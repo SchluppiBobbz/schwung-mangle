@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 
 /* ============================================================================
  * Plugin API definitions (inlined to avoid path issues during cross-compile)
@@ -659,12 +660,19 @@ static const char* basename_ptr(const char *path) {
 }
 
 /*
- * Generate an edited copy filename from the original.
- * "sample.wav" -> "sample_edit.wav"
+ * Generate an edited copy filename from the original with timestamp.
+ * "sample.wav" -> "sample_edit_0306_1423.wav"
  * Writes into out_buf with max out_len.
  */
 static void make_edit_filename(const char *original_path, char *out_buf,
                                int out_len) {
+    /* Get timestamp */
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char ts[16];
+    snprintf(ts, sizeof(ts), "%02d%02d_%02d%02d",
+             t->tm_mon + 1, t->tm_mday, t->tm_hour, t->tm_min);
+
     /* Find the directory */
     const char *filename = basename_ptr(original_path);
     int dir_len = (int)(filename - original_path);
@@ -672,18 +680,17 @@ static void make_edit_filename(const char *original_path, char *out_buf,
     /* Find the extension */
     const char *dot = strrchr(filename, '.');
     if (!dot) {
-        /* No extension */
-        snprintf(out_buf, (size_t)out_len, "%s_edit.wav", original_path);
+        snprintf(out_buf, (size_t)out_len, "%s_edit_%s.wav", original_path, ts);
         return;
     }
 
     int name_part_len = (int)(dot - filename);
 
-    /* Build: dir + name_part + "_edit" + extension */
-    snprintf(out_buf, (size_t)out_len, "%.*s%.*s_edit%s",
+    /* Build: dir + name_part + "_edit_MMDD_HHMM" + extension */
+    snprintf(out_buf, (size_t)out_len, "%.*s%.*s_edit_%s%s",
              dir_len, original_path,
              name_part_len, filename,
-             dot);
+             ts, dot);
 }
 
 /* ============================================================================
@@ -1417,6 +1424,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         } else {
             plugin_log("Save failed");
         }
+        return;
+    }
+
+    if (strcmp(key, "dirty") == 0) {
+        inst->dirty = (val && val[0] == '1') ? 1 : 0;
         return;
     }
 

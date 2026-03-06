@@ -209,6 +209,7 @@ var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Record state */
+var isRecordedFile = false;      /* true if current file came from recording (unsaved) */
 var recordState = "idle";        /* "idle" | "ready" | "recording" | "stopping" */
 var recordStoppingTicks = 0;     /* tick counter while waiting for sampler to finalize */
 var recordFilePath = "";         /* auto-generated path */
@@ -1157,12 +1158,7 @@ function drawTrimView() {
         var mins = Math.floor(elapsed / 60);
         var secs = elapsed % 60;
         var timeStr = mins + ":" + (secs < 10 ? "0" : "") + secs.toFixed(1);
-        var rawVu = 0;
-        if (typeof shadow_get_overlay_state === "function") {
-            var dbgOv = shadow_get_overlay_state();
-            if (dbgOv) rawVu = dbgOv.samplerVuPeak || 0;
-        }
-        print(0, 0, "REC " + timeStr + " vu:" + rawVu, 1);
+        print(0, 0, "REC  " + timeStr, 1);
         drawDivider(10);
 
         /* Draw live waveform with write head.
@@ -1771,6 +1767,12 @@ function confirmSelect() {
             exitEditor();
             break;
         case 1: /* Discard */
+            if (isRecordedFile && recordFilePath) {
+                /* Delete unsaved recording temp file */
+                if (typeof host_system_cmd === "function") {
+                    host_system_cmd("rm -f '" + recordFilePath + "'");
+                }
+            }
             exitEditor();
             break;
         case 2: /* Cancel */
@@ -1842,6 +1844,7 @@ function doSave() {
         host_module_set_param("apply_gain", "1");
     }
     host_module_set_param("save", "1");
+    isRecordedFile = false;
     showStatus("Saved!", 90);
     refreshState();
     refreshFileInfo();
@@ -3352,8 +3355,10 @@ globalThis.tick = function() {
             /* Sampler finished — load the recorded file */
             recordState = "idle";
             openedFilePath = recordFilePath;
+            isRecordedFile = true;
             host_module_set_param("file_path", "");
             host_module_set_param("file_path", recordFilePath);
+            host_module_set_param("dirty", "1");
             refreshFileInfo();
             waveformDirty = true;
             refreshWaveform();
@@ -3364,8 +3369,10 @@ globalThis.tick = function() {
             /* Timeout (~5 sec) — load anyway */
             recordState = "idle";
             openedFilePath = recordFilePath;
+            isRecordedFile = true;
             host_module_set_param("file_path", "");
             host_module_set_param("file_path", recordFilePath);
+            host_module_set_param("dirty", "1");
             refreshFileInfo();
             waveformDirty = true;
             refreshWaveform();
