@@ -2478,20 +2478,9 @@ function handleCC(cc, value) {
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
-        /* Handle record states first */
-        if (recordState === "recording") {
-            /* Stop and discard */
-            host_sampler_stop();
-            recordState = "idle";
-            setButtonLED(CC_REC, LED_OFF);
-            announce("Recording cancelled");
-            enterOpenFileBrowser();
-            return;
-        }
-        if (recordState === "ready") {
-            recordState = "idle";
-            setButtonLED(CC_REC, LED_OFF);
-            host_module_exit();
+        /* During recording or record-ready, just hide — DSP keeps recording */
+        if (recordState === "recording" || recordState === "ready") {
+            exitEditor();
             return;
         }
         switch (currentView) {
@@ -3385,10 +3374,21 @@ globalThis.init = function() {
         var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
         if (stillRecording) {
             recordState = "recording";
+            recordFilePath = openedFilePath;
             recordLedCounter = 0;
             currentView = VIEW_TRIM;
             selectedField = 0;
             announce("Wave Edit, recording in progress");
+        } else if (openedFilePath && totalFrames === 0) {
+            /* File path set but no audio data — restore record-ready state */
+            var lastSlash = openedFilePath.lastIndexOf("/");
+            recordBrowserDir = lastSlash > 0 ? openedFilePath.substring(0, lastSlash) : "";
+            recordFilePath = openedFilePath;
+            recordState = "ready";
+            recordLedCounter = 0;
+            currentView = VIEW_TRIM;
+            selectedField = 0;
+            announce("New Recording, press REC to record");
         } else {
             currentView = VIEW_TRIM;
             selectedField = 0;
