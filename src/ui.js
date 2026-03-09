@@ -3396,7 +3396,7 @@ globalThis.init = function() {
         }
         /* Force full LED repaint */
         ledInitPending = true;
-        ledInitStep = 0;
+        ledInitIndex = 0;
     } else {
         /* Fresh session */
         currentView = VIEW_TRIM;
