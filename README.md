@@ -76,6 +76,8 @@ cd move-anything-waveform-editor
 | Knob 5 | Set BPM (Shift: fine ±0.1) |
 | Knob 6 | Set beat division (1/1–1/16) |
 | Left/Right | Move active marker by one division |
+| Shift+L/R | Move entire selection by one division |
+| Shift+Loop | Toggle loop on/off |
 | Back | Return to Trim view |
 
 ### Slice Mode

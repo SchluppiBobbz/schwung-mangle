@@ -3109,6 +3109,12 @@ function handleCC(cc, value) {
                 /* Loop button in loop view: return to trim */
                 switchView(VIEW_TRIM);
             }
+        } else if (currentView === VIEW_BPM_TRIM) {
+            if (shiftHeld) {
+                /* Shift+Loop in BPM view: toggle loop on/off */
+                toggleLoop();
+            }
+            /* Plain Loop press does nothing in BPM view */
         } else if (currentView === VIEW_TRIM) {
             if (shiftHeld) {
                 /* Shift+Loop in trim view: toggle loop on/off */
@@ -3205,12 +3211,25 @@ function handleCC(cc, value) {
     /* Left/Right arrows — nudge selection or jump by selection length */
     if ((cc === CC_LEFT || cc === CC_RIGHT) && value > 0) {
         if (currentView === VIEW_BPM_TRIM) {
-            /* Move selected marker by one beat division */
             var dir = (cc === CC_LEFT) ? -1 : 1;
-            adjustMarker(selectedField, dir * getBeatStepSamples());
+            var beatStep = getBeatStepSamples();
+            if (shiftHeld) {
+                /* Shift: move entire selection by one beat division */
+                var selLen = endSample - startSample;
+                var newStart = startSample + dir * beatStep;
+                var newEnd   = endSample   + dir * beatStep;
+                if (newStart < 0) { newStart = 0; newEnd = selLen; }
+                if (newEnd > totalFrames) { newEnd = totalFrames; newStart = newEnd - selLen; if (newStart < 0) newStart = 0; }
+                startSample = newStart;
+                endSample   = newEnd;
+                showStatus("Start:" + formatTime(startSample), 30);
+            } else {
+                /* Normal: move selected marker by one beat division */
+                adjustMarker(selectedField, dir * beatStep);
+                showStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample), 30);
+            }
             syncMarkersToDs();
             refreshWaveform();
-            showStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample), 30);
             return;
         } else if (currentView === VIEW_TRIM) {
             var selLen = endSample - startSample;
