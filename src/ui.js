@@ -3123,10 +3123,12 @@ function handleCC(cc, value) {
     if (cc === CC_COPY && value > 0) {
         if (currentView === VIEW_BPM_TRIM) {
             if (shiftHeld) {
-                /* Shift+Copy: estimate BPM from selection length (assumes 1 bar in 4/4) */
+                /* Shift+Copy: estimate BPM — selection = 4 beat steps at current division.
+                 * bpm = 960 / (duration * div): at 1/4 select 1 bar, at 1/1 select 4 bars. */
                 var selLen = endSample - startSample;
                 if (selLen <= 0) { showStatus("Empty selection", 60); return; }
-                var estimatedBpm = 240.0 / (selLen / sampleRate); /* 4 beats × 60s */
+                var div = BEAT_DIVISIONS[beatDivIndex];
+                var estimatedBpm = 960.0 / (selLen / sampleRate * div);
                 estimatedBpm = Math.round(estimatedBpm * 10) / 10;
                 if (estimatedBpm < 20 || estimatedBpm > 999) {
                     showStatus("BPM out of range", 60); return;
