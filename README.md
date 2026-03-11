@@ -10,9 +10,11 @@ A full-featured audio waveform editor for your Ableton Move. Trim, gain adjust, 
 - Real-time gain adjustment and normalization
 - Cut, copy, paste, and mute operations
 - Hold-to-audition playback with loop mode
+- Loop view: seam editor for seamless loops with zero-crossing snap
 - Undo support for all destructive edits
 - Export selection to new file
 - BPM-grid slicing and beat-aligned marker snapping
+- Record audio directly into the editor (New Recording in file browser)
 
 ## Prerequisites
 
@@ -39,6 +41,14 @@ cd move-anything-waveform-editor
 
 ## Controls
 
+### View Selection (Step Buttons)
+
+| Step | View |
+|------|------|
+| Step 1 | Trim view |
+| Step 2 | BPM Step mode |
+| Step 3 | Slice mode |
+
 ### Trim View
 
 | Control | Function |
@@ -51,21 +61,24 @@ cd move-anything-waveform-editor
 | Knob 3 | Zoom |
 | Knob 4 | Vertical scale |
 | Knob 5 | Gain (Shift: normalize) |
+| Knob 7 (touch+twist) | Toggle loop mode on/off |
+| Knob 8 (touch+twist) | Snap markers to zero crossing |
 | Any pad | Hold to audition (Shift: preview near end) |
-| Mute | Set start marker at playback position |
-| Shift+Mute | Set end marker at playback position |
+| Mute | Set start marker at playback position (while playing) |
+| Shift+Mute | Set end marker at playback position (while playing) |
 | Copy | Copy selection |
 | Shift+Copy | Paste at cursor (insert) |
-| Delete | Cut selection |
 | Left/Right | Nudge selection by coarse step |
 | Shift+L/R | Jump selection by one selection length |
-| Loop | Toggle loop mode |
-| Capture | Save (overwrite) |
-| Shift+Capture | Export selection |
+| Loop | Enter loop view (seam editor) |
+| Shift+Loop | Toggle loop mode on/off |
+| Sample | Open save menu (editable filename) |
+| Shift+Capture | Export selection to new file |
 | Undo | Undo last edit |
-| Back | Exit (warns on unsaved) |
+| Back | Hide (keeps DSP alive) |
+| Shift+Back | Full exit (unload DSP) |
 
-### BPM Step Mode (via Jog click → BPM Step)
+### BPM Step Mode (Step 2, or Jog click → BPM Step)
 
 | Control | Function |
 |---------|----------|
@@ -83,7 +96,7 @@ cd move-anything-waveform-editor
 | Shift+Loop | Toggle loop on/off |
 | Back | Return to Trim view |
 
-### Slice Mode
+### Slice Mode (Step 3)
 
 | Control | Function |
 |---------|----------|
@@ -96,7 +109,13 @@ cd move-anything-waveform-editor
 | Knob 6 | Beat division (BPM mode only) |
 | Knob 8 | Select slice |
 | Left/Right | Previous / next slice |
+| Up | Merge slice with previous |
+| Down | Split slice at midpoint |
+| Shift+Up/Down | Scroll pad bank (when >32 slices) |
 | Pads | Audition slice (hold) |
+| Sample | Save slices / Drum Preset / REX Loop (if installed) |
+| Shift+Capture | Export current selection to new file |
+| Back | Hide (keeps DSP alive) |
 
 ## Header Indicators
 

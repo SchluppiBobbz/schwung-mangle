@@ -115,8 +115,8 @@
     {
       "title": "Slice Mode",
       "lines": [
-        "Capture: enter/exit",
-        "  slice mode",
+        "Step 3: enter slice mode",
+        "Step 1: return to edit",
         "",
         "Jog: cycle mode",
         "  Even / Auto /",
@@ -142,7 +142,12 @@
         "  slice (hold to",
         "  audition)",
         "Left/Right: prev/next",
-        "  slice"
+        "  slice",
+        "Down: split slice",
+        "Up: merge with prev",
+        "Sample: save slices /",
+        "  Drum Preset /",
+        "  REX Loop"
       ]
     },
     {
