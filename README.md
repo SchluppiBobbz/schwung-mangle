@@ -44,7 +44,7 @@ cd move-anything-waveform-editor
 | Control | Function |
 |---------|----------|
 | Jog wheel | Scroll view when zoomed in (Shift: fine scroll) |
-| Jog click | Edit menu: Copy, Cut, Truncate, Normalize Sel, BPM Step |
+| Jog click | Edit menu: Copy, Cut, Truncate, Normalize Sel, BPM Step, Mute |
 | Shift+Jog click | Paste/Export menu: Paste (insert), Paste (overwrite), Export |
 | Knob 1 | Move start marker |
 | Knob 2 | Move end marker |
@@ -52,7 +52,8 @@ cd move-anything-waveform-editor
 | Knob 4 | Vertical scale |
 | Knob 5 | Gain (Shift: normalize) |
 | Any pad | Hold to audition (Shift: preview near end) |
-| Mute | Zero out selection |
+| Mute | Set start marker at playback position |
+| Shift+Mute | Set end marker at playback position |
 | Copy | Copy selection |
 | Shift+Copy | Paste at cursor (insert) |
 | Delete | Cut selection |

@@ -267,7 +267,7 @@ var normalizeItems = ["Normalize", "Cancel"];
 var normalizeIndex = 0;
 
 /* Jog-click context menus (VIEW_TRIM) */
-var jogMenuItems = ["Copy", "Cut", "Truncate", "Normalize Sel", "BPM Step"];
+var jogMenuItems = ["Copy", "Cut", "Truncate", "Normalize Sel", "BPM Step", "Mute"];
 var jogMenuIndex = 0;
 var jogMenuScrollOffset = 0;
 var JOG_MENU_VISIBLE = 4;
@@ -1801,11 +1801,19 @@ function drawJogShiftMenu() {
 /* ============ Drawing: BPM Trim ============ */
 
 function drawBpmTrim() {
-    /* Reuse trim view, then overlay BPM status bar at bottom */
+    /* Reuse trim view, then overlay BPM label and status bar */
     drawTrimView();
+
+    /* Replace "TRIM" header label with "BPM" (keep dirty/loop indicators) */
+    var trimHeader = buildModeHeader("TRIM");
+    var bpmHeader  = buildModeHeader("BPM");
+    var eraseW = Math.max(trimHeader.length, bpmHeader.length) * 6 + 2;
+    fill_rect(0, 0, eraseW, 10, 0);
+    print(0, 0, bpmHeader, 1);
+
+    /* Overwrite the status area at very bottom with BPM info */
     var bpmStatus = "BPM:" + bpm.toFixed(1) + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
                     "  " + (selectedField === 0 ? "[Start]" : "[End]");
-    /* Overwrite the status area at very bottom */
     fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
     print(0, SCREEN_H - 9, bpmStatus, 1);
 }
@@ -3038,11 +3046,29 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Mute button — zero out selection */
+    /* Mute button — set marker at current playback position */
     if (cc === CC_MUTE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
+            if (shiftHeld) {
+                /* Shift+Mute: set end marker at play position */
+                endSample = playPos;
+                if (endSample <= startSample) endSample = startSample + 1;
+                if (endSample > totalFrames) endSample = totalFrames;
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("End → " + formatTime(endSample), 60);
+            } else {
+                /* Mute: set start marker at play position */
+                startSample = playPos;
+                if (startSample >= endSample) endSample = startSample + 1;
+                if (endSample > totalFrames) { endSample = totalFrames; startSample = endSample - 1; }
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("Start → " + formatTime(startSample), 60);
+            }
+        } else if (currentView === VIEW_LOOP) {
             doMute();
-            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+            invalidateSeamWaveform();
         }
         return;
     }
@@ -3515,6 +3541,7 @@ function handleCC(cc, value) {
                     case 2: doTrim(); break;
                     case 3: doNormalizeSelection(); break;
                     case 4: switchView(VIEW_BPM_TRIM); return; /* don't switch back to TRIM */
+                    case 5: doMute(); break;
                 }
                 switchView(VIEW_TRIM);
                 break;
