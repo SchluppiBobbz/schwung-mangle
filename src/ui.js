@@ -955,8 +955,6 @@ function recomputeSliceBoundaries() {
         if (sliceBoundaries.length < 2) {
             sliceBoundaries = [sliceRegionStart, sliceRegionEnd];
             sliceCount = 1;
-        } else {
-            sliceCount = sliceBoundaries.length - 1;
         }
     } else if (sliceMode === SLICE_MODE_EVEN) {
         var regionLen = sliceRegionEnd - sliceRegionStart;
@@ -1884,15 +1882,30 @@ function switchView(view) {
             sliceRegionEnd = totalFrames;
             sliceRegionStart = 0;
         }
-        sliceCount = 1;
-        selectedSlice = 0;
-        slicePadOffset = 0;
         sliceMenuIndex = 0;
         sliceMenuEditing = false;
         lazyChopping = false;
-        if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
-        recomputeSliceBoundaries();
-        selectSlice(0);
+
+        /* Restore existing slice state if the region is unchanged (boundaries still match).
+         * This preserves manual adjustments and lazy-chop results across view switches
+         * for all modes (Even, Auto, BPM, Lazy). */
+        var hasExistingState = sliceBoundaries.length >= 2 &&
+            sliceRegionStart === sliceBoundaries[0] &&
+            sliceRegionEnd === sliceBoundaries[sliceBoundaries.length - 1];
+
+        if (hasExistingState) {
+            sliceCount = sliceBoundaries.length - 1;
+            if (selectedSlice >= sliceCount) selectedSlice = 0;
+            /* Lazy: only reset to CHOP if no real chops done yet (single default slice) */
+            if (sliceMode === SLICE_MODE_LAZY && sliceBoundaries.length < 3) lazySub = LAZY_SUB_CHOP;
+        } else {
+            sliceCount = 1;
+            selectedSlice = 0;
+            slicePadOffset = 0;
+            if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
+            recomputeSliceBoundaries();
+        }
+        selectSlice(selectedSlice);
         /* Zoom to fit the slice region with 10% margin on each side */
         var regionLen = sliceRegionEnd - sliceRegionStart;
         if (regionLen > 0 && regionLen < totalFrames) {
@@ -3127,6 +3140,12 @@ function handleCC(cc, value) {
                     var detectedBpm = parseFloat(bpmMatch[1]);
                     if (detectedBpm >= 20 && detectedBpm <= 999) {
                         bpm = Math.round(detectedBpm * 10) / 10;
+                        var beatStep = getBeatStepSamples();
+                        var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
+                        endSample = startSample + beats * beatStep;
+                        if (endSample > totalFrames) endSample = totalFrames;
+                        syncMarkersToDs();
+                        refreshWaveform();
                         showStatus("BPM: " + bpm.toFixed(1), 90);
                     } else {
                         showStatus("BPM out of range", 60);
