@@ -68,6 +68,7 @@ cd move-anything-waveform-editor
 | Shift+Mute | Set end marker at playback position (while playing) |
 | Copy | Copy selection |
 | Shift+Copy | Paste at cursor (insert) |
+| Remove | Cut selection (copy + remove) |
 | Left/Right | Nudge selection by coarse step |
 | Shift+L/R | Jump selection by one selection length |
 | Loop | Enter loop view (seam editor) |
@@ -109,9 +110,14 @@ cd move-anything-waveform-editor
 | Knob 6 | Beat division (BPM mode only) |
 | Knob 8 | Select slice |
 | Left/Right | Previous / next slice |
+| Shift+Left/Right | Move selected slice left/right (swap with neighbour) |
 | Up | Merge slice with previous |
 | Down | Split slice at midpoint |
 | Shift+Up/Down | Scroll pad bank (when >32 slices) |
+| Copy | Copy selected slice to clipboard |
+| Shift+Copy | Paste clipboard overwrite into selected slice |
+| Remove | Cut selected slice (copy + remove from file) |
+| Shift+Remove | Paste clipboard insert before selected slice |
 | Pads | Audition slice (hold) |
 | Sample | Save slices / Drum Preset / REX Loop (if installed) |
 | Shift+Capture | Export current selection to new file |
