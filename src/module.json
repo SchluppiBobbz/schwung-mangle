@@ -1,8 +1,8 @@
 {
     "id": "waveform-editor",
     "name": "Wave Edit",
-    "version": "0.4.4",
-    "description": "Trim, gain adjust, and edit audio files on the Move",
+    "version": "0.5.0",
+    "description": "4-track audio editor with jamming, gate/trigger, and clock sync",
     "author": "Move Anything",
     "dsp": "dsp.so",
     "api_version": 2,

@@ -249,6 +249,253 @@ var REX_MODULE_PATH = "/data/UserData/move-anything/modules/sound_generators/rex
 var REX_ENCODE_BIN = REX_MODULE_PATH + "/rex-encode";
 var REX_LOOPS_DIR = REX_MODULE_PATH + "/loops";
 
+/* ============ Multi-Track State ============ */
+
+var NUM_TRACKS = 4;
+var activeTrack = 0;
+var pendingBrowserTrack = -1; /* Which track the file browser is loading for */
+
+/* MoveRow CCs (Track buttons) — MoveRow1=43, MoveRow2=42, MoveRow3=41, MoveRow4=40 */
+var TRACK_CCS = [43, 42, 41, 40];
+
+/* MovePlay CC */
+var CC_PLAY = 85;
+
+/* Track state array — each track stores its own copy of per-track UI state */
+var trackStates = [];
+
+function makeTrackState() {
+    return {
+        fileName: "", filePath: "", loaded: false,
+        startSample: 0, endSample: 0, totalFrames: 0,
+        zoomLevel: 0, zoomCenter: 0, vScale: 1.0,
+        playing: false, playPos: 0,
+        gainDb: 0.0, peakDb: -96,
+        gateMode: false,
+        loopEnabled: false,
+        fileDuration: 0, sampleRate: 44100,
+        selectedField: 0,
+        /* Slice state */
+        sliceMode: SLICE_MODE_EVEN, sliceCount: 1, sliceBoundaries: [],
+        selectedSlice: 0, slicePadOffset: 0,
+        sliceRegionStart: 0, sliceRegionEnd: 0,
+        sliceThreshold: 25.0,
+        lazySub: LAZY_SUB_CHOP, lazyChopping: false,
+        /* Waveform cache */
+        waveformData: null, cachedVisStart: -1, cachedVisEnd: -1,
+        waveformDirty: true,
+        /* Seam waveform */
+        seamWaveformData: null, seamWaveformDirty: true,
+        cachedSeamStart: -1, cachedSeamEnd: -1, cachedSeamHalf: -1,
+        seamZoomLevel: 4,
+        /* Loop */
+        loopSelectedField: 0,
+        /* BPM */
+        bpm: 120.0, beatDivIndex: 2,
+        /* Flags */
+        dirty: false, hasUndo: false, hasClipboard: false,
+        /* Misc */
+        pendingPlay: "", activePadNote: -1,
+        playLoop: false, playWhole: false,
+        isRecordedFile: false, openedFilePath: ""
+    };
+}
+
+for (var _ti = 0; _ti < NUM_TRACKS; _ti++) trackStates.push(makeTrackState());
+
+/**
+ * Save current global UI state into trackStates[idx].
+ */
+function saveTrackUIState(idx) {
+    var ts = trackStates[idx];
+    ts.fileName = fileName;
+    ts.filePath = openedFilePath;
+    ts.loaded = (totalFrames > 0);
+    ts.startSample = startSample;
+    ts.endSample = endSample;
+    ts.totalFrames = totalFrames;
+    ts.zoomLevel = zoomLevel;
+    ts.zoomCenter = zoomCenter;
+    ts.vScale = vScale;
+    ts.playing = playing;
+    ts.playPos = playPos;
+    ts.gainDb = gainDb;
+    ts.peakDb = peakDb;
+    ts.loopEnabled = loopEnabled;
+    ts.fileDuration = fileDuration;
+    ts.sampleRate = sampleRate;
+    ts.selectedField = selectedField;
+    /* Slice */
+    ts.sliceMode = sliceMode;
+    ts.sliceCount = sliceCount;
+    ts.sliceBoundaries = sliceBoundaries;
+    ts.selectedSlice = selectedSlice;
+    ts.slicePadOffset = slicePadOffset;
+    ts.sliceRegionStart = sliceRegionStart;
+    ts.sliceRegionEnd = sliceRegionEnd;
+    ts.sliceThreshold = sliceThreshold;
+    ts.lazySub = lazySub;
+    ts.lazyChopping = lazyChopping;
+    /* Waveform */
+    ts.waveformData = waveformData;
+    ts.cachedVisStart = cachedVisStart;
+    ts.cachedVisEnd = cachedVisEnd;
+    ts.waveformDirty = waveformDirty;
+    /* Seam */
+    ts.seamWaveformData = seamWaveformData;
+    ts.seamWaveformDirty = seamWaveformDirty;
+    ts.cachedSeamStart = cachedSeamStart;
+    ts.cachedSeamEnd = cachedSeamEnd;
+    ts.cachedSeamHalf = cachedSeamHalf;
+    ts.seamZoomLevel = seamZoomLevel;
+    /* Loop */
+    ts.loopSelectedField = loopSelectedField;
+    /* BPM */
+    ts.bpm = bpm;
+    ts.beatDivIndex = beatDivIndex;
+    /* Flags */
+    ts.dirty = dirty;
+    ts.hasUndo = hasUndo;
+    ts.hasClipboard = hasClipboard;
+    /* Misc */
+    ts.pendingPlay = pendingPlay;
+    ts.activePadNote = activePadNote;
+    ts.isRecordedFile = isRecordedFile;
+    ts.openedFilePath = openedFilePath;
+}
+
+/**
+ * Restore global UI state from trackStates[idx].
+ */
+function restoreTrackUIState(idx) {
+    var ts = trackStates[idx];
+    fileName = ts.fileName;
+    openedFilePath = ts.filePath;
+    totalFrames = ts.totalFrames;
+    startSample = ts.startSample;
+    endSample = ts.endSample;
+    zoomLevel = ts.zoomLevel;
+    zoomCenter = ts.zoomCenter;
+    vScale = ts.vScale;
+    playing = ts.playing;
+    playPos = ts.playPos;
+    gainDb = ts.gainDb;
+    peakDb = ts.peakDb;
+    loopEnabled = ts.loopEnabled;
+    fileDuration = ts.fileDuration;
+    sampleRate = ts.sampleRate;
+    selectedField = ts.selectedField;
+    /* Slice */
+    sliceMode = ts.sliceMode;
+    sliceCount = ts.sliceCount;
+    sliceBoundaries = ts.sliceBoundaries;
+    selectedSlice = ts.selectedSlice;
+    slicePadOffset = ts.slicePadOffset;
+    sliceRegionStart = ts.sliceRegionStart;
+    sliceRegionEnd = ts.sliceRegionEnd;
+    sliceThreshold = ts.sliceThreshold;
+    lazySub = ts.lazySub;
+    lazyChopping = ts.lazyChopping;
+    /* Waveform */
+    waveformData = ts.waveformData;
+    cachedVisStart = ts.cachedVisStart;
+    cachedVisEnd = ts.cachedVisEnd;
+    waveformDirty = ts.waveformDirty;
+    /* Seam */
+    seamWaveformData = ts.seamWaveformData;
+    seamWaveformDirty = ts.seamWaveformDirty;
+    cachedSeamStart = ts.cachedSeamStart;
+    cachedSeamEnd = ts.cachedSeamEnd;
+    cachedSeamHalf = ts.cachedSeamHalf;
+    seamZoomLevel = ts.seamZoomLevel;
+    /* Loop */
+    loopSelectedField = ts.loopSelectedField;
+    /* BPM */
+    bpm = ts.bpm;
+    beatDivIndex = ts.beatDivIndex;
+    /* Flags — these will be refreshed from DSP in tick() */
+    dirty = ts.dirty;
+    hasUndo = ts.hasUndo;
+    hasClipboard = ts.hasClipboard;
+    /* Misc */
+    pendingPlay = ts.pendingPlay;
+    activePadNote = ts.activePadNote;
+    isRecordedFile = ts.isRecordedFile;
+}
+
+/**
+ * Switch to a different track. If already on this track, toggle play.
+ */
+function switchToTrack(idx) {
+    if (idx === activeTrack && trackStates[idx].loaded) {
+        /* Second press on active track = toggle play */
+        toggleTrackPlay(idx);
+        return;
+    }
+    /* Save current state */
+    saveTrackUIState(activeTrack);
+    activeTrack = idx;
+    /* Tell DSP which track is active */
+    host_module_set_param("active_track", String(idx));
+    /* Restore UI state for new track */
+    restoreTrackUIState(idx);
+    /* Force waveform refresh */
+    waveformDirty = true;
+    seamWaveformDirty = true;
+    /* Re-fetch file info from DSP */
+    refreshFileInfo();
+    announce("Track " + (idx + 1));
+}
+
+/**
+ * Toggle play/stop for a specific track.
+ */
+function toggleTrackPlay(idx) {
+    var ts = trackStates[idx];
+    ts.playing = !ts.playing;
+    host_module_set_param("t" + idx + ":play",
+        ts.playing ? "selection" : "stop");
+    if (idx === activeTrack) {
+        playing = ts.playing;
+    }
+}
+
+/**
+ * Update Track LEDs based on current state.
+ */
+function updateTrackLEDs() {
+    for (var i = 0; i < NUM_TRACKS; i++) {
+        var color;
+        if (trackStates[i].playing) {
+            color = BrightGreen;
+        } else if (i === activeTrack) {
+            color = WhiteLedBright;
+        } else if (trackStates[i].loaded) {
+            color = WhiteLedDim;
+        } else {
+            color = Black;
+        }
+        setButtonLED(TRACK_CCS[i], color);
+    }
+}
+
+/**
+ * Update Play LED.
+ */
+function updatePlayLED() {
+    var anyPlaying = false;
+    for (var i = 0; i < NUM_TRACKS; i++) {
+        if (trackStates[i].playing) { anyPlaying = true; break; }
+    }
+    setButtonLED(CC_PLAY, anyPlaying ? BrightGreen : Black);
+}
+
+/* Shared flags used by tick/draw — refreshed from DSP each tick */
+var loopEnabled = false;
+var dirty = false;
+var hasUndo = false;
+var hasClipboard = false;
+
 /* Mode menu */
 var menuItems = ["Edit", "Loop", "Open File", "Close Session"];
 var menuIndex = 0;
@@ -415,17 +662,7 @@ function restoreSliceState() {
 }
 
 /* Loop state */
-var loopEnabled = false;
 var savedLoopState = false;
-
-/* Undo state */
-var hasUndo = false;
-
-/* Clipboard state */
-var hasClipboard = false;
-
-/* Dirty flag */
-var dirty = false;
 
 /* Status message — two modes:
  * 1. Knob-held: persists while knob is touched, per-knob messages
@@ -568,6 +805,13 @@ function updateLeds() {
     setLED(STEP_BASE + 0, isTrim  ? White     : DarkGrey);
     setLED(STEP_BASE + 1, isBpm   ? LightGrey : DarkGrey);
     setLED(STEP_BASE + 2, isSlice ? OrangeRed : DarkGrey);
+
+    /* Step 4: Gate/Trigger mode LED */
+    setLED(STEP_BASE + 3, isEdit ? (trackStates[activeTrack].gateMode ? BrightRed : DarkGrey) : Black);
+
+    /* Step 5: Clock Sync LED */
+    var syncOn = (host_module_get_param("sync_clock") === "1");
+    setLED(STEP_BASE + 4, isEdit ? (syncOn ? BrightGreen : DarkGrey) : Black);
 
     /* Step 9/10: fade in/out LEDs (Trim/BPM/Slice) */
     var hasFade = isTrim || isBpm || isSlice;
@@ -920,6 +1164,13 @@ function loadFileIntoEditor(filePath) {
     waveformDirty = true;
     refreshWaveform();
     refreshState();
+    /* Update track state */
+    trackStates[activeTrack].loaded = (totalFrames > 0);
+    trackStates[activeTrack].fileName = fileName;
+    trackStates[activeTrack].filePath = openedFilePath;
+    trackStates[activeTrack].totalFrames = totalFrames;
+    /* Reset pending browser track */
+    pendingBrowserTrack = -1;
 }
 
 /**
@@ -1219,9 +1470,10 @@ function printCentered(y, text) {
  * Format: "MODE*L" where * = dirty, L = loop enabled.
  */
 function buildModeHeader(modeName) {
-    var s = modeName;
+    var s = "T" + (activeTrack + 1) + " " + modeName;
     if (dirty) s += "*";
     if (loopEnabled) s += " L";
+    if (trackStates[activeTrack].gateMode) s += " G";
     return s;
 }
 
@@ -3309,6 +3561,63 @@ function handleCC(cc, value) {
         return;
     }
 
+    /* --- MoveRow1-4: Track selection / file browser --- */
+    for (var _t = 0; _t < NUM_TRACKS; _t++) {
+        if (cc === TRACK_CCS[_t] && value > 0) {
+            if (shiftHeld) {
+                /* Shift+MoveRow: open file browser for this track */
+                pendingBrowserTrack = _t;
+                if (_t !== activeTrack) {
+                    saveTrackUIState(activeTrack);
+                    activeTrack = _t;
+                    host_module_set_param("active_track", String(_t));
+                    restoreTrackUIState(_t);
+                }
+                /* Enter file browser */
+                if (!openFileBrowserState) {
+                    openFileBrowserState = buildFilepathBrowserState({
+                        rootDir: "/data/UserData/UserLibrary",
+                        extensions: [".wav"],
+                        showUp: true
+                    });
+                }
+                refreshBrowserWithRecording();
+                switchView(VIEW_OPEN_FILE);
+                announce("Open file for Track " + (_t + 1));
+            } else {
+                /* Normal press: select track (or toggle play if already active) */
+                switchToTrack(_t);
+            }
+            return;
+        }
+    }
+
+    /* --- MovePlay: start/stop ALL loaded tracks --- */
+    if (cc === CC_PLAY && value > 0) {
+        var anyPlaying = false;
+        for (var _p = 0; _p < NUM_TRACKS; _p++) {
+            if (trackStates[_p].playing) { anyPlaying = true; break; }
+        }
+        if (anyPlaying) {
+            /* Stop all */
+            host_module_set_param("play_all", "0");
+            for (var _p2 = 0; _p2 < NUM_TRACKS; _p2++) {
+                trackStates[_p2].playing = false;
+            }
+            playing = false;
+        } else {
+            /* Start all loaded */
+            host_module_set_param("play_all", "1");
+            for (var _p3 = 0; _p3 < NUM_TRACKS; _p3++) {
+                if (trackStates[_p3].loaded) {
+                    trackStates[_p3].playing = true;
+                }
+            }
+            if (trackStates[activeTrack].loaded) playing = true;
+        }
+        return;
+    }
+
     /* During record states, only allow Back and Rec buttons */
     if (recordState !== "idle" && recordState !== "stopping" && cc !== CC_BACK && cc !== CC_REC) {
         return;
@@ -4261,6 +4570,28 @@ function handleNote(note, velocity) {
         }
     }
 
+    /* Step 4: Toggle Gate/Trigger mode for active track */
+    if (velocity > 0 && note === STEP_BASE + 3) {
+        trackStates[activeTrack].gateMode = !trackStates[activeTrack].gateMode;
+        host_module_set_param("t" + activeTrack + ":gate_mode",
+            trackStates[activeTrack].gateMode ? "1" : "0");
+        announce(trackStates[activeTrack].gateMode ? "Gate Mode" : "Trigger Mode");
+        showStatus(trackStates[activeTrack].gateMode ? "Gate" : "Trigger", 60);
+        updateLeds();
+        return;
+    }
+
+    /* Step 5: Toggle Clock Sync */
+    if (velocity > 0 && note === STEP_BASE + 4) {
+        var syncState = host_module_get_param("sync_clock");
+        var newSync = (syncState === "1") ? "0" : "1";
+        host_module_set_param("sync_clock", newSync);
+        announce(newSync === "1" ? "Sync On" : "Sync Off");
+        showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
+        updateLeds();
+        return;
+    }
+
     /* Step 9/10: fade in/out (Trim/BPM/Slice) */
     if (velocity > 0 && (note === STEP_BASE + 8 || note === STEP_BASE + 9)) {
         if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
@@ -4579,7 +4910,7 @@ globalThis.tick = function() {
         pendingPlay = "";
     }
 
-    /* Poll playback state if playing */
+    /* Poll playback state for active track */
     if (playing) {
         var posRaw = host_module_get_param("play_pos");
         if (posRaw) playPos = parseInt(posRaw, 10) || 0;
@@ -4587,6 +4918,7 @@ globalThis.tick = function() {
         var playingRaw = host_module_get_param("playing");
         if (playingRaw === "0" || playingRaw === "false") {
             playing = false;
+            trackStates[activeTrack].playing = false;
             if (lazyChopping) {
                 /* Sample reached end — finalize chop session */
                 lazyChopping = false;
@@ -4598,6 +4930,24 @@ globalThis.tick = function() {
             }
         }
     }
+
+    /* Poll playback state for non-active tracks */
+    for (var _pt = 0; _pt < NUM_TRACKS; _pt++) {
+        if (_pt === activeTrack) continue;
+        if (trackStates[_pt].playing) {
+            var _pRaw = host_module_get_param("t" + _pt + ":playing");
+            if (_pRaw === "0" || _pRaw === "false") {
+                trackStates[_pt].playing = false;
+            } else {
+                var _posRaw = host_module_get_param("t" + _pt + ":play_pos");
+                if (_posRaw) trackStates[_pt].playPos = parseInt(_posRaw, 10) || 0;
+            }
+        }
+    }
+
+    /* Update track and play LEDs */
+    updateTrackLEDs();
+    updatePlayLED();
 
     /* Decay status message timer */
     if (statusTimer > 0) {
