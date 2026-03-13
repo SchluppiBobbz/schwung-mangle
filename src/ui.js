@@ -739,6 +739,12 @@ function initLedsStep() {
             return function() { setLED(n, Black, true); };
         })(STEP_BASE + s));
     }
+    /* Step 4 (Gate/Trigger) + Step 5 (Clock Sync) — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 3, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 4, Black, true); });
+    /* Step 9/10 (Fade In/Out) — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 8, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 9, Black, true); });
     /* Step 15/16 marker-set LEDs — init to Black */
     commands.push(function() { setLED(STEP_BASE + 14, Black, true); });
     commands.push(function() { setLED(STEP_BASE + 15, Black, true); });
@@ -3573,14 +3579,10 @@ function handleCC(cc, value) {
                     host_module_set_param("active_track", String(_t));
                     restoreTrackUIState(_t);
                 }
-                /* Enter file browser */
-                if (!openFileBrowserState) {
-                    openFileBrowserState = buildFilepathBrowserState({
-                        rootDir: "/data/UserData/UserLibrary",
-                        extensions: [".wav"],
-                        showUp: true
-                    });
-                }
+                /* Enter file browser — always start at UserLibrary root */
+                openFileBrowserState = buildFilepathBrowserState(
+                    { root: "/data/UserData/UserLibrary", filter: ".wav" }
+                );
                 refreshBrowserWithRecording();
                 switchView(VIEW_OPEN_FILE);
                 announce("Open file for Track " + (_t + 1));
@@ -4664,6 +4666,7 @@ function handleNote(note, velocity) {
      * an earlier pad while a newer one is held does nothing. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_BPM_TRIM) {
+            var isGate = trackStates[activeTrack].gateMode;
             if (velocity > 0) {
                 setLED(note, PAD_COLOR_PLAY);
                 activePadNote = note;
@@ -4675,15 +4678,27 @@ function handleNote(note, velocity) {
                     if (from < startSample) from = startSample;
                     startPlaybackFrom(from);
                     showStatus("Preview End", 20);
-                } else {
+                } else if (isGate) {
+                    /* Gate mode: play while held, DSP silences on gate_held=0 */
+                    host_module_set_param("t" + activeTrack + ":gate_held", "1");
                     startPlayback();
-                    showStatus("Play Sel", 20);
+                    showStatus("Gate", 20);
+                } else {
+                    /* Trigger mode: play whole file on press */
+                    pendingPlay = "whole";
+                    playing = true;
+                    showStatus("Trigger", 20);
                 }
             } else {
                 setLED(note, PAD_COLOR_DIM);
                 if (note === activePadNote) {
                     activePadNote = -1;
-                    stopPlayback();
+                    if (isGate) {
+                        /* Gate mode: release silences via DSP gate, then stop */
+                        host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                        stopPlayback();
+                    }
+                    /* Trigger mode: do NOT stop — let file play to end */
                 }
             }
         } else if (currentView === VIEW_SLICE) {
@@ -4808,8 +4823,8 @@ globalThis.init = function() {
             var timeStr = Math.floor(elapsedSec / 60) + ":" +
                 (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
             announce("Wave Edit, recording in progress, " + timeStr);
-        } else if (openedFilePath && totalFrames === 0) {
-            /* File path set but no audio data — restore record-ready state */
+        } else if (totalFrames === 0) {
+            /* No audio data — restore record-ready state */
             recordBrowserDir = SCRATCH_DIR;
             recordFilePath = SCRATCH_PATH;
             recordState = "ready";
@@ -4838,8 +4853,8 @@ globalThis.init = function() {
         selectedField = 0;
         host_module_set_param("mode", "0");
 
-        if (openedFilePath && totalFrames === 0) {
-            /* New file — use scratch path for recording */
+        if (totalFrames === 0) {
+            /* No audio data — use scratch path for recording */
             if (typeof host_ensure_dir === "function") {
                 host_ensure_dir(SCRATCH_DIR);
             }
