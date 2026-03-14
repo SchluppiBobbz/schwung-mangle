@@ -121,6 +121,11 @@ typedef struct {
     int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play) */
     int gate_held;              /* 1 while gate is held (pad/key down) */
 
+    float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
+    int   tempo_percent;        /* 50 to 200 */
+    float playback_rate;        /* computed: pitch_ratio * tempo_ratio */
+    double play_pos_frac;       /* fractional playback position */
+
     char copy_result[256];
     char load_error[256];
     char slice_state[2048];     /* JSON blob for UI slice state persistence */
@@ -455,6 +460,7 @@ static int load_wav(track_t *t, const char *path) {
 
     t->playing = 0;
     t->play_pos = 0;
+    t->play_pos_frac = 0.0;
     t->gain_db = 0.0f;
     t->mode = 0;
 
@@ -800,12 +806,18 @@ static void init_track(track_t *t) {
     t->gain_db = 0.0f;
     t->peak_db = -96.0f;
     t->mode = 0;
+    t->pitch_semitones = 0.0f;
+    t->tempo_percent = 100;
+    t->playback_rate = 1.0f;
+    t->play_pos_frac = 0.0;
     t->zoom_level = 0;
     t->orig_format = 1;    /* PCM */
     t->orig_bits = 16;
     t->orig_channels = 2;  /* stereo */
     t->sample_rate = MOVE_SAMPLE_RATE;
 }
+
+static void recompute_playback_rate(track_t *t);
 
 /* ============================================================================
  * V2 API implementation
@@ -902,6 +914,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     t->play_whole = 0;
                     t->playing = 1;
                     t->play_pos = t->start_sample;
+                    t->play_pos_frac = (double)t->start_sample;
                 }
             } else {
                 t->playing = 0;
@@ -938,6 +951,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         /* Stop any playback */
         t->playing = 0;
+
+        /* Reset pitch/tempo on new file */
+        t->pitch_semitones = 0.0f;
+        t->tempo_percent = 100;
+        recompute_playback_rate(t);
 
         /* Load the file */
         if (load_wav(t, val) == 0) {
@@ -1043,8 +1061,10 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->playing = 1;
         if (whole) {
             t->play_pos = 0;
+            t->play_pos_frac = 0.0;
         } else {
             t->play_pos = t->start_sample;
+            t->play_pos_frac = (double)t->start_sample;
         }
         {
             char dbg[256];
@@ -1067,6 +1087,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->play_whole = 0;
         t->playing = 1;
         t->play_pos = pos;
+        t->play_pos_frac = (double)pos;
         return;
     }
 
@@ -1097,6 +1118,26 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "gate_held") == 0) {
         if (!val) return;
         t->gate_held = atoi(val) ? 1 : 0;
+        return;
+    }
+
+    if (strcmp(param, "pitch") == 0) {
+        if (!val) return;
+        float v = (float)atof(val);
+        if (v < -12.0f) v = -12.0f;
+        if (v > 12.0f) v = 12.0f;
+        t->pitch_semitones = v;
+        recompute_playback_rate(t);
+        return;
+    }
+
+    if (strcmp(param, "tempo") == 0) {
+        if (!val) return;
+        int v = atoi(val);
+        if (v < 50) v = 50;
+        if (v > 200) v = 200;
+        t->tempo_percent = v;
+        recompute_playback_rate(t);
         return;
     }
 
@@ -2115,6 +2156,16 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
+    if (strcmp(param, "pitch") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%.2f", t->pitch_semitones);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
+    if (strcmp(param, "tempo") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%d", t->tempo_percent);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
     return -1; /* Unknown parameter */
 }
 
@@ -2130,6 +2181,14 @@ static int v2_get_error(void *instance, char *buf, int buf_len) {
 
     int n = snprintf(buf, (size_t)buf_len, "%s", t->load_error);
     return (n >= 0 && n < buf_len) ? n : 0;
+}
+
+/* ---- pitch/tempo helpers ---- */
+
+static void recompute_playback_rate(track_t *t) {
+    float pitch_ratio = powf(2.0f, t->pitch_semitones / 12.0f);
+    float tempo_ratio = (float)t->tempo_percent / 100.0f;
+    t->playback_rate = pitch_ratio * tempo_ratio;
 }
 
 /* ---- render_block ---- */
@@ -2161,6 +2220,9 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         linear_gain = powf(10.0f, t->gain_db / 20.0f);
     }
 
+    double rate = (double)t->playback_rate;
+    int region_len = play_end - play_start;
+
     int produced = 0;
     for (int i = 0; i < frames; i++) {
         if (!t->playing) {
@@ -2169,36 +2231,52 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             continue;
         }
 
-        if (t->play_pos >= play_end) {
-            if (t->play_loop) {
-                t->play_pos = play_start;
+        /* Loop/stop check using fractional position */
+        while (t->play_pos_frac >= (double)play_end) {
+            if (t->play_loop && region_len > 0) {
+                t->play_pos_frac -= (double)region_len;
             } else {
                 t->playing = 0;
-                out[i * 2]     = 0;
-                out[i * 2 + 1] = 0;
-                continue;
+                break;
             }
         }
+        if (!t->playing) {
+            out[i * 2]     = 0;
+            out[i * 2 + 1] = 0;
+            t->play_pos = (int)t->play_pos_frac;
+            continue;
+        }
 
-        int16_t sample_l = t->audio_data[t->play_pos * 2];
-        int16_t sample_r = t->audio_data[t->play_pos * 2 + 1];
-        t->play_pos++;
+        /* Linear interpolation between adjacent samples */
+        int pos_int = (int)t->play_pos_frac;
+        float frac = (float)(t->play_pos_frac - (double)pos_int);
+
+        int next = pos_int + 1;
+        if (next >= play_end) {
+            next = t->play_loop ? play_start : pos_int;
+        }
+
+        float sample_l = (float)t->audio_data[pos_int * 2]
+                        + frac * ((float)t->audio_data[next * 2] - (float)t->audio_data[pos_int * 2]);
+        float sample_r = (float)t->audio_data[pos_int * 2 + 1]
+                        + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[pos_int * 2 + 1]);
+
+        t->play_pos_frac += rate;
+        t->play_pos = (int)t->play_pos_frac;
         produced = 1;
 
         /* Apply gain preview */
         if (linear_gain != 1.0f) {
-            float sl = (float)sample_l * linear_gain;
-            float sr = (float)sample_r * linear_gain;
-            if (sl > 32767.0f) sl = 32767.0f;
-            if (sl < -32768.0f) sl = -32768.0f;
-            if (sr > 32767.0f) sr = 32767.0f;
-            if (sr < -32768.0f) sr = -32768.0f;
-            sample_l = (int16_t)sl;
-            sample_r = (int16_t)sr;
+            sample_l *= linear_gain;
+            sample_r *= linear_gain;
         }
+        if (sample_l > 32767.0f) sample_l = 32767.0f;
+        if (sample_l < -32768.0f) sample_l = -32768.0f;
+        if (sample_r > 32767.0f) sample_r = 32767.0f;
+        if (sample_r < -32768.0f) sample_r = -32768.0f;
 
-        out[i * 2]     = sample_l;
-        out[i * 2 + 1] = sample_r;
+        out[i * 2]     = (int16_t)sample_l;
+        out[i * 2 + 1] = (int16_t)sample_r;
     }
 
     return produced;

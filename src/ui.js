@@ -181,6 +181,10 @@ var activePadNote = -1; /* Which pad note owns current playback */
 var gainDb = 0.0;
 var peakDb = -100.0;
 
+/* Pitch/tempo state */
+var pitchSemitones = 0.0;   /* -12.0 to +12.0 */
+var tempoPercent = 100;     /* 50 to 200 */
+
 /* Waveform cache — only re-fetch when visible range changes */
 var waveformData = null; /* Array of [min, max] pairs, length 128 */
 var cachedVisStart = -1;
@@ -273,6 +277,8 @@ function makeTrackState() {
         gainDb: 0.0, peakDb: -96,
         gateMode: false,
         loopEnabled: false,
+        pitchSemitones: 0.0,
+        tempoPercent: 100,
         fileDuration: 0, sampleRate: 44100,
         selectedField: 0,
         /* Slice state */
@@ -322,6 +328,8 @@ function saveTrackUIState(idx) {
     ts.gainDb = gainDb;
     ts.peakDb = peakDb;
     ts.loopEnabled = loopEnabled;
+    ts.pitchSemitones = pitchSemitones;
+    ts.tempoPercent = tempoPercent;
     ts.fileDuration = fileDuration;
     ts.sampleRate = sampleRate;
     ts.selectedField = selectedField;
@@ -382,6 +390,8 @@ function restoreTrackUIState(idx) {
     gainDb = ts.gainDb;
     peakDb = ts.peakDb;
     loopEnabled = ts.loopEnabled;
+    pitchSemitones = ts.pitchSemitones;
+    tempoPercent = ts.tempoPercent;
     fileDuration = ts.fileDuration;
     sampleRate = ts.sampleRate;
     selectedField = ts.selectedField;
@@ -859,6 +869,15 @@ function formatDb(db) {
     return sign + db.toFixed(1) + "dB";
 }
 
+function formatPitch(semi) {
+    if (semi === 0) return "0";
+    var sign = semi > 0 ? "+" : "";
+    var whole = Math.floor(Math.abs(semi));
+    var cents = Math.round((Math.abs(semi) - whole) * 100);
+    if (cents === 0) return sign + (semi > 0 ? whole : -whole) + "st";
+    return sign + (semi > 0 ? whole : -whole) + "." + (cents < 10 ? "0" : "") + cents + "st";
+}
+
 /**
  * Format selection duration for display.
  * Adaptive precision: 3 decimals for <1s, 2 for <10s, 1 for rest.
@@ -909,6 +928,10 @@ function getKnobLabel(knobIndex) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
             return shiftHeld ? "Normalize" : "Gain:" + formatDb(gainDb);
         }
+    } else if (knobIndex === 6) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Pitch:" + formatPitch(pitchSemitones);
+    } else if (knobIndex === 7) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
     }
     return "";
 }
@@ -1166,6 +1189,9 @@ function loadFileIntoEditor(filePath) {
         host_module_set_param("file_path", filePath);
     }
     host_module_set_param("dirty", "1");
+    /* Reset pitch/tempo on new file */
+    pitchSemitones = 0.0;
+    tempoPercent = 100;
     refreshFileInfo();
     waveformDirty = true;
     refreshWaveform();
@@ -1480,6 +1506,7 @@ function buildModeHeader(modeName) {
     if (dirty) s += "*";
     if (loopEnabled) s += " L";
     if (trackStates[activeTrack].gateMode) s += " G";
+    if (pitchSemitones !== 0 || tempoPercent !== 100) s += " P";
     return s;
 }
 
@@ -4509,6 +4536,31 @@ function handleCC(cc, value) {
         return; /* E6 has no function in other views */
     }
 
+    /* E7 (Knob 7): Pitch adjust in VIEW_TRIM/VIEW_LOOP */
+    if (cc === CC_E7) {
+        var delta = decodeDelta(value);
+        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+            if (shiftHeld) {
+                /* Fine: cents, +-1 cent per click */
+                var cents = Math.round(pitchSemitones * 100);
+                cents += delta;
+                if (cents < -1200) cents = -1200;
+                if (cents > 1200) cents = 1200;
+                pitchSemitones = cents / 100.0;
+            } else {
+                /* Coarse: semitones, +-1 per click */
+                var semi = Math.round(pitchSemitones);
+                semi += delta;
+                if (semi < -12) semi = -12;
+                if (semi > 12) semi = 12;
+                pitchSemitones = semi;
+            }
+            host_module_set_param("pitch", pitchSemitones.toFixed(2));
+            showKnobStatus(6, "Pitch:" + formatPitch(pitchSemitones));
+        }
+        return;
+    }
+
     /* E8 (Knob 8): Slice select in VIEW_SLICE */
     if (cc === CC_E8) {
         var delta = decodeDelta(value);
@@ -4516,32 +4568,40 @@ function handleCC(cc, value) {
             var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
             if (newIdx < 0) newIdx = 0;
             if (newIdx >= sliceCount) newIdx = sliceCount - 1;
-            selectSlice(newIdx);
+            selectSlice(newIdx);showStatus
             syncMarkersToDs();
             updateSlicePadLeds();
             showKnobStatus(7, "Slice " + (selectedSlice + 1) + "/" + sliceCount);
             return;
         }
+        /* Tempo adjust in VIEW_TRIM/VIEW_LOOP */
+        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+            var step = shiftHeld ? 1 : 5;
+            tempoPercent += delta * step;
+            if (tempoPercent < 50) tempoPercent = 50;
+            if (tempoPercent > 200) tempoPercent = 200;
+            host_module_set_param("tempo", String(tempoPercent));
+            showKnobStatus(7, "Tempo:" + tempoPercent + "%");
+            return;
+        }
     }
 
-    /* E7/E8 twist actions: turn confirms/cancels pending action */
-    if (cc === CC_E7 || cc === CC_E8) {
-        var delta = decodeDelta(value);
-        if (delta > 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-            /* Twist right = execute */
-            if (pendingTwistAction.action === "toggle_loop") {
-                toggleLoop();
-            } else if (pendingTwistAction.action === "zero_cross") {
-                snapToZeroCrossing();
-            }
-            pendingTwistAction = null;
-        } else if (delta < 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-            /* Twist left = cancel */
-            pendingTwistAction = null;
-            showStatus("Cancelled", 20);
-        }
-        return;
-    }
+    /* E8 twist action: turn confirms/cancels pending action */
+    // if (cc === CC_E8) {
+    //     var delta = decodeDelta(value);
+    //     if (delta > 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
+    //         /* Twist right = execute */
+    //         if (pendingTwistAction.action === "zero_cross") {
+    //             snapToZeroCrossing();
+    //         }
+    //         pendingTwistAction = null;
+    //     } else if (delta < 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
+    //         /* Twist left = cancel */
+    //         pendingTwistAction = null;
+    //         showStatus("Cancelled", 20);
+    //     }
+    //     return;
+    // }
 }
 
 /**
@@ -4551,13 +4611,8 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
-    /* Knob touch: twist actions for E7 (loop) and E8 (zero crossing) */
+    /* Knob touch: twist action for E8 (zero crossing) */
     if (velocity > 0) {
-        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
-            pendingTwistAction = { cc: CC_E7, action: "toggle_loop" };
-            showStatus("Twist: Loop " + (loopEnabled ? "Off" : "On"), 9999);
-            return;
-        }
         if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
             pendingTwistAction = { cc: CC_E8, action: "zero_cross" };
             showStatus("Twist: Zero Cross Snap", 9999);
@@ -4565,7 +4620,7 @@ function handleNote(note, velocity) {
         }
     } else {
         /* Touch release: cancel pending and clear prompt */
-        if ((note === MoveKnob7Touch || note === MoveKnob8Touch) && pendingTwistAction) {
+        if (note === MoveKnob8Touch && pendingTwistAction) {
             pendingTwistAction = null;
             statusTimer = 0;
             statusMsg = "";
