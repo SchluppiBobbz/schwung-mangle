@@ -148,7 +148,6 @@ var currentView = VIEW_TRIM;
 var shiftHeld = false;
 
 /* Twist-action knob state (touch + twist right = execute, twist left = cancel) */
-var pendingTwistAction = null; /* { cc, action, prompt } or null */
 
 /* File info */
 var fileName = "";
@@ -828,6 +827,22 @@ function updateLeds() {
     /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
     setLED(STEP_BASE + 14, (isTrim || isBpm) ? BrightGreen : Black);
     setLED(STEP_BASE + 15, (isTrim || isBpm) ? BrightRed : isSlice ? BrightRed : Black);
+
+    /* Pad LEDs: only illuminate pads with functions in Trim/BPM views */
+    if (isTrim || isBpm) {
+        for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
+            var padIdx = p - PAD_NOTE_MIN;
+            if (padIdx === 0) {
+                /* Pad 1: audition — show play state */
+                setLED(p, (activePadNote === p) ? PAD_COLOR_PLAY : PAD_COLOR_DIM);
+            } else if (padIdx === 8) {
+                /* Pad 9: stop playback */
+                setLED(p, playing ? BrightRed : DarkGrey);
+            } else {
+                setLED(p, Black);
+            }
+        }
+    }
 }
 
 /* ============ Helpers ============ */
@@ -920,9 +935,9 @@ function getKnobLabel(knobIndex) {
             return shiftHeld ? "Normalize" : "Gain:" + formatDb(gainDb);
         }
     } else if (knobIndex === 6) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Pitch:" + formatPitch(pitchSemitones);
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP) return "Pitch:" + formatPitch(pitchSemitones);
     } else if (knobIndex === 7) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
     }
     return "";
 }
@@ -2173,10 +2188,6 @@ function switchView(view) {
         refreshState();
         refreshWaveform();
         updateLeds();
-        /* Reset pad LEDs — may be stale from slice mode */
-        for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
-            setLED(p, PAD_COLOR_DIM);
-        }
         announce("Edit, " + fileName);
     } else if (view === VIEW_LOOP) {
         /* Auto-enable loop when entering loop mode */
@@ -2187,19 +2198,11 @@ function switchView(view) {
         refreshState();
         invalidateSeamWaveform();
         updateLeds();
-        /* Reset pad LEDs — may be stale from slice mode */
-        for (var p2 = PAD_NOTE_MIN; p2 <= PAD_NOTE_MAX; p2++) {
-            setLED(p2, PAD_COLOR_DIM);
-        }
         announce("Loop, " + fileName);
     } else if (view === VIEW_BPM_TRIM) {
         refreshState();
         refreshWaveform();
         updateLeds();
-        /* Reset pad LEDs — may be stale from slice mode */
-        for (var p3 = PAD_NOTE_MIN; p3 <= PAD_NOTE_MAX; p3++) {
-            setLED(p3, PAD_COLOR_DIM);
-        }
         announce("BPM, " + fileName);
     } else if (view === VIEW_SLICE) {
         /* Disable looping for slice audition */
@@ -3806,7 +3809,8 @@ function handleCC(cc, value) {
     /* Remove (Delete) button: cut (all views) */
     if (cc === CC_DELETE && value > 0) {
         if (currentView === VIEW_SLICE) {
-            doSliceCut();
+            doSliceCut(); 
+
         } else if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
             doCut();
         } else if (currentView === VIEW_LOOP) {
@@ -4559,10 +4563,10 @@ function handleCC(cc, value) {
         return; /* E6 has no function in other views */
     }
 
-    /* E7 (Knob 7): Pitch adjust in VIEW_TRIM/VIEW_LOOP */
+    /* E7 (Knob 7): Pitch adjust in VIEW_TRIM/VIEW_BPM_TRIM/VIEW_LOOP */
     if (cc === CC_E7) {
         var delta = decodeDelta(value);
-        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP)) {
             if (shiftHeld) {
                 /* Fine: cents, +-1 cent per click */
                 var cents = Math.round(pitchSemitones * 100);
@@ -4591,16 +4595,16 @@ function handleCC(cc, value) {
             var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
             if (newIdx < 0) newIdx = 0;
             if (newIdx >= sliceCount) newIdx = sliceCount - 1;
-            selectSlice(newIdx);showStatus
+            selectSlice(newIdx);
             syncMarkersToDs();
             updateSlicePadLeds();
             showKnobStatus(7, "Slice " + (selectedSlice + 1) + "/" + sliceCount);
             return;
         }
-        /* Tempo adjust in VIEW_TRIM/VIEW_LOOP */
-        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+        /* Tempo adjust in VIEW_TRIM/VIEW_BPM_TRIM/VIEW_LOOP — right = faster */
+        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP)) {
             var step = shiftHeld ? 1 : 5;
-            tempoPercent += delta * step;
+            tempoPercent -= delta * step;
             if (tempoPercent < 50) tempoPercent = 50;
             if (tempoPercent > 200) tempoPercent = 200;
             host_module_set_param("tempo", String(tempoPercent));
@@ -4609,22 +4613,6 @@ function handleCC(cc, value) {
         }
     }
 
-    /* E8 twist action: turn confirms/cancels pending action */
-    // if (cc === CC_E8) {
-    //     var delta = decodeDelta(value);
-    //     if (delta > 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-    //         /* Twist right = execute */
-    //         if (pendingTwistAction.action === "zero_cross") {
-    //             snapToZeroCrossing();
-    //         }
-    //         pendingTwistAction = null;
-    //     } else if (delta < 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-    //         /* Twist left = cancel */
-    //         pendingTwistAction = null;
-    //         showStatus("Cancelled", 20);
-    //     }
-    //     return;
-    // }
 }
 
 /**
@@ -4634,22 +4622,33 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
-    /* Knob touch: twist action for E8 (zero crossing) */
-    if (velocity > 0) {
-        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
-            pendingTwistAction = { cc: CC_E8, action: "zero_cross" };
-            showStatus("Twist: Zero Cross Snap", 9999);
+    /* Shift+Knob touch: reset pitch/tempo/gain */
+    if (velocity > 0 && shiftHeld) {
+        /* Shift+Knob7Touch: reset pitch (VIEW_TRIM, VIEW_BPM_TRIM) */
+        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
+            pitchSemitones = 0.0;
+            host_module_set_param("pitch", "0.00");
+            showKnobStatus(6, "Pitch:0");
+            showStatus("Pitch Reset", 60);
             return;
         }
-    } else {
-        /* Touch release: cancel pending and clear prompt */
-        if (note === MoveKnob8Touch && pendingTwistAction) {
-            pendingTwistAction = null;
-            statusTimer = 0;
-            statusMsg = "";
+        /* Shift+Knob8Touch: reset tempo (VIEW_TRIM, VIEW_BPM_TRIM) */
+        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
+            tempoPercent = 100;
+            host_module_set_param("tempo", "100");
+            showKnobStatus(7, "Tempo:100%");
+            showStatus("Tempo Reset", 60);
+            return;
+        }
+        /* Shift+Knob5Touch: reset gain (VIEW_TRIM only) */
+        if (note === MoveKnob5Touch && currentView === VIEW_TRIM) {
+            gainDb = 0.0;
+            host_module_set_param("gain_db", "0.0");
+            showKnobStatus(4, "Gain:" + formatDb(gainDb));
+            showStatus("Gain Reset", 60);
+            return;
         }
     }
-
     /* Step 4: Toggle Gate/Trigger mode for active track */
     if (velocity > 0 && note === STEP_BASE + 3) {
         trackStates[activeTrack].gateMode = !trackStates[activeTrack].gateMode;
@@ -4760,42 +4759,55 @@ function handleNote(note, velocity) {
      * an earlier pad while a newer one is held does nothing. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_BPM_TRIM) {
-            /* Only Pad 1 triggers playback */
-            if (note !== PAD_NOTE_MIN) return;
-            var isGate = trackStates[activeTrack].gateMode;
-            if (velocity > 0) {
-                setLED(note, PAD_COLOR_PLAY);
-                activePadNote = note;
-                if (shiftHeld) {
-                    /* Shift+Pad 1: preview from before end marker (~20% of selection) */
-                    var selLen = endSample - startSample;
-                    var previewLen = Math.min(Math.max(Math.floor(selLen * 0.20), sampleRate), sampleRate * 20);
-                    var from = endSample - previewLen;
-                    if (from < startSample) from = startSample;
-                    startPlaybackFrom(from);
-                    showStatus("Preview End", 20);
-                } else if (isGate) {
-                    /* Gate mode: play selection while held */
-                    host_module_set_param("t" + activeTrack + ":gate_held", "1");
-                    startPlayback();
-                    showStatus("Gate", 20);
-                } else {
-                    /* Trigger mode: play selection on press */
-                    startPlayback();
-                    showStatus("Trigger", 20);
-                }
-            } else {
-                setLED(note, PAD_COLOR_DIM);
-                if (note === activePadNote) {
-                    activePadNote = -1;
-                    if (isGate) {
-                        /* Gate mode: release silences via DSP gate, then stop */
-                        host_module_set_param("t" + activeTrack + ":gate_held", "0");
-                        stopPlayback();
+            var padIdx = note - PAD_NOTE_MIN;
+
+            /* Pad 9: stop current track */
+            if (padIdx === 8 && velocity > 0) {
+                stopPlayback();
+                showStatus("Stop", 20);
+                updateLeds();
+                return;
+            }
+
+            /* Pad 1: audition */
+            if (padIdx === 0) {
+                var isGate = trackStates[activeTrack].gateMode;
+                if (velocity > 0) {
+                    setLED(note, PAD_COLOR_PLAY);
+                    activePadNote = note;
+                    if (shiftHeld) {
+                        /* Shift+Pad 1: preview from before end marker (~20% of selection) */
+                        var selLen = endSample - startSample;
+                        var previewLen = Math.min(Math.max(Math.floor(selLen * 0.20), sampleRate), sampleRate * 20);
+                        var from = endSample - previewLen;
+                        if (from < startSample) from = startSample;
+                        startPlaybackFrom(from);
+                        showStatus("Preview End", 20);
+                    } else if (isGate) {
+                        /* Gate mode: play selection while held */
+                        host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                        startPlayback();
+                        showStatus("Gate", 20);
+                    } else {
+                        /* Trigger mode: play selection on press */
+                        startPlayback();
+                        showStatus("Trigger", 20);
                     }
-                    /* Trigger mode: do NOT stop — let selection play to end */
+                } else {
+                    setLED(note, PAD_COLOR_DIM);
+                    if (note === activePadNote) {
+                        activePadNote = -1;
+                        if (isGate) {
+                            /* Gate mode: release silences via DSP gate, then stop */
+                            host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                            stopPlayback();
+                        }
+                        /* Trigger mode: do NOT stop — let selection play to end */
+                    }
                 }
             }
+
+            return; /* Ignore other pads in Trim/BPM */
         } else if (currentView === VIEW_SLICE) {
             var padIdx = note - PAD_NOTE_MIN;
             if (sliceMode === SLICE_MODE_LAZY && lazySub === LAZY_SUB_CHOP) {

@@ -10,16 +10,23 @@
  *
  * V2 API only - instance-based for multi-instance support.
  * Audio stored as interleaved stereo int16 (L,R,L,R,...).
+ *
+ * Uses Bungee library for high-quality time-stretching and pitch-shifting.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <math.h>
-#include <time.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <ctime>
+#include <algorithm>
 #include <unistd.h>
 #include <pwd.h>
+
+#include <bungee/Bungee.h>
+
+extern "C" {
 
 /* ============================================================================
  * Plugin API definitions (inlined to avoid path issues during cross-compile)
@@ -58,6 +65,8 @@ typedef struct plugin_api_v2 {
     void (*render_block)(void *instance, int16_t *out_interleaved_lr, int frames);
 } plugin_api_v2_t;
 
+} /* extern "C" */
+
 /* ============================================================================
  * Constants
  * ============================================================================ */
@@ -74,9 +83,9 @@ typedef struct plugin_api_v2 {
 /* Number of tracks */
 #define NUM_TRACKS 4
 
-/* OLA Time-Stretch constants */
-#define TS_WINDOW 1024
-#define TS_HOP    256
+/* Bungee output accumulator capacity per track (frames).
+ * Must hold several Bungee output grains. 8192 frames ≈ 0.19s at 44.1kHz. */
+#define BNG_OUT_BUF_CAPACITY 8192
 
 /* ============================================================================
  * Track structure — per-track audio state
@@ -131,12 +140,15 @@ typedef struct {
     float tempo_ratio;          /* cached: tempo_percent / 100.0 */
     double play_pos_frac;       /* fractional playback position */
 
-    /* OLA Time-Stretch state */
-    float  ts_prev_tail[TS_HOP * 2]; /* Overlap tail from previous grain (stereo) */
-    float  ts_out_buf[TS_HOP * 2];   /* Current output buffer (stereo floats) */
-    int    ts_out_idx;                /* Read position in ts_out_buf */
-    double ts_read_pos;               /* Grain read position in audio_data */
-    int    ts_initialized;            /* Reset on playback start */
+    /* Bungee time-stretch state */
+    Bungee::Stretcher<Bungee::Basic> *stretcher;
+    Bungee::Request bng_req;
+    float *bng_grain_input;     /* non-interleaved buffer [max_grain * 2] */
+    int    bng_max_grain;       /* maxInputFrameCount from stretcher */
+    float *bng_out_buf;         /* output accumulator (interleaved stereo float) */
+    int    bng_out_count;       /* frames currently buffered */
+    int    bng_play_start;      /* playback region start for Bungee */
+    int    bng_play_end;        /* playback region end for Bungee */
 
     char copy_result[256];
     char load_error[256];
@@ -807,6 +819,18 @@ static void free_track(track_t *t) {
         free(t->clipboard_data);
         t->clipboard_data = NULL;
     }
+    if (t->stretcher) {
+        delete t->stretcher;
+        t->stretcher = NULL;
+    }
+    if (t->bng_grain_input) {
+        free(t->bng_grain_input);
+        t->bng_grain_input = NULL;
+    }
+    if (t->bng_out_buf) {
+        free(t->bng_out_buf);
+        t->bng_out_buf = NULL;
+    }
 }
 
 /* ============================================================================
@@ -823,16 +847,30 @@ static void init_track(track_t *t) {
     t->pitch_ratio = 1.0f;
     t->tempo_ratio = 1.0f;
     t->play_pos_frac = 0.0;
-    t->ts_initialized = 0;
-    t->ts_out_idx = TS_HOP;
     t->zoom_level = 0;
     t->orig_format = 1;    /* PCM */
     t->orig_bits = 16;
     t->orig_channels = 2;  /* stereo */
     t->sample_rate = MOVE_SAMPLE_RATE;
+
+    /* Create Bungee stretcher for this track */
+    t->stretcher = new Bungee::Stretcher<Bungee::Basic>(
+        Bungee::SampleRates{MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE}, 2, 0);
+    t->bng_max_grain = t->stretcher->maxInputFrameCount();
+    t->bng_grain_input = (float *)calloc(t->bng_max_grain * 2, sizeof(float));
+    t->bng_out_buf = (float *)calloc(BNG_OUT_BUF_CAPACITY * 2, sizeof(float));
+    t->bng_out_count = 0;
+
+    /* Initialize Bungee request */
+    t->bng_req.position = 0.0;
+    t->bng_req.speed = 1.0;
+    t->bng_req.pitch = 1.0;
+    t->bng_req.reset = true;
+    t->bng_req.resampleMode = resampleMode_autoOut;
 }
 
 static void recompute_ratios(track_t *t);
+static void bng_reset_stretcher(track_t *t, double position);
 
 /* ============================================================================
  * V2 API implementation
@@ -930,11 +968,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     t->playing = 1;
                     t->play_pos = t->start_sample;
                     t->play_pos_frac = (double)t->start_sample;
-                    /* Reset OLA state */
-                    t->ts_read_pos = (double)t->start_sample;
-                    t->ts_initialized = 0;
-                    t->ts_out_idx = TS_HOP;
-                    memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
+                    /* Reset Bungee state */
+                    t->bng_out_count = 0;
+                    t->bng_play_start = t->start_sample;
+                    t->bng_play_end = t->end_sample;
+                    bng_reset_stretcher(t, (double)t->start_sample);
                 }
             } else {
                 t->playing = 0;
@@ -1082,16 +1120,18 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (whole) {
             t->play_pos = 0;
             t->play_pos_frac = 0.0;
-            t->ts_read_pos = 0.0;
+            t->bng_play_start = 0;
+            t->bng_play_end = t->audio_frames;
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, 0.0);
         } else {
             t->play_pos = t->start_sample;
             t->play_pos_frac = (double)t->start_sample;
-            t->ts_read_pos = (double)t->start_sample;
+            t->bng_play_start = t->start_sample;
+            t->bng_play_end = t->end_sample;
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, (double)t->start_sample);
         }
-        /* Reset OLA state for fresh playback */
-        t->ts_initialized = 0;
-        t->ts_out_idx = TS_HOP;
-        memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
         {
             char dbg[256];
             snprintf(dbg, sizeof(dbg), "PLAY t%d: whole=%d start=%d end=%d pos=%d total=%d",
@@ -1114,11 +1154,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->playing = 1;
         t->play_pos = pos;
         t->play_pos_frac = (double)pos;
-        /* Reset OLA state */
-        t->ts_read_pos = (double)pos;
-        t->ts_initialized = 0;
-        t->ts_out_idx = TS_HOP;
-        memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
+        /* Reset Bungee state */
+        t->bng_play_start = t->start_sample;
+        t->bng_play_end = t->end_sample;
+        t->bng_out_count = 0;
+        bng_reset_stretcher(t, (double)pos);
         return;
     }
 
@@ -1159,6 +1199,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 12.0f) v = 12.0f;
         t->pitch_semitones = v;
         recompute_ratios(t);
+        t->bng_req.pitch = pow(2.0, (double)v / 12.0);
         return;
     }
 
@@ -1169,6 +1210,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 200) v = 200;
         t->tempo_percent = v;
         recompute_ratios(t);
+        t->bng_req.speed = (double)v / 100.0;
         return;
     }
 
@@ -2262,87 +2304,39 @@ static void recompute_ratios(track_t *t) {
     t->tempo_ratio = (float)t->tempo_percent / 100.0f;
 }
 
-/* ---- OLA time-stretch ---- */
+/* ---- Bungee time-stretch helpers ---- */
 
-/*
- * Read one sample from audio_data with linear interpolation at fractional pos.
- * Returns stereo pair via out_l/out_r. Clamps to [0, audio_frames-1].
- */
-static void ts_read_sample(const track_t *t, double pos,
-                           float *out_l, float *out_r) {
-    int idx = (int)pos;
-    float frac = (float)(pos - (double)idx);
-    if (idx < 0) idx = 0;
-    if (idx >= t->audio_frames) idx = t->audio_frames - 1;
-    int next = idx + 1;
-    if (next >= t->audio_frames) next = idx;
+/* Feed a grain to the stretcher from int16 audio_data (converts to float).
+ * Handles out-of-bounds frames via muteHead/muteTail. */
+static void bng_feed_grain(track_t *t, const Bungee::InputChunk &chunk) {
+    int len = chunk.end - chunk.begin;
+    int stride = t->bng_max_grain;
 
-    *out_l = (float)t->audio_data[idx * 2]
-           + frac * ((float)t->audio_data[next * 2] - (float)t->audio_data[idx * 2]);
-    *out_r = (float)t->audio_data[idx * 2 + 1]
-           + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[idx * 2 + 1]);
+    memset(t->bng_grain_input, 0, stride * 2 * sizeof(float));
+
+    for (int i = 0; i < len; i++) {
+        int src = chunk.begin + i;
+        if (src >= 0 && src < t->audio_frames) {
+            t->bng_grain_input[i]          = (float)t->audio_data[src * 2 + 0] / 32768.0f;
+            t->bng_grain_input[stride + i] = (float)t->audio_data[src * 2 + 1] / 32768.0f;
+        }
+    }
+
+    int muteHead = std::max(0, -chunk.begin);
+    int muteTail = std::max(0, chunk.end - t->audio_frames);
+
+    t->stretcher->analyseGrain(t->bng_grain_input, stride, muteHead, muteTail);
 }
 
-/*
- * Generate TS_HOP output frames using OLA time-stretching.
- * Reads a TS_WINDOW grain from audio_data at ts_read_pos with pitch_ratio rate,
- * crossfades first TS_HOP frames with previous tail, outputs TS_HOP frames.
- * Returns 0 if playback ended.
- */
-static int ts_generate_block(track_t *t, int play_start, int play_end) {
-    int region_len = play_end - play_start;
-    if (region_len <= 0) return 0;
-
-    float grain_l[TS_WINDOW];
-    float grain_r[TS_WINDOW];
-
-    /* Read TS_WINDOW frames from audio at ts_read_pos with pitch_ratio rate */
-    double read_pos = t->ts_read_pos;
-    for (int i = 0; i < TS_WINDOW; i++) {
-        /* Boundary: wrap or clamp */
-        double rp = read_pos + (double)i * (double)t->pitch_ratio;
-        if (t->play_loop && region_len > 0) {
-            while (rp >= (double)play_end) rp -= (double)region_len;
-            while (rp < (double)play_start) rp += (double)region_len;
-        } else if (rp >= (double)play_end) {
-            /* Fill rest with silence */
-            for (int j = i; j < TS_WINDOW; j++) {
-                grain_l[j] = 0.0f;
-                grain_r[j] = 0.0f;
-            }
-            break;
-        }
-        ts_read_sample(t, rp, &grain_l[i], &grain_r[i]);
-    }
-
-    /* Crossfade first TS_HOP frames with prev_tail using Hann window */
-    for (int i = 0; i < TS_HOP; i++) {
-        float w = 0.5f * (1.0f - cosf(3.14159265f * (float)i / (float)TS_HOP));
-        t->ts_out_buf[i * 2]     = t->ts_prev_tail[i * 2]     * (1.0f - w) + grain_l[i] * w;
-        t->ts_out_buf[i * 2 + 1] = t->ts_prev_tail[i * 2 + 1] * (1.0f - w) + grain_r[i] * w;
-    }
-
-    /* Copy tail of grain (last TS_HOP frames) to prev_tail for next overlap */
-    for (int i = 0; i < TS_HOP; i++) {
-        int src = TS_WINDOW - TS_HOP + i;
-        t->ts_prev_tail[i * 2]     = grain_l[src];
-        t->ts_prev_tail[i * 2 + 1] = grain_r[src];
-    }
-
-    /* Advance read position: hop in output time scaled by tempo */
-    double advance = (double)TS_HOP * (double)t->pitch_ratio / (double)t->tempo_ratio;
-    t->ts_read_pos += advance;
-
-    /* Boundary check */
-    if (t->play_loop && region_len > 0) {
-        while (t->ts_read_pos >= (double)play_end)
-            t->ts_read_pos -= (double)region_len;
-    } else if (t->ts_read_pos >= (double)play_end) {
-        return 0; /* Playback ended */
-    }
-
-    t->ts_out_idx = 0;
-    return 1;
+/* Reset Bungee stretcher for playback start or loop wrap. */
+static void bng_reset_stretcher(track_t *t, double position) {
+    if (!t->stretcher) return;
+    t->bng_req.position = position;
+    t->bng_req.speed = (double)t->tempo_percent / 100.0;
+    t->bng_req.pitch = pow(2.0, (double)t->pitch_semitones / 12.0);
+    t->bng_req.reset = true;
+    t->bng_req.resampleMode = resampleMode_autoOut;
+    t->stretcher->preroll(t->bng_req);
 }
 
 /* ---- render_block ---- */
@@ -2374,16 +2368,15 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         linear_gain = powf(10.0f, t->gain_db / 20.0f);
     }
 
-    /* Bypass OLA when pitch and tempo are both ~1.0 (direct playback) */
-    int use_ola = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
-                    fabsf(t->tempo_ratio - 1.0f) < 0.001f);
+    /* Use Bungee when pitch or tempo differ from default */
+    int use_bungee = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
+                       fabsf(t->tempo_ratio - 1.0f) < 0.001f);
 
     int region_len = play_end - play_start;
     int produced = 0;
 
-    if (!use_ola) {
-        /* Direct playback path (original behavior) */
-        double rate = (double)t->pitch_ratio;
+    if (!use_bungee) {
+        /* Direct playback path (no pitch/tempo change) */
         for (int i = 0; i < frames; i++) {
             if (!t->playing) {
                 out[i * 2]     = 0;
@@ -2418,7 +2411,7 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             float sample_r = (float)t->audio_data[pos_int * 2 + 1]
                             + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[pos_int * 2 + 1]);
 
-            t->play_pos_frac += rate;
+            t->play_pos_frac += 1.0;
             t->play_pos = (int)t->play_pos_frac;
             produced = 1;
 
@@ -2434,48 +2427,85 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             out[i * 2]     = (int16_t)sample_l;
             out[i * 2 + 1] = (int16_t)sample_r;
         }
-    } else {
-        /* OLA time-stretch path */
-        for (int i = 0; i < frames; i++) {
-            if (!t->playing) {
-                out[i * 2]     = 0;
-                out[i * 2 + 1] = 0;
-                continue;
-            }
+    } else if (t->stretcher) {
+        /* Bungee time-stretch path */
 
-            /* Refill OLA buffer when exhausted */
-            if (t->ts_out_idx >= TS_HOP) {
-                if (!ts_generate_block(t, play_start, play_end)) {
-                    if (!t->play_loop) {
-                        t->playing = 0;
-                        out[i * 2]     = 0;
-                        out[i * 2 + 1] = 0;
-                        continue;
-                    }
+        /* Fill output accumulator from Bungee grains until we have enough */
+        int safety = 256;
+        while (t->bng_out_count < frames && safety-- > 0) {
+            /* Handle loop wrap */
+            if (t->bng_req.position >= (double)play_end) {
+                if (t->play_loop && region_len > 0) {
+                    double wrapped = (double)play_start +
+                        fmod(t->bng_req.position - (double)play_start, (double)region_len);
+                    if (wrapped < (double)play_start) wrapped = (double)play_start;
+                    bng_reset_stretcher(t, wrapped);
+                } else {
+                    t->playing = 0;
+                    break;
                 }
             }
 
-            float sample_l = t->ts_out_buf[t->ts_out_idx * 2];
-            float sample_r = t->ts_out_buf[t->ts_out_idx * 2 + 1];
-            t->ts_out_idx++;
-            produced = 1;
+            Bungee::InputChunk chunk = t->stretcher->specifyGrain(t->bng_req);
+            bng_feed_grain(t, chunk);
 
-            /* Update play_pos for UI cursor */
-            t->play_pos = (int)t->ts_read_pos;
-            t->play_pos_frac = t->ts_read_pos;
+            Bungee::OutputChunk output{};
+            t->stretcher->synthesiseGrain(output);
+
+            /* Append output to accumulator */
+            int space = BNG_OUT_BUF_CAPACITY - t->bng_out_count;
+            int toCopy = std::min(output.frameCount, space);
+            for (int i = 0; i < toCopy; i++) {
+                int idx = (t->bng_out_count + i) * 2;
+                t->bng_out_buf[idx + 0] = output.data[i];
+                t->bng_out_buf[idx + 1] = output.data[i + output.channelStride];
+            }
+            t->bng_out_count += toCopy;
+
+            t->stretcher->next(t->bng_req);
+            t->bng_req.reset = false;
+        }
+
+        /* Drain frames from accumulator to output */
+        int avail = std::min(t->bng_out_count, frames);
+        for (int i = 0; i < avail; i++) {
+            float L = t->bng_out_buf[i * 2 + 0] * 32768.0f;
+            float R = t->bng_out_buf[i * 2 + 1] * 32768.0f;
 
             if (linear_gain != 1.0f) {
-                sample_l *= linear_gain;
-                sample_r *= linear_gain;
+                L *= linear_gain;
+                R *= linear_gain;
             }
-            if (sample_l > 32767.0f) sample_l = 32767.0f;
-            if (sample_l < -32768.0f) sample_l = -32768.0f;
-            if (sample_r > 32767.0f) sample_r = 32767.0f;
-            if (sample_r < -32768.0f) sample_r = -32768.0f;
+            if (L > 32767.0f) L = 32767.0f;
+            if (L < -32768.0f) L = -32768.0f;
+            if (R > 32767.0f) R = 32767.0f;
+            if (R < -32768.0f) R = -32768.0f;
 
-            out[i * 2]     = (int16_t)sample_l;
-            out[i * 2 + 1] = (int16_t)sample_r;
+            out[i * 2 + 0] = (int16_t)L;
+            out[i * 2 + 1] = (int16_t)R;
         }
+
+        /* Zero-fill if we ran short */
+        for (int i = avail; i < frames; i++) {
+            out[i * 2 + 0] = 0;
+            out[i * 2 + 1] = 0;
+        }
+
+        /* Shift remaining frames to front of accumulator */
+        int remaining = t->bng_out_count - avail;
+        if (remaining > 0) {
+            memmove(t->bng_out_buf, t->bng_out_buf + avail * 2,
+                    remaining * 2 * sizeof(float));
+        }
+        t->bng_out_count = remaining;
+
+        /* Update play_pos for UI cursor from Bungee position */
+        t->play_pos = (int)t->bng_req.position;
+        if (t->play_pos < 0) t->play_pos = 0;
+        if (t->play_pos >= t->audio_frames) t->play_pos = t->audio_frames - 1;
+        t->play_pos_frac = t->bng_req.position;
+
+        produced = (avail > 0) ? 1 : 0;
     }
 
     return produced;
@@ -2529,10 +2559,10 @@ static plugin_api_v2_t s_plugin_api = {
     .render_block = v2_render_block,
 };
 
-__attribute__((visibility("default")))
+extern "C" __attribute__((visibility("default")))
 void *move_plugin_init_v2(const host_api_v1_t *host_api) {
     if (!host_api) return NULL;
     g_host = host_api;
-    plugin_log("Plugin initialized (V2 4-track stereo)");
+    plugin_log("Plugin initialized (V2 4-track stereo, Bungee)");
     return &s_plugin_api;
 }
