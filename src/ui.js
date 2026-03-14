@@ -146,6 +146,8 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 
 var currentView = VIEW_TRIM;
 var shiftHeld = false;
+var deleteHeld = false;
+var deletePendingCut = false;
 
 /* Twist-action knob state (touch + twist right = execute, twist left = cancel) */
 
@@ -3806,16 +3808,25 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Remove (Delete) button: cut (all views) */
-    if (cc === CC_DELETE && value > 0) {
-        if (currentView === VIEW_SLICE) {
-            doSliceCut(); 
-
-        } else if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
-            doCut();
-        } else if (currentView === VIEW_LOOP) {
-            doCut();
-            invalidateSeamWaveform();
+    /* Remove (Delete) button: cut (all views), or hold as modifier for combos */
+    if (cc === CC_DELETE) {
+        if (value > 0) {
+            deleteHeld = true;
+            deletePendingCut = true;
+        } else {
+            /* Release: execute cut only if no combo was used */
+            if (deletePendingCut) {
+                if (currentView === VIEW_SLICE) {
+                    doSliceCut();
+                } else if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
+                    doCut();
+                } else if (currentView === VIEW_LOOP) {
+                    doCut();
+                    invalidateSeamWaveform();
+                }
+            }
+            deleteHeld = false;
+            deletePendingCut = false;
         }
         return;
     }
@@ -4621,6 +4632,36 @@ function handleCC(cc, value) {
 function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
+
+    /* Delete+Knob touch: reset pitch/tempo/gain */
+    if (velocity > 0 && deleteHeld) {
+        deletePendingCut = false; /* combo used — cancel the pending cut */
+        /* Delete+Knob7Touch: reset pitch (VIEW_TRIM, VIEW_BPM_TRIM) */
+        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
+            pitchSemitones = 0.0;
+            host_module_set_param("pitch", "0.00");
+            showKnobStatus(6, "Pitch:0");
+            showStatus("Pitch Reset", 60);
+            return;
+        }
+        /* Delete+Knob8Touch: reset tempo (VIEW_TRIM, VIEW_BPM_TRIM) */
+        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
+            tempoPercent = 100;
+            host_module_set_param("tempo", "100");
+            showKnobStatus(7, "Tempo:100%");
+            showStatus("Tempo Reset", 60);
+            return;
+        }
+        /* Delete+Knob5Touch: reset gain (VIEW_TRIM only) */
+        if (note === MoveKnob5Touch && currentView === VIEW_TRIM) {
+            gainDb = 0.0;
+            host_module_set_param("gain_db", "0.0");
+            showKnobStatus(4, "Gain:" + formatDb(gainDb));
+            showStatus("Gain Reset", 60);
+            return;
+        }
+        return;
+    }
 
     /* Shift+Knob touch: reset pitch/tempo/gain */
     if (velocity > 0 && shiftHeld) {
