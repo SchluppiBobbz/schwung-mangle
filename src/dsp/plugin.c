@@ -74,6 +74,10 @@ typedef struct plugin_api_v2 {
 /* Number of tracks */
 #define NUM_TRACKS 4
 
+/* OLA Time-Stretch constants */
+#define TS_WINDOW 1024
+#define TS_HOP    256
+
 /* ============================================================================
  * Track structure — per-track audio state
  * ============================================================================ */
@@ -123,8 +127,16 @@ typedef struct {
 
     float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
     int   tempo_percent;        /* 50 to 200 */
-    float playback_rate;        /* computed: pitch_ratio * tempo_ratio */
+    float pitch_ratio;          /* cached: pow(2, pitch_semitones/12) */
+    float tempo_ratio;          /* cached: tempo_percent / 100.0 */
     double play_pos_frac;       /* fractional playback position */
+
+    /* OLA Time-Stretch state */
+    float  ts_prev_tail[TS_HOP * 2]; /* Overlap tail from previous grain (stereo) */
+    float  ts_out_buf[TS_HOP * 2];   /* Current output buffer (stereo floats) */
+    int    ts_out_idx;                /* Read position in ts_out_buf */
+    double ts_read_pos;               /* Grain read position in audio_data */
+    int    ts_initialized;            /* Reset on playback start */
 
     char copy_result[256];
     char load_error[256];
@@ -808,8 +820,11 @@ static void init_track(track_t *t) {
     t->mode = 0;
     t->pitch_semitones = 0.0f;
     t->tempo_percent = 100;
-    t->playback_rate = 1.0f;
+    t->pitch_ratio = 1.0f;
+    t->tempo_ratio = 1.0f;
     t->play_pos_frac = 0.0;
+    t->ts_initialized = 0;
+    t->ts_out_idx = TS_HOP;
     t->zoom_level = 0;
     t->orig_format = 1;    /* PCM */
     t->orig_bits = 16;
@@ -817,7 +832,7 @@ static void init_track(track_t *t) {
     t->sample_rate = MOVE_SAMPLE_RATE;
 }
 
-static void recompute_playback_rate(track_t *t);
+static void recompute_ratios(track_t *t);
 
 /* ============================================================================
  * V2 API implementation
@@ -915,6 +930,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                     t->playing = 1;
                     t->play_pos = t->start_sample;
                     t->play_pos_frac = (double)t->start_sample;
+                    /* Reset OLA state */
+                    t->ts_read_pos = (double)t->start_sample;
+                    t->ts_initialized = 0;
+                    t->ts_out_idx = TS_HOP;
+                    memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
                 }
             } else {
                 t->playing = 0;
@@ -955,7 +975,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         /* Reset pitch/tempo on new file */
         t->pitch_semitones = 0.0f;
         t->tempo_percent = 100;
-        recompute_playback_rate(t);
+        recompute_ratios(t);
 
         /* Load the file */
         if (load_wav(t, val) == 0) {
@@ -1062,10 +1082,16 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (whole) {
             t->play_pos = 0;
             t->play_pos_frac = 0.0;
+            t->ts_read_pos = 0.0;
         } else {
             t->play_pos = t->start_sample;
             t->play_pos_frac = (double)t->start_sample;
+            t->ts_read_pos = (double)t->start_sample;
         }
+        /* Reset OLA state for fresh playback */
+        t->ts_initialized = 0;
+        t->ts_out_idx = TS_HOP;
+        memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
         {
             char dbg[256];
             snprintf(dbg, sizeof(dbg), "PLAY t%d: whole=%d start=%d end=%d pos=%d total=%d",
@@ -1088,6 +1114,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->playing = 1;
         t->play_pos = pos;
         t->play_pos_frac = (double)pos;
+        /* Reset OLA state */
+        t->ts_read_pos = (double)pos;
+        t->ts_initialized = 0;
+        t->ts_out_idx = TS_HOP;
+        memset(t->ts_prev_tail, 0, sizeof(t->ts_prev_tail));
         return;
     }
 
@@ -1127,7 +1158,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < -12.0f) v = -12.0f;
         if (v > 12.0f) v = 12.0f;
         t->pitch_semitones = v;
-        recompute_playback_rate(t);
+        recompute_ratios(t);
         return;
     }
 
@@ -1137,7 +1168,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < 50) v = 50;
         if (v > 200) v = 200;
         t->tempo_percent = v;
-        recompute_playback_rate(t);
+        recompute_ratios(t);
         return;
     }
 
@@ -1447,6 +1478,47 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             char log_buf[128];
             snprintf(log_buf, sizeof(log_buf),
                      "Fade out %d-%d (%d frames)", start, end, len);
+            plugin_log(log_buf);
+        }
+        return;
+    }
+
+    if (strcmp(param, "reverse") == 0) {
+        /* Reverse selection in-place (swap stereo frame pairs) */
+        if (!t->audio_data || t->audio_frames <= 0) return;
+
+        int start = t->start_sample;
+        int end   = t->end_sample;
+        if (start < 0) start = 0;
+        if (end > t->audio_frames) end = t->audio_frames;
+        if (start >= end) {
+            plugin_log("Reverse: invalid selection");
+            return;
+        }
+
+        save_undo(t);
+
+        int i = start;
+        int j = end - 1;
+        while (i < j) {
+            /* Swap stereo pairs */
+            int16_t tmp_l = t->audio_data[i * 2];
+            int16_t tmp_r = t->audio_data[i * 2 + 1];
+            t->audio_data[i * 2]     = t->audio_data[j * 2];
+            t->audio_data[i * 2 + 1] = t->audio_data[j * 2 + 1];
+            t->audio_data[j * 2]     = tmp_l;
+            t->audio_data[j * 2 + 1] = tmp_r;
+            i++;
+            j--;
+        }
+
+        t->dirty = 1;
+        compute_waveform(t, 128);
+
+        {
+            char log_buf[128];
+            snprintf(log_buf, sizeof(log_buf),
+                     "Reversed %d-%d (%d frames)", start, end, end - start);
             plugin_log(log_buf);
         }
         return;
@@ -2185,10 +2257,92 @@ static int v2_get_error(void *instance, char *buf, int buf_len) {
 
 /* ---- pitch/tempo helpers ---- */
 
-static void recompute_playback_rate(track_t *t) {
-    float pitch_ratio = powf(2.0f, t->pitch_semitones / 12.0f);
-    float tempo_ratio = (float)t->tempo_percent / 100.0f;
-    t->playback_rate = pitch_ratio * tempo_ratio;
+static void recompute_ratios(track_t *t) {
+    t->pitch_ratio = powf(2.0f, t->pitch_semitones / 12.0f);
+    t->tempo_ratio = (float)t->tempo_percent / 100.0f;
+}
+
+/* ---- OLA time-stretch ---- */
+
+/*
+ * Read one sample from audio_data with linear interpolation at fractional pos.
+ * Returns stereo pair via out_l/out_r. Clamps to [0, audio_frames-1].
+ */
+static void ts_read_sample(const track_t *t, double pos,
+                           float *out_l, float *out_r) {
+    int idx = (int)pos;
+    float frac = (float)(pos - (double)idx);
+    if (idx < 0) idx = 0;
+    if (idx >= t->audio_frames) idx = t->audio_frames - 1;
+    int next = idx + 1;
+    if (next >= t->audio_frames) next = idx;
+
+    *out_l = (float)t->audio_data[idx * 2]
+           + frac * ((float)t->audio_data[next * 2] - (float)t->audio_data[idx * 2]);
+    *out_r = (float)t->audio_data[idx * 2 + 1]
+           + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[idx * 2 + 1]);
+}
+
+/*
+ * Generate TS_HOP output frames using OLA time-stretching.
+ * Reads a TS_WINDOW grain from audio_data at ts_read_pos with pitch_ratio rate,
+ * crossfades first TS_HOP frames with previous tail, outputs TS_HOP frames.
+ * Returns 0 if playback ended.
+ */
+static int ts_generate_block(track_t *t, int play_start, int play_end) {
+    int region_len = play_end - play_start;
+    if (region_len <= 0) return 0;
+
+    float grain_l[TS_WINDOW];
+    float grain_r[TS_WINDOW];
+
+    /* Read TS_WINDOW frames from audio at ts_read_pos with pitch_ratio rate */
+    double read_pos = t->ts_read_pos;
+    for (int i = 0; i < TS_WINDOW; i++) {
+        /* Boundary: wrap or clamp */
+        double rp = read_pos + (double)i * (double)t->pitch_ratio;
+        if (t->play_loop && region_len > 0) {
+            while (rp >= (double)play_end) rp -= (double)region_len;
+            while (rp < (double)play_start) rp += (double)region_len;
+        } else if (rp >= (double)play_end) {
+            /* Fill rest with silence */
+            for (int j = i; j < TS_WINDOW; j++) {
+                grain_l[j] = 0.0f;
+                grain_r[j] = 0.0f;
+            }
+            break;
+        }
+        ts_read_sample(t, rp, &grain_l[i], &grain_r[i]);
+    }
+
+    /* Crossfade first TS_HOP frames with prev_tail using Hann window */
+    for (int i = 0; i < TS_HOP; i++) {
+        float w = 0.5f * (1.0f - cosf(3.14159265f * (float)i / (float)TS_HOP));
+        t->ts_out_buf[i * 2]     = t->ts_prev_tail[i * 2]     * (1.0f - w) + grain_l[i] * w;
+        t->ts_out_buf[i * 2 + 1] = t->ts_prev_tail[i * 2 + 1] * (1.0f - w) + grain_r[i] * w;
+    }
+
+    /* Copy tail of grain (last TS_HOP frames) to prev_tail for next overlap */
+    for (int i = 0; i < TS_HOP; i++) {
+        int src = TS_WINDOW - TS_HOP + i;
+        t->ts_prev_tail[i * 2]     = grain_l[src];
+        t->ts_prev_tail[i * 2 + 1] = grain_r[src];
+    }
+
+    /* Advance read position: hop in output time scaled by tempo */
+    double advance = (double)TS_HOP * (double)t->pitch_ratio / (double)t->tempo_ratio;
+    t->ts_read_pos += advance;
+
+    /* Boundary check */
+    if (t->play_loop && region_len > 0) {
+        while (t->ts_read_pos >= (double)play_end)
+            t->ts_read_pos -= (double)region_len;
+    } else if (t->ts_read_pos >= (double)play_end) {
+        return 0; /* Playback ended */
+    }
+
+    t->ts_out_idx = 0;
+    return 1;
 }
 
 /* ---- render_block ---- */
@@ -2220,63 +2374,108 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         linear_gain = powf(10.0f, t->gain_db / 20.0f);
     }
 
-    double rate = (double)t->playback_rate;
+    /* Bypass OLA when pitch and tempo are both ~1.0 (direct playback) */
+    int use_ola = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
+                    fabsf(t->tempo_ratio - 1.0f) < 0.001f);
+
     int region_len = play_end - play_start;
-
     int produced = 0;
-    for (int i = 0; i < frames; i++) {
-        if (!t->playing) {
-            out[i * 2]     = 0;
-            out[i * 2 + 1] = 0;
-            continue;
-        }
 
-        /* Loop/stop check using fractional position */
-        while (t->play_pos_frac >= (double)play_end) {
-            if (t->play_loop && region_len > 0) {
-                t->play_pos_frac -= (double)region_len;
-            } else {
-                t->playing = 0;
-                break;
+    if (!use_ola) {
+        /* Direct playback path (original behavior) */
+        double rate = (double)t->pitch_ratio;
+        for (int i = 0; i < frames; i++) {
+            if (!t->playing) {
+                out[i * 2]     = 0;
+                out[i * 2 + 1] = 0;
+                continue;
             }
-        }
-        if (!t->playing) {
-            out[i * 2]     = 0;
-            out[i * 2 + 1] = 0;
+
+            while (t->play_pos_frac >= (double)play_end) {
+                if (t->play_loop && region_len > 0) {
+                    t->play_pos_frac -= (double)region_len;
+                } else {
+                    t->playing = 0;
+                    break;
+                }
+            }
+            if (!t->playing) {
+                out[i * 2]     = 0;
+                out[i * 2 + 1] = 0;
+                t->play_pos = (int)t->play_pos_frac;
+                continue;
+            }
+
+            int pos_int = (int)t->play_pos_frac;
+            float frac = (float)(t->play_pos_frac - (double)pos_int);
+            int next = pos_int + 1;
+            if (next >= play_end) {
+                next = t->play_loop ? play_start : pos_int;
+            }
+
+            float sample_l = (float)t->audio_data[pos_int * 2]
+                            + frac * ((float)t->audio_data[next * 2] - (float)t->audio_data[pos_int * 2]);
+            float sample_r = (float)t->audio_data[pos_int * 2 + 1]
+                            + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[pos_int * 2 + 1]);
+
+            t->play_pos_frac += rate;
             t->play_pos = (int)t->play_pos_frac;
-            continue;
+            produced = 1;
+
+            if (linear_gain != 1.0f) {
+                sample_l *= linear_gain;
+                sample_r *= linear_gain;
+            }
+            if (sample_l > 32767.0f) sample_l = 32767.0f;
+            if (sample_l < -32768.0f) sample_l = -32768.0f;
+            if (sample_r > 32767.0f) sample_r = 32767.0f;
+            if (sample_r < -32768.0f) sample_r = -32768.0f;
+
+            out[i * 2]     = (int16_t)sample_l;
+            out[i * 2 + 1] = (int16_t)sample_r;
         }
+    } else {
+        /* OLA time-stretch path */
+        for (int i = 0; i < frames; i++) {
+            if (!t->playing) {
+                out[i * 2]     = 0;
+                out[i * 2 + 1] = 0;
+                continue;
+            }
 
-        /* Linear interpolation between adjacent samples */
-        int pos_int = (int)t->play_pos_frac;
-        float frac = (float)(t->play_pos_frac - (double)pos_int);
+            /* Refill OLA buffer when exhausted */
+            if (t->ts_out_idx >= TS_HOP) {
+                if (!ts_generate_block(t, play_start, play_end)) {
+                    if (!t->play_loop) {
+                        t->playing = 0;
+                        out[i * 2]     = 0;
+                        out[i * 2 + 1] = 0;
+                        continue;
+                    }
+                }
+            }
 
-        int next = pos_int + 1;
-        if (next >= play_end) {
-            next = t->play_loop ? play_start : pos_int;
+            float sample_l = t->ts_out_buf[t->ts_out_idx * 2];
+            float sample_r = t->ts_out_buf[t->ts_out_idx * 2 + 1];
+            t->ts_out_idx++;
+            produced = 1;
+
+            /* Update play_pos for UI cursor */
+            t->play_pos = (int)t->ts_read_pos;
+            t->play_pos_frac = t->ts_read_pos;
+
+            if (linear_gain != 1.0f) {
+                sample_l *= linear_gain;
+                sample_r *= linear_gain;
+            }
+            if (sample_l > 32767.0f) sample_l = 32767.0f;
+            if (sample_l < -32768.0f) sample_l = -32768.0f;
+            if (sample_r > 32767.0f) sample_r = 32767.0f;
+            if (sample_r < -32768.0f) sample_r = -32768.0f;
+
+            out[i * 2]     = (int16_t)sample_l;
+            out[i * 2 + 1] = (int16_t)sample_r;
         }
-
-        float sample_l = (float)t->audio_data[pos_int * 2]
-                        + frac * ((float)t->audio_data[next * 2] - (float)t->audio_data[pos_int * 2]);
-        float sample_r = (float)t->audio_data[pos_int * 2 + 1]
-                        + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[pos_int * 2 + 1]);
-
-        t->play_pos_frac += rate;
-        t->play_pos = (int)t->play_pos_frac;
-        produced = 1;
-
-        /* Apply gain preview */
-        if (linear_gain != 1.0f) {
-            sample_l *= linear_gain;
-            sample_r *= linear_gain;
-        }
-        if (sample_l > 32767.0f) sample_l = 32767.0f;
-        if (sample_l < -32768.0f) sample_l = -32768.0f;
-        if (sample_r > 32767.0f) sample_r = 32767.0f;
-        if (sample_r < -32768.0f) sample_r = -32768.0f;
-
-        out[i * 2]     = (int16_t)sample_l;
-        out[i * 2 + 1] = (int16_t)sample_r;
     }
 
     return produced;

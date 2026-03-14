@@ -437,11 +437,7 @@ function restoreTrackUIState(idx) {
  * Switch to a different track. If already on this track, toggle play.
  */
 function switchToTrack(idx) {
-    if (idx === activeTrack && trackStates[idx].loaded) {
-        /* Second press on active track = toggle play */
-        toggleTrackPlay(idx);
-        return;
-    }
+    if (idx === activeTrack) return;
     /* Save current state */
     saveTrackUIState(activeTrack);
     activeTrack = idx;
@@ -455,19 +451,6 @@ function switchToTrack(idx) {
     /* Re-fetch file info from DSP */
     refreshFileInfo();
     announce("Track " + (idx + 1));
-}
-
-/**
- * Toggle play/stop for a specific track.
- */
-function toggleTrackPlay(idx) {
-    var ts = trackStates[idx];
-    ts.playing = !ts.playing;
-    host_module_set_param("t" + idx + ":play",
-        ts.playing ? "selection" : "stop");
-    if (idx === activeTrack) {
-        playing = ts.playing;
-    }
 }
 
 /**
@@ -752,10 +735,12 @@ function initLedsStep() {
     /* Step 4 (Gate/Trigger) + Step 5 (Clock Sync) — init to Black */
     commands.push(function() { setLED(STEP_BASE + 3, Black, true); });
     commands.push(function() { setLED(STEP_BASE + 4, Black, true); });
-    /* Step 9/10 (Fade In/Out) — init to Black */
+    /* Step 9/10 (Fade In/Out) + Step 11 (Reverse) — init to Black */
     commands.push(function() { setLED(STEP_BASE + 8, Black, true); });
     commands.push(function() { setLED(STEP_BASE + 9, Black, true); });
-    /* Step 15/16 marker-set LEDs — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 10, Black, true); });
+    /* Step 14 (Reset) + Step 15/16 marker-set LEDs — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 13, Black, true); });
     commands.push(function() { setLED(STEP_BASE + 14, Black, true); });
     commands.push(function() { setLED(STEP_BASE + 15, Black, true); });
 
@@ -833,6 +818,12 @@ function updateLeds() {
     var hasFade = isTrim || isBpm || isSlice;
     setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
     setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
+
+    /* Step 11: Reverse LED (Trim/BPM/Slice) */
+    setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
+
+    /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
+    setLED(STEP_BASE + 13, (isTrim || isBpm || isSlice) ? BrightRed : Black);
 
     /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
     setLED(STEP_BASE + 14, (isTrim || isBpm) ? BrightGreen : Black);
@@ -2766,6 +2757,38 @@ function doFadeOut() {
     invalidateWaveform();
 }
 
+function doReverse() {
+    syncMarkersToDs();
+    host_module_set_param("reverse", "1");
+    showStatus("Reverse", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
+function doResetFile() {
+    if (!openedFilePath || totalFrames <= 0) {
+        showStatus("No file", 60);
+        return;
+    }
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking("file_path", openedFilePath, 2000);
+    } else {
+        host_module_set_param("file_path", openedFilePath);
+    }
+    pitchSemitones = 0.0;
+    tempoPercent = 100;
+    gainDb = 0.0;
+    zoomLevel = 0;
+    vScale = 1.0;
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    showStatus("Reset", 60);
+    announce("File Reset");
+    updateLeds();
+}
+
 /**
  * Cut selection to clipboard (copy + remove).
  */
@@ -4661,10 +4684,26 @@ function handleNote(note, velocity) {
         }
     }
 
+    /* Step 11: reverse selection (Trim/BPM/Slice) */
+    if (velocity > 0 && note === STEP_BASE + 10) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
+            doReverse();
+            return;
+        }
+    }
+
     /* Step 16: shuffle slices (Slice view only) */
     if (velocity > 0 && note === STEP_BASE + 15 && currentView === VIEW_SLICE) {
         doSliceShuffle();
         return;
+    }
+
+    /* Step 14: reset/reload file (Trim/BPM/Slice) */
+    if (velocity > 0 && note === STEP_BASE + 13) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
+            doResetFile();
+            return;
+        }
     }
 
     /* Step 15/16: set start/end marker at playback position */
@@ -4721,12 +4760,14 @@ function handleNote(note, velocity) {
      * an earlier pad while a newer one is held does nothing. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
         if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_BPM_TRIM) {
+            /* Only Pad 1 triggers playback */
+            if (note !== PAD_NOTE_MIN) return;
             var isGate = trackStates[activeTrack].gateMode;
             if (velocity > 0) {
                 setLED(note, PAD_COLOR_PLAY);
                 activePadNote = note;
                 if (shiftHeld) {
-                    /* Shift+pad: preview from before end marker (~20% of selection) */
+                    /* Shift+Pad 1: preview from before end marker (~20% of selection) */
                     var selLen = endSample - startSample;
                     var previewLen = Math.min(Math.max(Math.floor(selLen * 0.20), sampleRate), sampleRate * 20);
                     var from = endSample - previewLen;
@@ -4734,14 +4775,13 @@ function handleNote(note, velocity) {
                     startPlaybackFrom(from);
                     showStatus("Preview End", 20);
                 } else if (isGate) {
-                    /* Gate mode: play while held, DSP silences on gate_held=0 */
+                    /* Gate mode: play selection while held */
                     host_module_set_param("t" + activeTrack + ":gate_held", "1");
                     startPlayback();
                     showStatus("Gate", 20);
                 } else {
-                    /* Trigger mode: play whole file on press */
-                    pendingPlay = "whole";
-                    playing = true;
+                    /* Trigger mode: play selection on press */
+                    startPlayback();
                     showStatus("Trigger", 20);
                 }
             } else {
@@ -4753,7 +4793,7 @@ function handleNote(note, velocity) {
                         host_module_set_param("t" + activeTrack + ":gate_held", "0");
                         stopPlayback();
                     }
-                    /* Trigger mode: do NOT stop — let file play to end */
+                    /* Trigger mode: do NOT stop — let selection play to end */
                 }
             }
         } else if (currentView === VIEW_SLICE) {
@@ -4788,18 +4828,38 @@ function handleNote(note, velocity) {
                 /* Normal slice or lazy play mode: audition slices */
                 var sliceIdx = slicePadOffset + padIdx;
                 if (sliceIdx < sliceCount) {
+                    var isGateSlice = trackStates[activeTrack].gateMode;
                     if (velocity > 0) {
                         selectSlice(sliceIdx);
                         updateSlicePadLeds();
                         setLED(note, PAD_COLOR_PLAY);
                         activePadNote = note;
-                        startPlayback();
-                        showStatus("Slice " + (sliceIdx + 1), 20);
+                        if (shiftHeld) {
+                            /* Shift+Pad: play sequentially from this slice to end */
+                            endSample = sliceBoundaries[sliceCount];
+                            syncMarkersToDs();
+                            startPlayback();
+                            showStatus("Play " + (sliceIdx + 1) + "-" + sliceCount, 20);
+                        } else if (isGateSlice) {
+                            /* Gate mode: play slice while held */
+                            host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                            startPlayback();
+                            showStatus("Gate " + (sliceIdx + 1), 20);
+                        } else {
+                            /* Trigger mode: play slice */
+                            startPlayback();
+                            showStatus("Slice " + (sliceIdx + 1), 20);
+                        }
                     } else {
                         updateSlicePadLeds();
                         if (note === activePadNote) {
                             activePadNote = -1;
-                            stopPlayback();
+                            if (isGateSlice) {
+                                /* Gate mode: stop on release */
+                                host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                                stopPlayback();
+                            }
+                            /* Trigger mode: do NOT stop — let slice play to end */
                         }
                     }
                 }
