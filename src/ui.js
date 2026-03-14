@@ -2170,8 +2170,8 @@ function drawBpmTrim() {
     fill_rect(0, 0, eraseW, 10, 0);
     print(0, 0, bpmHeader, 1);
 
-    /* Overwrite the status area at very bottom with BPM info (unless a timed status is showing) */
-    if (statusTimer <= 0) {
+    /* Overwrite the status area at very bottom with BPM info (unless a timed status or knob status is showing) */
+    if (getActiveStatus() === "") {
         var bpmStatus = "BPM:" + bpm.toFixed(1) + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
                         "  " + (selectedField === 0 ? "[Start]" : "[End]");
         fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
