@@ -86,6 +86,14 @@ var VIEW_SLICE = 9;
 var VIEW_JOG_MENU = 10;
 var VIEW_JOG_SHIFT_MENU = 11;
 var VIEW_BPM_TRIM = 12;
+var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
+var VIEW_SCENE    = 14;  /* Scene launcher with skipback */
+
+/* Skipback / scenes constants */
+var MAX_SCENES = 4;
+var SKIPBACK_BARS_OPTIONS = [1, 2, 4, 8];
+var SKIPBACK_SOURCE_ACT = 0;   /* active track ring buffer */
+var SKIPBACK_SOURCE_MIX = 1;   /* master mix ring buffer */
 
 /* MIDI CCs — use shared constants */
 var CC_JOG = MoveMainKnob;
@@ -269,6 +277,25 @@ var TRACK_CCS = [43, 42, 41, 40];
 /* MovePlay CC */
 var CC_PLAY = 85;
 
+/* ============ Project / Skipback / Scene State ============ */
+
+var projectDir = "";          /* e.g. ".../Recordings/Project_20260315_1430" or "_no_project" */
+var projectBrowserState = null;
+
+/* Skipback settings */
+var skipbackBarsIdx   = 1;    /* index into SKIPBACK_BARS_OPTIONS → 2 bars default */
+var skipbackSourceIdx = 0;    /* SKIPBACK_SOURCE_ACT or SKIPBACK_SOURCE_MIX */
+var skipbackPending   = false;
+var skipbackCaptureSeconds = 0;
+
+/* Quantized scene switching */
+var pendingSceneSwitch      = -1;
+var pendingSceneSwitchTrack = -1;
+var lastBarBoundaryPos      = 0;
+
+/* Scene pad flash counter */
+var sceneFlashCounter = 0;
+
 /* Track state array — each track stores its own copy of per-track UI state */
 var trackStates = [];
 
@@ -307,7 +334,10 @@ function makeTrackState() {
         /* Misc */
         pendingPlay: "", activePadNote: -1,
         playLoop: false, playWhole: false,
-        isRecordedFile: false, openedFilePath: ""
+        isRecordedFile: false, openedFilePath: "",
+        /* Scenes */
+        scenes: [],     /* array of WAV paths, index 0 = original loaded file */
+        activeScene: 0  /* which scene is currently loaded */
     };
 }
 
@@ -377,6 +407,7 @@ function saveTrackUIState(idx) {
     ts.activePadNote = activePadNote;
     ts.isRecordedFile = isRecordedFile;
     ts.openedFilePath = openedFilePath;
+    /* Scenes — not proxied into globals, stored only in trackStates */
 }
 
 /**
@@ -668,6 +699,75 @@ function restoreSliceState() {
     }
 }
 
+/* ============ Scene / Project persistence helpers ============ */
+
+/**
+ * Persist per-track scene state to the DSP (survives reconnect).
+ */
+function saveSceneState(trackIdx) {
+    var ts = trackStates[trackIdx];
+    var json = JSON.stringify({ scenes: ts.scenes, activeScene: ts.activeScene });
+    host_module_set_param("t" + trackIdx + ":scene_state", json);
+}
+
+/**
+ * Restore per-track scene state from the DSP on reconnect.
+ * Returns true if there were scenes to restore.
+ */
+function restoreSceneState(trackIdx) {
+    var raw = host_module_get_param("t" + trackIdx + ":scene_state");
+    if (!raw || raw.length < 2) return false;
+    try {
+        var s = JSON.parse(raw);
+        trackStates[trackIdx].scenes      = s.scenes      || [];
+        trackStates[trackIdx].activeScene = s.activeScene || 0;
+        return trackStates[trackIdx].scenes.length > 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Write project.json to the project folder.
+ */
+function saveProjectJson() {
+    if (!projectDir || projectDir === "_no_project") return;
+    var d = { version: 1, tracks: [] };
+    for (var _st = 0; _st < NUM_TRACKS; _st++) {
+        d.tracks.push({
+            scenes: trackStates[_st].scenes,
+            activeScene: trackStates[_st].activeScene
+        });
+    }
+    if (typeof host_write_file === "function") {
+        host_write_file(projectDir + "/project.json", JSON.stringify(d));
+    }
+}
+
+/**
+ * Load project.json from the project folder and restore all tracks.
+ * Returns true on success.
+ */
+function loadProjectJson() {
+    if (!projectDir || projectDir === "_no_project") return false;
+    if (typeof host_read_file !== "function") return false;
+    var raw = host_read_file(projectDir + "/project.json");
+    if (!raw || raw.length < 2) return false;
+    try {
+        var d = JSON.parse(raw);
+        for (var _lt = 0; _lt < NUM_TRACKS; _lt++) {
+            var td = (d.tracks && d.tracks[_lt]) || {};
+            trackStates[_lt].scenes      = td.scenes      || [];
+            trackStates[_lt].activeScene = td.activeScene || 0;
+            var path = trackStates[_lt].scenes[trackStates[_lt].activeScene];
+            if (path) host_module_set_param("t" + _lt + ":file_path", path);
+        }
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
 /* Loop state */
 var savedLoopState = false;
 var savedTempoPercent = 100;  /* global tempo saved/restored around VIEW_SLICE */
@@ -785,6 +885,14 @@ function initLedsStep() {
 function updateLeds() {
     if (ledInitPending) return; /* Don't send until init completes */
 
+    var isScene = (currentView === VIEW_SCENE);
+
+    /* VIEW_SCENE has its own full LED layout */
+    if (isScene) {
+        updateSceneLeds();
+        return;
+    }
+
     var isTrim  = (currentView === VIEW_TRIM);
     var isBpm   = (currentView === VIEW_BPM_TRIM);
     var isSlice = (currentView === VIEW_SLICE);
@@ -828,6 +936,9 @@ function updateLeds() {
     /* Step 5: Clock Sync LED */
     var syncOn = (host_module_get_param("sync_clock") === "1");
     setLED(STEP_BASE + 4, isEdit ? (syncOn ? BrightGreen : DarkGrey) : Black);
+
+    /* Step 6: Scene view LED */
+    setLED(STEP_BASE + 5, isEdit ? VividYellow : Black);
 
     /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
     var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
@@ -2443,6 +2554,213 @@ function enterOpenFileBrowser() {
     announce("Open File, " + dirName + ", " + first);
 }
 
+/* ============ Scene helpers ============ */
+
+/**
+ * Apply a scene switch immediately: load the WAV and start playback.
+ */
+function applySceneSwitch(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    ts.activeScene = sceneIdx;
+    var path = ts.scenes[sceneIdx];
+    saveSceneState(trackIdx);
+    host_module_set_param("t" + trackIdx + ":file_path", path);
+    host_module_set_param("t" + trackIdx + ":play", "whole");
+    ts.playing = true;
+    if (trackIdx === activeTrack) {
+        playing = true;
+        openedFilePath = path;
+        waveformDirty = true;
+        refreshFileInfo();
+    }
+    updateTrackLEDs();
+    showStatus("Scene " + (sceneIdx + 1), 30);
+    lastBarBoundaryPos = playPos;
+}
+
+/**
+ * Trigger a scene — quantized if already playing, immediate otherwise.
+ */
+function switchScene(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    if (sceneIdx >= ts.scenes.length) return;
+    if (ts.playing && sceneIdx !== ts.activeScene) {
+        pendingSceneSwitch = sceneIdx;
+        pendingSceneSwitchTrack = trackIdx;
+        showStatus("Cue S" + (sceneIdx + 1), 30);
+    } else {
+        applySceneSwitch(trackIdx, sceneIdx);
+    }
+}
+
+/**
+ * Trigger skipback: extract last N bars from ring buffer and save as new scene.
+ */
+function doSkipback() {
+    var ts = trackStates[activeTrack];
+    var slot = ts.scenes.length;
+    if (slot >= MAX_SCENES) {
+        showStatus("Max " + MAX_SCENES + " scenes", 60);
+        return;
+    }
+    var bars = SKIPBACK_BARS_OPTIONS[skipbackBarsIdx];
+    var barFrames = Math.round(44100 * 4 * 60 / bpm);
+    var extractFrames = bars * barFrames;
+    var source = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? String(activeTrack) : "master";
+    var dir = (projectDir && projectDir !== "_no_project") ? projectDir : SCRATCH_DIR;
+    if (typeof host_ensure_dir === "function") host_ensure_dir(dir);
+    var path = dir + "/t" + activeTrack + "_scene" + slot + ".wav";
+    host_module_set_param("skipback", source + "," + extractFrames + "," + path);
+    skipbackPending = true;
+    skipbackCaptureSeconds = extractFrames / 44100;  /* informational */
+    showStatus("Skipback " + bars + "b...", 90);
+}
+
+/**
+ * Update LEDs for VIEW_SCENE.
+ */
+function updateSceneLeds() {
+    var ts = trackStates[activeTrack];
+
+    /* All standard buttons off except Back */
+    setButtonLED(CC_BACK,    LED_DIM);
+    setButtonLED(CC_COPY,    LED_OFF);
+    setButtonLED(CC_MUTE,    LED_OFF);
+    setButtonLED(CC_DELETE,  LED_OFF);
+    setButtonLED(CC_UNDO,    LED_OFF);
+    setButtonLED(CC_LOOP,    LED_OFF);
+    setButtonLED(CC_CAPTURE, LED_OFF);
+    setButtonLED(CC_LEFT,    LED_OFF);
+    setButtonLED(CC_RIGHT,   LED_OFF);
+    setButtonLED(CC_UP,      LED_DIM);   /* UP = toggle source */
+    setButtonLED(CC_DOWN,    LED_OFF);
+    setButtonLED(CC_REC,     skipbackPending ? BrightRed : LED_DIM);
+
+    /* Step LEDs: 1-3 dim, Step 6 vivid yellow */
+    setLED(STEP_BASE + 0, DarkGrey);
+    setLED(STEP_BASE + 1, DarkGrey);
+    setLED(STEP_BASE + 2, DarkGrey);
+    setLED(STEP_BASE + 3, DarkGrey);
+    setLED(STEP_BASE + 4, DarkGrey);
+    setLED(STEP_BASE + 5, VividYellow);
+    for (var _sl = 6; _sl < 16; _sl++) setLED(STEP_BASE + _sl, Black);
+
+    /* Pad LEDs 1-4: map to scenes 0-3 */
+    sceneFlashCounter++;
+    var flashOn = (sceneFlashCounter % 12) < 6;
+    for (var _sp = 0; _sp < 32; _sp++) {
+        var padNote = PAD_NOTE_MIN + _sp;
+        if (_sp < MAX_SCENES) {
+            var isPending = (pendingSceneSwitch === _sp && pendingSceneSwitchTrack === activeTrack);
+            if (isPending) {
+                setLED(padNote, flashOn ? VividYellow : Black);
+            } else if (_sp === ts.activeScene && ts.scenes.length > _sp) {
+                setLED(padNote, BrightGreen);
+            } else if (_sp < ts.scenes.length) {
+                setLED(padNote, White);
+            } else {
+                setLED(padNote, DarkGrey);
+            }
+        } else {
+            setLED(padNote, Black);
+        }
+    }
+    updateTrackLEDs();
+    updatePlayLED();
+}
+
+/**
+ * Draw VIEW_SCENE — scene launcher + skipback controls.
+ */
+function drawSceneView() {
+    clear_screen();
+    var ts = trackStates[activeTrack];
+    var bars = SKIPBACK_BARS_OPTIONS[skipbackBarsIdx];
+    var srcLabel = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? "TRK" : "MIX";
+
+    /* Header */
+    print(0, 0, "T" + (activeTrack + 1) + " SCENES  SB:" + bars + "b " + srcLabel, 1);
+    fill_rect(0, 8, 128, 1, 1);
+
+    /* 4 scene boxes: 2x2 grid, each 62×22 px, left col x=0, right col x=64, rows y=11 and y=34 */
+    for (var _sc = 0; _sc < MAX_SCENES; _sc++) {
+        var bx = (_sc % 2) * 64;
+        var by = 11 + Math.floor(_sc / 2) * 23;
+        var hasScene = (_sc < ts.scenes.length);
+        var isActive = (_sc === ts.activeScene && hasScene);
+        var isPendSc = (pendingSceneSwitch === _sc && pendingSceneSwitchTrack === activeTrack);
+
+        if (isActive) {
+            fill_rect(bx, by, 62, 21, 1);
+        } else {
+            /* Draw outline: top, bottom, left, right */
+            fill_rect(bx,      by,      62, 1,  1);
+            fill_rect(bx,      by + 20, 62, 1,  1);
+            fill_rect(bx,      by,      1,  21, 1);
+            fill_rect(bx + 61, by,      1,  21, 1);
+        }
+
+        var label;
+        if (hasScene) {
+            var scPath = ts.scenes[_sc];
+            var scName = scPath.replace(/.*\//, "").replace(/\.wav$/i, "");
+            if (scName.length > 8) scName = scName.substring(0, 8);
+            label = "S" + (_sc + 1) + ":" + scName;
+        } else {
+            label = "S" + (_sc + 1) + ":-";
+        }
+
+        if (isPendSc) {
+            /* Blink label if pending switch */
+            if ((sceneFlashCounter % 12) < 6) {
+                print(bx + 2, by + 7, label, isActive ? 0 : 1);
+            }
+        } else {
+            print(bx + 2, by + 7, label, isActive ? 0 : 1);
+        }
+    }
+
+    /* Bottom hint */
+    var hint = skipbackPending ? "Recording..." : "REC=skip  JOG=bars  UP=src";
+    print(0, 57, hint, 1);
+}
+
+/* ============ Project folder browser ============ */
+
+/**
+ * Draw VIEW_PROJECT — project folder selection at startup.
+ */
+function drawProjectView() {
+    clear_screen();
+    print(0, 0, "SELECT PROJECT", 1);
+    fill_rect(0, 8, 128, 1, 1);
+
+    var state = projectBrowserState;
+    if (!state) {
+        print(4, 20, "Loading...", 1);
+        return;
+    }
+
+    /* Reuse filepath browser draw logic */
+    var items = state.items || [];
+    var sel = state.selectedIndex || 0;
+    var maxVisible = 4;
+    var startIdx = Math.max(0, sel - maxVisible + 1);
+    for (var _pi = 0; _pi < maxVisible; _pi++) {
+        var _idx = startIdx + _pi;
+        if (_idx >= items.length) break;
+        var _item = items[_idx];
+        var _y = 12 + _pi * 13;
+        if (_idx === sel) {
+            fill_rect(0, _y - 1, 128, 11, 1);
+            print(2, _y, _item.label, 0);
+        } else {
+            print(2, _y, _item.label, 1);
+        }
+    }
+    print(0, 57, "JOG=navigate  CLICK=select", 1);
+}
+
 function drawOpenFileBrowser() {
     clear_screen();
 
@@ -3860,7 +4178,15 @@ function handleCC(cc, value) {
             case VIEW_JOG_MENU:
             case VIEW_JOG_SHIFT_MENU:
             case VIEW_BPM_TRIM:
+            case VIEW_SCENE:
                 switchView(VIEW_TRIM);
+                break;
+            case VIEW_PROJECT:
+                /* Back on project browser = skip without selecting a project */
+                projectDir = "_no_project";
+                projectBrowserState = null;
+                currentView = VIEW_TRIM;
+                updateLeds();
                 break;
             case VIEW_CONFIRM_SAVE:
                 switchView(saveReturnView);
@@ -3993,6 +4319,15 @@ function handleCC(cc, value) {
     }
 
     /* REC button — start/stop recording */
+    /* CC_REC in VIEW_SCENE: trigger skipback instead of recording */
+    if (cc === CC_REC && value > 0 && currentView === VIEW_SCENE) {
+        if (!skipbackPending) {
+            doSkipback();
+            updateLeds();
+        }
+        return;
+    }
+
     if (cc === CC_REC && value > 0) {
         if (recordState === "ready") {
             /* Ensure parent directory exists */
@@ -4145,6 +4480,15 @@ function handleCC(cc, value) {
 
     /* Up/Down arrows */
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
+        if (currentView === VIEW_SCENE) {
+            /* UP: toggle skipback source (active track / master mix) */
+            if (cc === CC_UP) {
+                skipbackSourceIdx = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? SKIPBACK_SOURCE_MIX : SKIPBACK_SOURCE_ACT;
+                showStatus(skipbackSourceIdx === SKIPBACK_SOURCE_ACT ? "Src:Track" : "Src:Mix", 60);
+                updateLeds();
+            }
+            return;
+        }
         if (currentView === VIEW_BPM_TRIM) {
             if (cc === CC_DOWN) {
                 /* Down: read BPM from filename */
@@ -4243,6 +4587,14 @@ function handleCC(cc, value) {
                 announce(menuItems[menuIndex]);
                 break;
 
+            case VIEW_PROJECT:
+                if (projectBrowserState) {
+                    moveFilepathBrowserSelection(projectBrowserState, delta);
+                    var psel = projectBrowserState.items[projectBrowserState.selectedIndex];
+                    if (psel) announce(psel.label);
+                }
+                break;
+
             case VIEW_OPEN_FILE:
                 if (openFileBrowserState) {
                     moveFilepathBrowserSelection(openFileBrowserState, delta);
@@ -4312,6 +4664,12 @@ function handleCC(cc, value) {
                 if (jogShiftMenuIndex < 0) jogShiftMenuIndex = 0;
                 if (jogShiftMenuIndex >= jogShiftMenuItems.length) jogShiftMenuIndex = jogShiftMenuItems.length - 1;
                 announce(jogShiftMenuItems[jogShiftMenuIndex]);
+                break;
+
+            case VIEW_SCENE:
+                /* Jog cycles skipback bar length */
+                skipbackBarsIdx = (skipbackBarsIdx + (delta > 0 ? 1 : -1) + SKIPBACK_BARS_OPTIONS.length) % SKIPBACK_BARS_OPTIONS.length;
+                showStatus("SB:" + SKIPBACK_BARS_OPTIONS[skipbackBarsIdx] + "b", 60);
                 break;
 
             case VIEW_BPM_TRIM:
@@ -4420,6 +4778,48 @@ function handleCC(cc, value) {
                 showStatus(loopSelectedField === 0 ? "Loop Point" : "Loop End", 30);
                 break;
 
+
+            case VIEW_PROJECT:
+                if (projectBrowserState) {
+                    var pItem = projectBrowserState.items[projectBrowserState.selectedIndex];
+                    if (pItem && pItem.kind === "new_project") {
+                        /* Create a new timestamped project folder */
+                        var now = new Date();
+                        var pad2 = function(n) { return n < 10 ? "0" + n : String(n); };
+                        var ts = String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate()) +
+                                 "_" + pad2(now.getHours()) + pad2(now.getMinutes());
+                        projectDir = SCRATCH_DIR + "/Project_" + ts;
+                        if (typeof host_ensure_dir === "function") host_ensure_dir(projectDir);
+                        projectBrowserState = null;
+                        currentView = VIEW_TRIM;
+                        updateLeds();
+                        announce("Project " + projectDir.replace(/.*\//, ""));
+                    } else if (pItem && pItem.kind === "skip") {
+                        projectDir = "_no_project";
+                        projectBrowserState = null;
+                        currentView = VIEW_TRIM;
+                        updateLeds();
+                    } else if (pItem) {
+                        if (pItem.kind === "up") {
+                            /* Navigate up */
+                            activateFilepathBrowserItem(projectBrowserState);
+                            refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
+                            /* Re-prepend action items after refresh */
+                            projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
+                            projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
+                            projectBrowserState.selectedIndex = 0;
+                        } else if (pItem.kind === "dir") {
+                            /* Select this directory as the project folder */
+                            projectDir = pItem.path;
+                            projectBrowserState = null;
+                            loadProjectJson();
+                            currentView = VIEW_TRIM;
+                            updateLeds();
+                            announce("Project " + pItem.label);
+                        }
+                    }
+                }
+                break;
 
             case VIEW_OPEN_FILE:
                 if (openFileBrowserState) {
@@ -4838,6 +5238,20 @@ function handleNote(note, velocity) {
         return;
     }
 
+    /* Step 6: Enter/exit VIEW_SCENE */
+    if (velocity > 0 && note === STEP_BASE + 5) {
+        var editViews2 = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE, VIEW_LOOP, VIEW_SCENE];
+        if (editViews2.indexOf(currentView) >= 0) {
+            if (currentView === VIEW_SCENE) {
+                currentView = VIEW_TRIM;
+            } else {
+                currentView = VIEW_SCENE;
+            }
+            updateLeds();
+        }
+        return;
+    }
+
     /* Step 5: Toggle Clock Sync */
     if (velocity > 0 && note === STEP_BASE + 4) {
         var syncState = host_module_get_param("sync_clock");
@@ -5067,6 +5481,13 @@ function handleNote(note, velocity) {
                     }
                 }
             }
+        } else if (currentView === VIEW_SCENE) {
+            var padIdx = note - PAD_NOTE_MIN;
+            if (velocity > 0 && padIdx >= 0 && padIdx < MAX_SCENES) {
+                switchScene(activeTrack, padIdx);
+                updateLeds();
+            }
+            return;
         }
         return;
     }
@@ -5180,8 +5601,33 @@ globalThis.init = function() {
             recordBrowserDir = SCRATCH_DIR;
             recordState = "ready";
             recordLedCounter = 0;
-            announce("New Recording, press REC to record");
+
+            /* Show project browser at startup if no project is set yet */
+            if (!projectDir) {
+                projectBrowserState = buildFilepathBrowserState(
+                    { root: SCRATCH_DIR, name: "Project Folder" },
+                    ""
+                );
+                refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
+                /* Remove file entries (only show dirs), then prepend action items */
+                if (projectBrowserState && projectBrowserState.items) {
+                    projectBrowserState.items = projectBrowserState.items.filter(function(it) {
+                        return it.kind !== "file";
+                    });
+                    projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
+                    projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
+                    projectBrowserState.selectedIndex = 0;
+                }
+                currentView = VIEW_PROJECT;
+                announce("Select or create project folder");
+            } else {
+                announce("New Recording, press REC to record");
+            }
         } else {
+            /* Restore scene state for all tracks on reconnect/open-with-file */
+            for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
+                restoreSceneState(_ri);
+            }
             announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
         }
     }
@@ -5220,6 +5666,42 @@ globalThis.tick = function() {
             isRecordedFile = true;
             loadFileIntoEditor(recordFilePath);
             showStatus("Recorded " + fileName, 90);
+        }
+    }
+
+    /* Poll skipback result from DSP */
+    if (skipbackPending) {
+        var _sbResult = host_module_get_param("skipback_result");
+        if (_sbResult && _sbResult.length > 0) {
+            skipbackPending = false;
+            var _sbSlot = trackStates[activeTrack].scenes.length;
+            trackStates[activeTrack].scenes.push(_sbResult);
+            trackStates[activeTrack].activeScene = _sbSlot;
+            saveSceneState(activeTrack);
+            saveProjectJson();
+            /* Load new scene into DSP for this track */
+            host_module_set_param("t" + activeTrack + ":file_path", _sbResult);
+            if (activeTrack === activeTrack) {  /* always true; keep pattern consistent */
+                openedFilePath = _sbResult;
+                waveformDirty = true;
+                refreshFileInfo();
+            }
+            showStatus("Scene " + (_sbSlot + 1) + " saved", 90);
+            updateLeds();
+        }
+    }
+
+    /* Quantized scene switching — check bar boundary */
+    if (pendingSceneSwitch >= 0) {
+        var _barF = Math.round(44100 * 4 * 60 / bpm);
+        if (_barF > 0) {
+            var _barsPassed = Math.floor((playPos - lastBarBoundaryPos) / _barF);
+            if (_barsPassed >= 1) {
+                lastBarBoundaryPos += _barsPassed * _barF;
+                applySceneSwitch(pendingSceneSwitchTrack, pendingSceneSwitch);
+                pendingSceneSwitch = -1;
+                pendingSceneSwitchTrack = -1;
+            }
         }
     }
 
@@ -5347,6 +5829,12 @@ globalThis.tick = function() {
             break;
         case VIEW_BPM_TRIM:
             drawBpmTrim();
+            break;
+        case VIEW_SCENE:
+            drawSceneView();
+            break;
+        case VIEW_PROJECT:
+            drawProjectView();
             break;
     }
 };

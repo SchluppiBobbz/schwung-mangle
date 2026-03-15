@@ -83,6 +83,11 @@ typedef struct plugin_api_v2 {
 /* Number of tracks */
 #define NUM_TRACKS 4
 
+/* Skipback ring buffer size in frames.
+ * 8 bars at 60 BPM = 44100 * 4 * 8 = 1,411,200 frames.
+ * At 120 BPM this covers 16 bars — always sufficient for max 8-bar skipback. */
+#define RB_FRAMES (44100 * 4 * 8)
+
 /* Bungee output accumulator capacity per track (frames).
  * Must hold several Bungee output grains. 8192 frames ≈ 0.19s at 44.1kHz. */
 #define BNG_OUT_BUF_CAPACITY 8192
@@ -153,6 +158,7 @@ typedef struct {
     char copy_result[256];
     char load_error[256];
     char slice_state[2048];     /* JSON blob for UI slice state persistence */
+    char scene_state[1024];     /* JSON blob for UI scene state persistence */
 } track_t;
 
 /* ============================================================================
@@ -164,6 +170,13 @@ typedef struct {
     int active_track;           /* 0-3, which track is being edited */
     int sync_to_clock;          /* Global clock sync flag */
     char module_dir[512];
+
+    /* Skipback ring buffers — filled continuously during render_block */
+    int16_t *master_rb;              /* stereo circular buffer of master mix */
+    int      master_rb_write;        /* write position in frames */
+    int16_t *track_rb[NUM_TRACKS];   /* per-track stereo circular buffers */
+    int      track_rb_write[NUM_TRACKS];
+    char     skipback_result[512];   /* path of last successfully written skipback WAV */
 } instance_t;
 
 /* ============================================================================
@@ -898,6 +911,14 @@ static void* v2_create(const char *module_dir, const char *json_defaults) {
     inst->active_track = 0;
     inst->sync_to_clock = 0;
 
+    /* Allocate skipback ring buffers */
+    inst->master_rb = (int16_t *)calloc((size_t)RB_FRAMES * 2, sizeof(int16_t));
+    inst->master_rb_write = 0;
+    for (int i = 0; i < NUM_TRACKS; i++) {
+        inst->track_rb[i] = (int16_t *)calloc((size_t)RB_FRAMES * 2, sizeof(int16_t));
+        inst->track_rb_write[i] = 0;
+    }
+
     plugin_log("Instance created (4-track)");
     return inst;
 }
@@ -908,6 +929,12 @@ static void v2_destroy(void *instance) {
 
     for (int i = 0; i < NUM_TRACKS; i++) {
         free_track(&inst->tracks[i]);
+    }
+
+    /* Free skipback ring buffers */
+    free(inst->master_rb);
+    for (int i = 0; i < NUM_TRACKS; i++) {
+        free(inst->track_rb[i]);
     }
 
     free(inst);
@@ -985,6 +1012,52 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "sync_clock") == 0) {
         if (!val) return;
         inst->sync_to_clock = atoi(val) ? 1 : 0;
+        return;
+    }
+
+    /* --- Skipback: extract last N frames from a ring buffer and write WAV ---
+     * Format: "source,frames,path"
+     *   source: "master" or "0".."3" (track index)
+     *   frames: number of frames to extract
+     *   path:   output WAV file path
+     */
+    if (strcmp(key, "skipback") == 0) {
+        if (!val) return;
+        char source[16];
+        int  extract_frames = 0;
+        char path[512];
+        if (sscanf(val, "%15[^,],%d,%511s", source, &extract_frames, path) != 3) return;
+        if (extract_frames <= 0 || extract_frames > RB_FRAMES) extract_frames = RB_FRAMES;
+
+        int16_t *rb = NULL;
+        int write_pos = 0;
+        if (strcmp(source, "master") == 0) {
+            rb = inst->master_rb;
+            write_pos = inst->master_rb_write;
+        } else {
+            int ti = atoi(source);
+            if (ti >= 0 && ti < NUM_TRACKS) {
+                rb = inst->track_rb[ti];
+                write_pos = inst->track_rb_write[ti];
+            }
+        }
+        if (!rb) return;
+
+        /* Extract last extract_frames from circular buffer (linearise) */
+        int16_t *buf = (int16_t *)malloc((size_t)extract_frames * 2 * sizeof(int16_t));
+        if (!buf) return;
+        int start = (write_pos - extract_frames + RB_FRAMES) % RB_FRAMES;
+        for (int f = 0; f < extract_frames; f++) {
+            int ri = (start + f) % RB_FRAMES;
+            buf[f * 2]     = rb[ri * 2];
+            buf[f * 2 + 1] = rb[ri * 2 + 1];
+        }
+
+        write_wav(path, buf, extract_frames, MOVE_SAMPLE_RATE, 1, 16, 2);
+        free(buf);
+
+        strncpy(inst->skipback_result, path, sizeof(inst->skipback_result) - 1);
+        inst->skipback_result[sizeof(inst->skipback_result) - 1] = '\0';
         return;
     }
 
@@ -1993,6 +2066,17 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(param, "scene_state") == 0) {
+        /* Store UI scene state JSON for reconnect persistence */
+        if (val) {
+            strncpy(t->scene_state, val, sizeof(t->scene_state) - 1);
+            t->scene_state[sizeof(t->scene_state) - 1] = '\0';
+        } else {
+            t->scene_state[0] = '\0';
+        }
+        return;
+    }
+
     {
         char log_buf[256];
         snprintf(log_buf, sizeof(log_buf),
@@ -2022,6 +2106,13 @@ static int v2_get_param(void *instance, const char *key, char *buf,
 
     if (strcmp(key, "track_count") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%d", NUM_TRACKS);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
+    if (strcmp(key, "skipback_result") == 0) {
+        /* Returns the path of the last written skipback WAV, then clears it */
+        int n = snprintf(buf, (size_t)buf_len, "%s", inst->skipback_result);
+        inst->skipback_result[0] = '\0';  /* consume once */
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
@@ -2230,6 +2321,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
 
     if (strcmp(param, "slice_state") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%s", t->slice_state);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
+    if (strcmp(param, "scene_state") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%s", t->scene_state);
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
@@ -2729,8 +2825,22 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
     for (int ti = 0; ti < NUM_TRACKS; ti++) {
         track_t *t = &inst->tracks[ti];
 
-        if (!render_track(t, tmp, frames)) continue;
-        any_audio = 1;
+        /* Always render to tmp (silence if not playing) so ring buffer stays in sync */
+        int produced = render_track(t, tmp, frames);
+        if (produced) any_audio = 1;
+
+        /* Write per-track output to skipback ring buffer (silence if not playing) */
+        if (inst->track_rb[ti]) {
+            int wp = inst->track_rb_write[ti];
+            for (int f = 0; f < frames; f++) {
+                int ri = (wp + f) % RB_FRAMES;
+                inst->track_rb[ti][ri * 2]     = produced ? tmp[f * 2]     : 0;
+                inst->track_rb[ti][ri * 2 + 1] = produced ? tmp[f * 2 + 1] : 0;
+            }
+            inst->track_rb_write[ti] = (wp + frames) % RB_FRAMES;
+        }
+
+        if (!produced) continue;
 
         /* Mix into output with saturating addition */
         for (int i = 0; i < frames * 2; i++) {
@@ -2739,6 +2849,17 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
             if (sum < -32768) sum = -32768;
             out_interleaved_lr[i] = (int16_t)sum;
         }
+    }
+
+    /* Write master mix to skipback ring buffer */
+    if (inst->master_rb) {
+        int mwp = inst->master_rb_write;
+        for (int f = 0; f < frames; f++) {
+            int ri = (mwp + f) % RB_FRAMES;
+            inst->master_rb[ri * 2]     = out_interleaved_lr[f * 2];
+            inst->master_rb[ri * 2 + 1] = out_interleaved_lr[f * 2 + 1];
+        }
+        inst->master_rb_write = (mwp + frames) % RB_FRAMES;
     }
 
     (void)any_audio;
