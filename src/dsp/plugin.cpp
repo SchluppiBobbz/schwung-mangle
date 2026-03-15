@@ -1018,6 +1018,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         /* Load the file */
         if (load_wav(t, val) == 0) {
+            /* Recreate Bungee stretcher with the file's actual sample rate
+             * so pitch/tempo processing handles rate conversion correctly */
+            if (t->sample_rate != MOVE_SAMPLE_RATE && t->stretcher) {
+                delete t->stretcher;
+                t->stretcher = new Bungee::Stretcher<Bungee::Basic>(
+                    Bungee::SampleRates{t->sample_rate, MOVE_SAMPLE_RATE}, 2, 0);
+                int new_max = t->stretcher->maxInputFrameCount();
+                if (new_max != t->bng_max_grain) {
+                    t->bng_max_grain = new_max;
+                    free(t->bng_grain_input);
+                    t->bng_grain_input = (float *)calloc(new_max * 2, sizeof(float));
+                }
+            }
             /* Compute initial waveform and peak */
             compute_waveform(t, 128);
             t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
@@ -2375,10 +2388,11 @@ static void do_apply_pitch_tempo(track_t *t) {
 
     int region_frames = end - start;
 
-    /* Offline stretcher — separate instance so we don't disrupt playback state */
+    /* Offline stretcher — separate instance so we don't disrupt playback state.
+     * Use the file's actual sample rate as input rate for correct conversion. */
     Bungee::Stretcher<Bungee::Basic> *str =
         new Bungee::Stretcher<Bungee::Basic>(
-            Bungee::SampleRates{MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE}, 2, 0);
+            Bungee::SampleRates{t->sample_rate, MOVE_SAMPLE_RATE}, 2, 0);
     int max_grain = str->maxInputFrameCount();
 
     float *grain_buf = (float *)calloc(max_grain * 2, sizeof(float));
@@ -2554,6 +2568,10 @@ static int render_track(track_t *t, int16_t *out, int frames) {
     int use_bungee = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
                        fabsf(t->tempo_ratio - 1.0f) < 0.001f);
 
+    /* Sample-rate conversion ratio: advance faster for files with higher
+     * sample rates (e.g. 48000/44100 ≈ 1.0884 for 48 kHz files). */
+    double rate_inc = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+
     int region_len = play_end - play_start;
     int produced = 0;
 
@@ -2593,7 +2611,7 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             float sample_r = (float)t->audio_data[pos_int * 2 + 1]
                             + frac * ((float)t->audio_data[next * 2 + 1] - (float)t->audio_data[pos_int * 2 + 1]);
 
-            t->play_pos_frac += 1.0;
+            t->play_pos_frac += rate_inc;
             t->play_pos = (int)t->play_pos_frac;
             produced = 1;
 
