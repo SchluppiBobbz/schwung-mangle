@@ -871,6 +871,7 @@ static void init_track(track_t *t) {
 
 static void recompute_ratios(track_t *t);
 static void bng_reset_stretcher(track_t *t, double position);
+static void do_apply_pitch_tempo(track_t *t);
 
 /* ============================================================================
  * V2 API implementation
@@ -1331,6 +1332,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                      "Trimmed: %d-%d -> %d frames", start, end, new_frames);
             plugin_log(log_buf);
         }
+        return;
+    }
+
+    if (strcmp(param, "apply_pitch_tempo") == 0) {
+        do_apply_pitch_tempo(t);
         return;
     }
 
@@ -2337,6 +2343,182 @@ static void bng_reset_stretcher(track_t *t, double position) {
     t->bng_req.reset = true;
     t->bng_req.resampleMode = resampleMode_autoOut;
     t->stretcher->preroll(t->bng_req);
+}
+
+/*
+ * Destructively apply current pitch/tempo settings to the selected region
+ * [start_sample, end_sample]. Audio outside the region is preserved unchanged.
+ * After processing, pitch and tempo are reset to defaults.
+ */
+static void do_apply_pitch_tempo(track_t *t) {
+    if (!t->audio_data || t->audio_frames <= 0) return;
+    if (!t->stretcher) return;
+
+    int start = t->start_sample;
+    int end   = t->end_sample;
+    if (start < 0) start = 0;
+    if (end > t->audio_frames) end = t->audio_frames;
+    if (start >= end) {
+        plugin_log("apply_pitch_tempo: invalid selection");
+        return;
+    }
+
+    if (fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
+        fabsf(t->tempo_ratio  - 1.0f) < 0.001f) {
+        plugin_log("apply_pitch_tempo: pitch/tempo already at default, nothing to do");
+        return;
+    }
+
+    save_undo(t);
+    t->playing = 0;
+    t->bng_out_count = 0;
+
+    int region_frames = end - start;
+
+    /* Offline stretcher — separate instance so we don't disrupt playback state */
+    Bungee::Stretcher<Bungee::Basic> *str =
+        new Bungee::Stretcher<Bungee::Basic>(
+            Bungee::SampleRates{MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE}, 2, 0);
+    int max_grain = str->maxInputFrameCount();
+
+    float *grain_buf = (float *)calloc(max_grain * 2, sizeof(float));
+    if (!grain_buf) {
+        delete str;
+        plugin_log("apply_pitch_tempo: grain buffer alloc failed");
+        return;
+    }
+
+    /* Estimate output capacity (tempo < 1 → longer output) */
+    int out_capacity = (int)((double)region_frames / t->tempo_ratio) + 8192;
+    float *out_float = (float *)calloc(out_capacity * 2, sizeof(float));
+    if (!out_float) {
+        free(grain_buf);
+        delete str;
+        plugin_log("apply_pitch_tempo: output buffer alloc failed");
+        return;
+    }
+    int out_count = 0;
+
+    /* Initialise request */
+    Bungee::Request req;
+    req.position     = (double)start;
+    req.speed        = (double)t->tempo_percent / 100.0;
+    req.pitch        = pow(2.0, (double)t->pitch_semitones / 12.0);
+    req.reset        = true;
+    req.resampleMode = resampleMode_autoOut;
+    str->preroll(req);
+
+    /* Safety limit: generous upper bound on grain iterations */
+    int safety = region_frames * 8 + 16384;
+
+    while (req.position < (double)end && safety-- > 0) {
+        Bungee::InputChunk chunk = str->specifyGrain(req);
+        int len = chunk.end - chunk.begin;
+
+        memset(grain_buf, 0, max_grain * 2 * sizeof(float));
+        for (int i = 0; i < len; i++) {
+            int src = chunk.begin + i;
+            if (src >= 0 && src < t->audio_frames) {
+                grain_buf[i]             = (float)t->audio_data[src * 2 + 0] / 32768.0f;
+                grain_buf[max_grain + i] = (float)t->audio_data[src * 2 + 1] / 32768.0f;
+            }
+        }
+        /* Mute grain samples that fall outside [start, end] */
+        int muteHead = std::max(0, start - chunk.begin);
+        int muteTail = std::max(0, chunk.end - end);
+        str->analyseGrain(grain_buf, max_grain, muteHead, muteTail);
+
+        Bungee::OutputChunk output{};
+        str->synthesiseGrain(output);
+
+        /* Grow output buffer if needed */
+        if (out_count + output.frameCount > out_capacity) {
+            out_capacity = (out_count + output.frameCount) * 2;
+            float *nb = (float *)realloc(out_float, out_capacity * 2 * sizeof(float));
+            if (!nb) {
+                free(out_float);
+                free(grain_buf);
+                delete str;
+                plugin_log("apply_pitch_tempo: realloc failed");
+                return;
+            }
+            out_float = nb;
+        }
+
+        for (int i = 0; i < output.frameCount; i++) {
+            out_float[(out_count + i) * 2 + 0] = output.data[i];
+            out_float[(out_count + i) * 2 + 1] = output.data[i + output.channelStride];
+        }
+        out_count += output.frameCount;
+
+        str->next(req);
+        req.reset = false;
+    }
+
+    free(grain_buf);
+    delete str;
+
+    /* Build new audio buffer: prefix + processed region + suffix */
+    int prefix_frames = start;
+    int suffix_frames = t->audio_frames - end;
+    int new_total     = prefix_frames + out_count + suffix_frames;
+
+    int16_t *new_data = (int16_t *)malloc((size_t)new_total * SAMPLES_PER_FRAME * sizeof(int16_t));
+    if (!new_data) {
+        free(out_float);
+        plugin_log("apply_pitch_tempo: new audio buffer alloc failed");
+        return;
+    }
+
+    if (prefix_frames > 0)
+        memcpy(new_data, t->audio_data, (size_t)prefix_frames * SAMPLES_PER_FRAME * sizeof(int16_t));
+
+    for (int i = 0; i < out_count; i++) {
+        float L = out_float[i * 2 + 0] * 32768.0f;
+        float R = out_float[i * 2 + 1] * 32768.0f;
+        if (L >  32767.0f) L =  32767.0f;
+        if (L < -32768.0f) L = -32768.0f;
+        if (R >  32767.0f) R =  32767.0f;
+        if (R < -32768.0f) R = -32768.0f;
+        new_data[(prefix_frames + i) * 2 + 0] = (int16_t)L;
+        new_data[(prefix_frames + i) * 2 + 1] = (int16_t)R;
+    }
+
+    if (suffix_frames > 0)
+        memcpy(new_data + (prefix_frames + out_count) * SAMPLES_PER_FRAME,
+               t->audio_data + end * SAMPLES_PER_FRAME,
+               (size_t)suffix_frames * SAMPLES_PER_FRAME * sizeof(int16_t));
+
+    free(out_float);
+    free(t->audio_data);
+    t->audio_data    = new_data;
+    t->audio_frames  = new_total;
+    t->total_frames  = new_total;
+    t->duration_secs = (float)new_total / (float)t->sample_rate;
+
+    /* Selection covers the processed region in the new buffer */
+    t->start_sample = prefix_frames;
+    t->end_sample   = prefix_frames + out_count;
+
+    /* Reset pitch/tempo to defaults */
+    t->pitch_semitones = 0.0f;
+    t->tempo_percent   = 100;
+    recompute_ratios(t);
+    /* Sync Bungee playback request too */
+    t->bng_req.pitch = 1.0;
+    t->bng_req.speed = 1.0;
+
+    t->dirty = 1;
+    compute_waveform(t, 128);
+    t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
+
+    {
+        char log_buf[128];
+        snprintf(log_buf, sizeof(log_buf),
+                 "apply_pitch_tempo: region [%d,%d] -> %d frames (was %d)",
+                 start, end, out_count, region_frames);
+        plugin_log(log_buf);
+    }
 }
 
 /* ---- render_block ---- */

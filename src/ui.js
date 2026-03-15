@@ -206,6 +206,7 @@ var loopSelectedField = 0;
 
 /* BPM state */
 var bpm = 120.0;
+var baseBpm = 120.0;   /* reference BPM at tempoPercent=100 (set by Up/Down in BPM view) */
 var beatDivIndex = 2;  /* default: 1/4 */
 var BEAT_DIVISIONS = [1, 2, 4, 8, 16];
 var BEAT_DIVISION_LABELS = ["1/1", "1/2", "1/4", "1/8", "1/16"];
@@ -228,6 +229,8 @@ var sliceBoundaries = [];
 var selectedSlice = 0;
 var sliceRegionStart = 0;
 var sliceRegionEnd = 0;
+var slicePitches = [];  /* per-slice pitch offset in semitones (index = slice index) */
+var sliceTempos = [];   /* per-slice tempo percent 50-200 (index = slice index) */
 var sliceMenuIndex = 0;
 var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
@@ -286,7 +289,7 @@ function makeTrackState() {
         sliceMode: SLICE_MODE_EVEN, sliceCount: 1, sliceBoundaries: [],
         selectedSlice: 0, slicePadOffset: 0,
         sliceRegionStart: 0, sliceRegionEnd: 0,
-        sliceThreshold: 25.0,
+        sliceThreshold: 25.0, slicePitches: [], sliceTempos: [],
         lazySub: LAZY_SUB_CHOP, lazyChopping: false,
         /* Waveform cache */
         waveformData: null, cachedVisStart: -1, cachedVisEnd: -1,
@@ -298,7 +301,7 @@ function makeTrackState() {
         /* Loop */
         loopSelectedField: 0,
         /* BPM */
-        bpm: 120.0, beatDivIndex: 2,
+        bpm: 120.0, baseBpm: 120.0, beatDivIndex: 2,
         /* Flags */
         dirty: false, hasUndo: false, hasClipboard: false,
         /* Misc */
@@ -343,6 +346,8 @@ function saveTrackUIState(idx) {
     ts.sliceRegionStart = sliceRegionStart;
     ts.sliceRegionEnd = sliceRegionEnd;
     ts.sliceThreshold = sliceThreshold;
+    ts.slicePitches = slicePitches;
+    ts.sliceTempos = sliceTempos;
     ts.lazySub = lazySub;
     ts.lazyChopping = lazyChopping;
     /* Waveform */
@@ -361,6 +366,7 @@ function saveTrackUIState(idx) {
     ts.loopSelectedField = loopSelectedField;
     /* BPM */
     ts.bpm = bpm;
+    ts.baseBpm = baseBpm;
     ts.beatDivIndex = beatDivIndex;
     /* Flags */
     ts.dirty = dirty;
@@ -405,6 +411,8 @@ function restoreTrackUIState(idx) {
     sliceRegionStart = ts.sliceRegionStart;
     sliceRegionEnd = ts.sliceRegionEnd;
     sliceThreshold = ts.sliceThreshold;
+    slicePitches = ts.slicePitches;
+    sliceTempos = ts.sliceTempos || [];
     lazySub = ts.lazySub;
     lazyChopping = ts.lazyChopping;
     /* Waveform */
@@ -423,6 +431,7 @@ function restoreTrackUIState(idx) {
     loopSelectedField = ts.loopSelectedField;
     /* BPM */
     bpm = ts.bpm;
+    baseBpm = ts.baseBpm;
     beatDivIndex = ts.beatDivIndex;
     /* Flags — these will be refreshed from DSP in tick() */
     dirty = ts.dirty;
@@ -626,7 +635,9 @@ function saveSliceState() {
         regionEnd: sliceRegionEnd,
         selected: selectedSlice,
         threshold: sliceThreshold,
-        padOffset: slicePadOffset
+        padOffset: slicePadOffset,
+        pitches: slicePitches,
+        tempos: sliceTempos
     });
     host_module_set_param("slice_state", state);
 }
@@ -649,6 +660,8 @@ function restoreSliceState() {
         selectedSlice = s.selected || 0;
         sliceThreshold = s.threshold || 25.0;
         slicePadOffset = s.padOffset || 0;
+        slicePitches = s.pitches || [];
+        sliceTempos = s.tempos || [];
         return true;
     } catch (e) {
         return false;
@@ -657,6 +670,7 @@ function restoreSliceState() {
 
 /* Loop state */
 var savedLoopState = false;
+var savedTempoPercent = 100;  /* global tempo saved/restored around VIEW_SLICE */
 
 /* Status message — two modes:
  * 1. Knob-held: persists while knob is touched, per-knob messages
@@ -815,6 +829,10 @@ function updateLeds() {
     var syncOn = (host_module_get_param("sync_clock") === "1");
     setLED(STEP_BASE + 4, isEdit ? (syncOn ? BrightGreen : DarkGrey) : Black);
 
+    /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
+    var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
+    setLED(STEP_BASE + 7, (isTrim || isBpm) && hasPitchTempo ? VividYellow : Black);
+
     /* Step 9/10: fade in/out LEDs (Trim/BPM/Slice) */
     var hasFade = isTrim || isBpm || isSlice;
     setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
@@ -938,8 +956,10 @@ function getKnobLabel(knobIndex) {
         }
     } else if (knobIndex === 6) {
         if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP) return "Pitch:" + formatPitch(pitchSemitones);
+        if (currentView === VIEW_SLICE) return "Slice Pitch:" + formatPitch(slicePitches[selectedSlice] || 0.0);
     } else if (knobIndex === 7) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
+        if (currentView === VIEW_BPM_TRIM) return "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)";
+        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
     }
     return "";
 }
@@ -965,6 +985,98 @@ function showJogStatus(msg) {
     jogHeldTimer = JOG_HOLD_FRAMES;
     pushTouchOrder(JOG_ID);
     announce(msg);
+}
+
+/* ============ Parameter Reset Helpers ============ */
+
+function resetPitch() {
+    pitchSemitones = 0.0;
+    host_module_set_param("pitch", "0.00");
+    showKnobStatus(6, "Pitch:0");
+    showStatus("Pitch Reset", 60);
+}
+
+function resetTempo() {
+    tempoPercent = 100;
+    host_module_set_param("tempo", "100");
+    showKnobStatus(7, "Tempo:100%");
+    showStatus("Tempo Reset", 60);
+}
+
+function resetSlicePitch() {
+    slicePitches[selectedSlice] = 0.0;
+    host_module_set_param("pitch", "0.00");
+    showKnobStatus(6, "Slice Pitch:0");
+    showStatus("Slice Pitch Reset", 60);
+}
+
+function resetSliceTempo() {
+    sliceTempos[selectedSlice] = 100;
+    tempoPercent = 100;
+    host_module_set_param("tempo", "100");
+    showKnobStatus(7, "Slice Tempo:100%");
+    showStatus("Slice Tempo Reset", 60);
+}
+
+function resetBpm() {
+    bpm = baseBpm;
+    tempoPercent = 100;
+    host_module_set_param("tempo", "100");
+    showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (100%)");
+    showStatus("BPM Reset", 60);
+}
+
+function resetGain() {
+    gainDb = 0.0;
+    host_module_set_param("gain_db", "0.0");
+    showKnobStatus(4, "Gain:" + formatDb(gainDb));
+    showStatus("Gain Reset", 60);
+}
+
+function resetZoom() {
+    if (currentView === VIEW_LOOP) {
+        seamZoomLevel = 0;
+        seamWaveformDirty = true;
+    } else {
+        zoomLevel = 0;
+        refreshWaveform();
+    }
+    showKnobStatus(2, "Zoom:Full");
+    showStatus("Zoom Reset", 60);
+}
+
+function resetVScale() {
+    vScale = 1.0;
+    showKnobStatus(3, "Scale:1.0x");
+    showStatus("Scale Reset", 60);
+}
+
+/**
+ * Handle Delete+knob rotation/touch combos: reset the parameter assigned to knob CC.
+ * Returns true if handled (caller should cancel deletePendingCut).
+ */
+function handleDeleteKnob(cc) {
+    if (cc === CC_E3) { resetZoom(); return true; }
+    if (cc === CC_E4) { resetVScale(); return true; }
+    if (cc === CC_E5 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+        resetGain(); return true;
+    }
+    if (cc === CC_E7 && currentView === VIEW_SLICE) {
+        resetSlicePitch(); return true;
+    }
+    if (cc === CC_E7 && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP)) {
+        resetPitch(); return true;
+    }
+    if (cc === CC_E8 && currentView === VIEW_SLICE) {
+        resetSliceTempo(); return true;
+    }
+    if (cc === CC_E8 && currentView === VIEW_BPM_TRIM) {
+        resetBpm(); return true;
+    }
+    if (cc === CC_E8 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
+        resetTempo(); return true;
+    }
+    return false;
 }
 
 /**
@@ -1338,6 +1450,8 @@ function recomputeSliceBoundaries() {
     /* Clamp selected slice */
     if (selectedSlice >= sliceCount) selectedSlice = sliceCount - 1;
     if (selectedSlice < 0) selectedSlice = 0;
+    /* Reset per-slice pitches when boundaries change */
+    slicePitches = [];
 }
 
 /**
@@ -1386,6 +1500,12 @@ function selectSlice(idx) {
     selectedSlice = idx;
     startSample = sliceBoundaries[idx];
     endSample = sliceBoundaries[idx + 1];
+    /* Apply this slice's individual pitch and tempo to the DSP */
+    var sp = slicePitches[idx] || 0.0;
+    host_module_set_param("pitch", sp.toFixed(2));
+    var st = sliceTempos[idx] || 100;
+    tempoPercent = st;
+    host_module_set_param("tempo", String(st));
 
     /* Auto-scroll: position slice start at 10% from left edge,
      * slice end at 90% — matching trim mode's margin style.
@@ -2172,7 +2292,8 @@ function drawBpmTrim() {
 
     /* Overwrite the status area at very bottom with BPM info (unless a timed status or knob status is showing) */
     if (getActiveStatus() === "") {
-        var bpmStatus = "BPM:" + bpm.toFixed(1) + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
+        var tempoStr = (tempoPercent !== 100) ? " " + tempoPercent + "%" : "";
+        var bpmStatus = "BPM:" + bpm.toFixed(1) + tempoStr + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
                         "  " + (selectedField === 0 ? "[Start]" : "[End]");
         fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
         print(0, SCREEN_H - 9, bpmStatus, 1);
@@ -2185,6 +2306,12 @@ function drawBpmTrim() {
  * Switch to a given view.
  */
 function switchView(view) {
+    /* Restore global pitch and tempo to DSP when leaving VIEW_SLICE */
+    if (currentView === VIEW_SLICE && view !== VIEW_SLICE) {
+        host_module_set_param("pitch", pitchSemitones.toFixed(2));
+        tempoPercent = savedTempoPercent;
+        host_module_set_param("tempo", String(tempoPercent));
+    }
     currentView = view;
     if (view === VIEW_TRIM) {
         refreshState();
@@ -2209,6 +2336,7 @@ function switchView(view) {
     } else if (view === VIEW_SLICE) {
         /* Disable looping for slice audition */
         savedLoopState = loopEnabled;
+        savedTempoPercent = tempoPercent;
         if (loopEnabled) {
             loopEnabled = false;
             host_module_set_param("play_loop", "0");
@@ -4025,6 +4153,9 @@ function handleCC(cc, value) {
                     var detectedBpm = parseFloat(bpmMatch[1]);
                     if (detectedBpm >= 20 && detectedBpm <= 999) {
                         bpm = Math.round(detectedBpm * 10) / 10;
+                        baseBpm = bpm;
+                        tempoPercent = 100;
+                        host_module_set_param("tempo", "100");
                         var beatStep = getBeatStepSamples();
                         var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
                         endSample = startSample + beats * beatStep;
@@ -4049,6 +4180,9 @@ function handleCC(cc, value) {
                     showStatus("BPM out of range", 60); return;
                 }
                 bpm = estimatedBpm;
+                baseBpm = bpm;
+                tempoPercent = 100;
+                host_module_set_param("tempo", "100");
                 showStatus("BPM: " + bpm.toFixed(1), 90);
             }
             return;
@@ -4322,6 +4456,12 @@ function handleCC(cc, value) {
         return;
     }
 
+    /* Delete+Knob rotation: reset the parameter assigned to this knob */
+    if (deleteHeld) {
+        if (handleDeleteKnob(cc)) deletePendingCut = false;
+        return;
+    }
+
     /* E1 turn: adjust start marker */
     if (cc === CC_E1) {
         var delta = decodeDelta(value);
@@ -4574,9 +4714,30 @@ function handleCC(cc, value) {
         return; /* E6 has no function in other views */
     }
 
-    /* E7 (Knob 7): Pitch adjust in VIEW_TRIM/VIEW_BPM_TRIM/VIEW_LOOP */
+    /* E7 (Knob 7): Pitch adjust */
     if (cc === CC_E7) {
         var delta = decodeDelta(value);
+        if (delta !== 0 && currentView === VIEW_SLICE) {
+            /* Per-slice pitch — does not affect global pitchSemitones */
+            var sp = slicePitches[selectedSlice] || 0.0;
+            if (shiftHeld) {
+                var cents = Math.round(sp * 100);
+                cents += delta;
+                if (cents < -1200) cents = -1200;
+                if (cents > 1200) cents = 1200;
+                sp = cents / 100.0;
+            } else {
+                var semi = Math.round(sp);
+                semi += delta;
+                if (semi < -12) semi = -12;
+                if (semi > 12) semi = 12;
+                sp = semi;
+            }
+            slicePitches[selectedSlice] = sp;
+            host_module_set_param("pitch", sp.toFixed(2));
+            showKnobStatus(6, "Slice Pitch:" + formatPitch(sp));
+            return;
+        }
         if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP)) {
             if (shiftHeld) {
                 /* Fine: cents, +-1 cent per click */
@@ -4599,27 +4760,48 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* E8 (Knob 8): Slice select in VIEW_SLICE */
+    /* E8 (Knob 8): Per-slice tempo in VIEW_SLICE, BPM in VIEW_BPM_TRIM, tempo in VIEW_TRIM/LOOP */
     if (cc === CC_E8) {
         var delta = decodeDelta(value);
         if (delta !== 0 && currentView === VIEW_SLICE && !lazyChopping) {
-            var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
-            if (newIdx < 0) newIdx = 0;
-            if (newIdx >= sliceCount) newIdx = sliceCount - 1;
-            selectSlice(newIdx);
-            syncMarkersToDs();
-            updateSlicePadLeds();
-            showKnobStatus(7, "Slice " + (selectedSlice + 1) + "/" + sliceCount);
+            var step = shiftHeld ? 1 : 5;
+            var st = sliceTempos[selectedSlice] || 100;
+            st -= delta * step;
+            if (st < 50) st = 50;
+            if (st > 200) st = 200;
+            sliceTempos[selectedSlice] = st;
+            tempoPercent = st;
+            host_module_set_param("tempo", String(st));
+            showKnobStatus(7, "Slice Tempo:" + st + "%");
             return;
         }
-        /* Tempo adjust in VIEW_TRIM/VIEW_BPM_TRIM/VIEW_LOOP — right = faster */
-        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_LOOP)) {
+        /* BPM direct adjust in VIEW_BPM_TRIM — right = faster (higher BPM) */
+        if (delta !== 0 && currentView === VIEW_BPM_TRIM) {
+            var step = shiftHeld ? 0.1 : 1.0;
+            bpm += delta * step;
+            if (bpm < 20) bpm = 20;
+            if (bpm > 999) bpm = 999;
+            bpm = Math.round(bpm * 10) / 10;
+            /* Derive tempoPercent from ratio to base BPM */
+            if (baseBpm > 0) {
+                tempoPercent = Math.round(bpm / baseBpm * 100);
+                if (tempoPercent < 50) { tempoPercent = 50; bpm = baseBpm * 0.5; }
+                if (tempoPercent > 200) { tempoPercent = 200; bpm = baseBpm * 2.0; }
+            }
+            host_module_set_param("tempo", String(tempoPercent));
+            showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)");
+            return;
+        }
+        /* Tempo adjust in VIEW_TRIM/VIEW_LOOP — right = faster */
+        if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
             var step = shiftHeld ? 1 : 5;
             tempoPercent -= delta * step;
             if (tempoPercent < 50) tempoPercent = 50;
             if (tempoPercent > 200) tempoPercent = 200;
             host_module_set_param("tempo", String(tempoPercent));
-            showKnobStatus(7, "Tempo:" + tempoPercent + "%");
+            /* Keep bpm in sync with tempoPercent if baseBpm is known */
+            if (baseBpm > 0) bpm = Math.round(baseBpm * tempoPercent / 10) / 10;
+            showKnobStatus(7, "Tempo:" + tempoPercent + "%" + (baseBpm > 0 ? " BPM:" + bpm.toFixed(1) : ""));
             return;
         }
     }
@@ -4633,62 +4815,17 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
-    /* Delete+Knob touch: reset pitch/tempo/gain */
-    if (velocity > 0 && deleteHeld) {
-        deletePendingCut = false; /* combo used — cancel the pending cut */
-        /* Delete+Knob7Touch: reset pitch (VIEW_TRIM, VIEW_BPM_TRIM) */
-        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
-            pitchSemitones = 0.0;
-            host_module_set_param("pitch", "0.00");
-            showKnobStatus(6, "Pitch:0");
-            showStatus("Pitch Reset", 60);
-            return;
-        }
-        /* Delete+Knob8Touch: reset tempo (VIEW_TRIM, VIEW_BPM_TRIM) */
-        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
-            tempoPercent = 100;
-            host_module_set_param("tempo", "100");
-            showKnobStatus(7, "Tempo:100%");
-            showStatus("Tempo Reset", 60);
-            return;
-        }
-        /* Delete+Knob5Touch: reset gain (VIEW_TRIM only) */
-        if (note === MoveKnob5Touch && currentView === VIEW_TRIM) {
-            gainDb = 0.0;
-            host_module_set_param("gain_db", "0.0");
-            showKnobStatus(4, "Gain:" + formatDb(gainDb));
-            showStatus("Gain Reset", 60);
-            return;
+    /* Delete/Shift+Knob touch: reset the parameter assigned to this knob */
+    if (velocity > 0 && (deleteHeld)) {
+        var knobCc = null;
+        if      (note === MoveKnob5Touch) knobCc = CC_E5;
+        else if (note === MoveKnob6Touch) knobCc = CC_E6;
+        else if (note === MoveKnob7Touch) knobCc = CC_E7;
+        else if (note === MoveKnob8Touch) knobCc = CC_E8;
+        if (knobCc !== null && handleDeleteKnob(knobCc)) {
+            if (deleteHeld) deletePendingCut = false;
         }
         return;
-    }
-
-    /* Shift+Knob touch: reset pitch/tempo/gain */
-    if (velocity > 0 && shiftHeld) {
-        /* Shift+Knob7Touch: reset pitch (VIEW_TRIM, VIEW_BPM_TRIM) */
-        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
-            pitchSemitones = 0.0;
-            host_module_set_param("pitch", "0.00");
-            showKnobStatus(6, "Pitch:0");
-            showStatus("Pitch Reset", 60);
-            return;
-        }
-        /* Shift+Knob8Touch: reset tempo (VIEW_TRIM, VIEW_BPM_TRIM) */
-        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
-            tempoPercent = 100;
-            host_module_set_param("tempo", "100");
-            showKnobStatus(7, "Tempo:100%");
-            showStatus("Tempo Reset", 60);
-            return;
-        }
-        /* Shift+Knob5Touch: reset gain (VIEW_TRIM only) */
-        if (note === MoveKnob5Touch && currentView === VIEW_TRIM) {
-            gainDb = 0.0;
-            host_module_set_param("gain_db", "0.0");
-            showKnobStatus(4, "Gain:" + formatDb(gainDb));
-            showStatus("Gain Reset", 60);
-            return;
-        }
     }
     /* Step 4: Toggle Gate/Trigger mode for active track */
     if (velocity > 0 && note === STEP_BASE + 3) {
@@ -4709,6 +4846,19 @@ function handleNote(note, velocity) {
         announce(newSync === "1" ? "Sync On" : "Sync Off");
         showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
         updateLeds();
+        return;
+    }
+
+    /* Step 8: Apply Pitch/Tempo to selection (Trim/BPM view) */
+    if (velocity > 0 && note === STEP_BASE + 7) {
+        if ((currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) &&
+            (pitchSemitones !== 0.0 || tempoPercent !== 100)) {
+            host_module_set_param("apply_pitch_tempo", "1");
+            pitchSemitones = 0.0;
+            tempoPercent = 100;
+            showStatus("Applied P/T", 90);
+            updateLeds();
+        }
         return;
     }
 
