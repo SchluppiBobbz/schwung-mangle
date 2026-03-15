@@ -87,10 +87,9 @@ var VIEW_JOG_MENU = 10;
 var VIEW_JOG_SHIFT_MENU = 11;
 var VIEW_BPM_TRIM = 12;
 var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
-var VIEW_SCENE    = 14;  /* Scene launcher with skipback */
 
 /* Skipback / scenes constants */
-var MAX_SCENES = 4;
+var MAX_SCENES = 8;
 var SKIPBACK_BARS_OPTIONS = [1, 2, 4, 8];
 var SKIPBACK_SOURCE_ACT = 0;   /* active track ring buffer */
 var SKIPBACK_SOURCE_MIX = 1;   /* master mix ring buffer */
@@ -287,6 +286,7 @@ var skipbackBarsIdx   = 1;    /* index into SKIPBACK_BARS_OPTIONS → 2 bars def
 var skipbackSourceIdx = 0;    /* SKIPBACK_SOURCE_ACT or SKIPBACK_SOURCE_MIX */
 var skipbackPending   = false;
 var skipbackCaptureSeconds = 0;
+var skipbackTargetSlot = -1;  /* which scene slot the in-flight skipback will write to */
 
 /* Quantized scene switching */
 var pendingSceneSwitch      = -1;
@@ -336,8 +336,9 @@ function makeTrackState() {
         playLoop: false, playWhole: false,
         isRecordedFile: false, openedFilePath: "",
         /* Scenes */
-        scenes: [],     /* array of WAV paths, index 0 = original loaded file */
-        activeScene: 0  /* which scene is currently loaded */
+        scenes: [],           /* array of WAV paths */
+        selectedSceneIdx: 0,  /* armed pad — target for new content */
+        playingSceneIdx:  -1  /* currently playing scene (-1 = none) */
     };
 }
 
@@ -706,7 +707,7 @@ function restoreSliceState() {
  */
 function saveSceneState(trackIdx) {
     var ts = trackStates[trackIdx];
-    var json = JSON.stringify({ scenes: ts.scenes, activeScene: ts.activeScene });
+    var json = JSON.stringify({ scenes: ts.scenes, selectedSceneIdx: ts.selectedSceneIdx, playingSceneIdx: ts.playingSceneIdx });
     host_module_set_param("t" + trackIdx + ":scene_state", json);
 }
 
@@ -719,8 +720,9 @@ function restoreSceneState(trackIdx) {
     if (!raw || raw.length < 2) return false;
     try {
         var s = JSON.parse(raw);
-        trackStates[trackIdx].scenes      = s.scenes      || [];
-        trackStates[trackIdx].activeScene = s.activeScene || 0;
+        trackStates[trackIdx].scenes           = s.scenes           || [];
+        trackStates[trackIdx].selectedSceneIdx = s.selectedSceneIdx || 0;
+        trackStates[trackIdx].playingSceneIdx  = (s.playingSceneIdx !== undefined) ? s.playingSceneIdx : -1;
         return trackStates[trackIdx].scenes.length > 0;
     } catch (e) {
         return false;
@@ -736,7 +738,8 @@ function saveProjectJson() {
     for (var _st = 0; _st < NUM_TRACKS; _st++) {
         d.tracks.push({
             scenes: trackStates[_st].scenes,
-            activeScene: trackStates[_st].activeScene
+            selectedSceneIdx: trackStates[_st].selectedSceneIdx,
+            playingSceneIdx:  trackStates[_st].playingSceneIdx
         });
     }
     if (typeof host_write_file === "function") {
@@ -757,10 +760,15 @@ function loadProjectJson() {
         var d = JSON.parse(raw);
         for (var _lt = 0; _lt < NUM_TRACKS; _lt++) {
             var td = (d.tracks && d.tracks[_lt]) || {};
-            trackStates[_lt].scenes      = td.scenes      || [];
-            trackStates[_lt].activeScene = td.activeScene || 0;
-            var path = trackStates[_lt].scenes[trackStates[_lt].activeScene];
-            if (path) host_module_set_param("t" + _lt + ":file_path", path);
+            trackStates[_lt].scenes           = td.scenes           || [];
+            trackStates[_lt].selectedSceneIdx = td.selectedSceneIdx || 0;
+            trackStates[_lt].playingSceneIdx  = (td.playingSceneIdx !== undefined) ? td.playingSceneIdx : -1;
+            /* Load the playing scene (or first available) into DSP */
+            var _ltPlayIdx = trackStates[_lt].playingSceneIdx;
+            var _ltPath = (_ltPlayIdx >= 0 && _ltPlayIdx < trackStates[_lt].scenes.length)
+                ? trackStates[_lt].scenes[_ltPlayIdx]
+                : (trackStates[_lt].scenes.length > 0 ? trackStates[_lt].scenes[0] : null);
+            if (_ltPath) host_module_set_param("t" + _lt + ":file_path", _ltPath);
         }
         return true;
     } catch (e) {
@@ -885,13 +893,6 @@ function initLedsStep() {
 function updateLeds() {
     if (ledInitPending) return; /* Don't send until init completes */
 
-    var isScene = (currentView === VIEW_SCENE);
-
-    /* VIEW_SCENE has its own full LED layout */
-    if (isScene) {
-        updateSceneLeds();
-        return;
-    }
 
     var isTrim  = (currentView === VIEW_TRIM);
     var isBpm   = (currentView === VIEW_BPM_TRIM);
@@ -937,8 +938,9 @@ function updateLeds() {
     var syncOn = (host_module_get_param("sync_clock") === "1");
     setLED(STEP_BASE + 4, isEdit ? (syncOn ? BrightGreen : DarkGrey) : Black);
 
-    /* Step 6: Scene view LED */
-    setLED(STEP_BASE + 5, isEdit ? VividYellow : Black);
+    /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
+    var _hasScenes = (trackStates[activeTrack].scenes.length > 0);
+    setLED(STEP_BASE + 5, isEdit ? (_hasScenes ? VividYellow : DarkGrey) : Black);
 
     /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
     var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
@@ -959,16 +961,35 @@ function updateLeds() {
     setLED(STEP_BASE + 14, (isTrim || isBpm) ? BrightGreen : Black);
     setLED(STEP_BASE + 15, (isTrim || isBpm) ? BrightRed : isSlice ? BrightRed : Black);
 
-    /* Pad LEDs: only illuminate pads with functions in Trim/BPM views */
+    /* Pad LEDs: scene launcher colors in Trim/BPM views */
     if (isTrim || isBpm) {
+        var _ts = trackStates[activeTrack];
+        sceneFlashCounter++;
+        var _flashOn = (sceneFlashCounter % 12) < 6;
         for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
             var padIdx = p - PAD_NOTE_MIN;
-            if (padIdx === 0) {
-                /* Pad 1: audition — show play state */
-                setLED(p, (activePadNote === p) ? PAD_COLOR_PLAY : PAD_COLOR_DIM);
-            } else if (padIdx === 8) {
-                /* Pad 9: stop playback */
+            if (padIdx === 8) {
+                /* Pad 9: stop */
                 setLED(p, playing ? BrightRed : DarkGrey);
+            } else if (padIdx >= 0 && padIdx < MAX_SCENES) {
+                var _isPending = (pendingSceneSwitch === padIdx && pendingSceneSwitchTrack === activeTrack);
+                var _isPlaying = (padIdx === _ts.playingSceneIdx && _ts.playing);
+                var _isSelected = (padIdx === _ts.selectedSceneIdx);
+                var _hasContent = (padIdx < _ts.scenes.length);
+
+                if (_isPending) {
+                    setLED(p, _flashOn ? VividYellow : Black);
+                } else if (_isPlaying) {
+                    setLED(p, BrightGreen);
+                } else if (_isSelected && _hasContent) {
+                    setLED(p, White);
+                } else if (_isSelected && !_hasContent) {
+                    setLED(p, DarkGrey);
+                } else if (_hasContent) {
+                    setLED(p, WhiteLedDim);
+                } else {
+                    setLED(p, Black);
+                }
             } else {
                 setLED(p, Black);
             }
@@ -1746,6 +1767,14 @@ function buildModeHeader(modeName) {
     if (loopEnabled) s += " L";
     if (trackStates[activeTrack].gateMode) s += " G";
     if (pitchSemitones !== 0 || tempoPercent !== 100) s += " P";
+    /* Scene indicator: S<armed> or S<armed>>S<playing> */
+    var _sts = trackStates[activeTrack];
+    if (_sts.scenes.length > 0 || _sts.selectedSceneIdx > 0) {
+        s += " S" + (_sts.selectedSceneIdx + 1);
+        if (_sts.playingSceneIdx >= 0 && _sts.playingSceneIdx !== _sts.selectedSceneIdx) {
+            s += ">" + (_sts.playingSceneIdx + 1);
+        }
+    }
     return s;
 }
 
@@ -2557,11 +2586,24 @@ function enterOpenFileBrowser() {
 /* ============ Scene helpers ============ */
 
 /**
- * Apply a scene switch immediately: load the WAV and start playback.
+ * Find the next free (empty) scene slot after selectedSceneIdx.
  */
-function applySceneSwitch(trackIdx, sceneIdx) {
+function findNextFreeSceneSlot(trackIdx) {
     var ts = trackStates[trackIdx];
-    ts.activeScene = sceneIdx;
+    for (var _nf = 1; _nf <= MAX_SCENES; _nf++) {
+        var c = (ts.selectedSceneIdx + _nf) % MAX_SCENES;
+        if (c >= ts.scenes.length) return c;
+    }
+    return ts.selectedSceneIdx; /* All full — stay put */
+}
+
+/**
+ * Apply a scene launch immediately: load the WAV and start playback.
+ */
+function applySceneLaunch(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    ts.playingSceneIdx  = sceneIdx;
+    ts.selectedSceneIdx = sceneIdx;
     var path = ts.scenes[sceneIdx];
     saveSceneState(trackIdx);
     host_module_set_param("t" + trackIdx + ":file_path", path);
@@ -2579,18 +2621,80 @@ function applySceneSwitch(trackIdx, sceneIdx) {
 }
 
 /**
- * Trigger a scene — quantized if already playing, immediate otherwise.
+ * Launch a scene — quantized to next bar if already playing a different scene,
+ * immediate otherwise. Pressing an empty pad just arms it.
  */
-function switchScene(trackIdx, sceneIdx) {
+function launchScene(trackIdx, sceneIdx) {
     var ts = trackStates[trackIdx];
-    if (sceneIdx >= ts.scenes.length) return;
-    if (ts.playing && sceneIdx !== ts.activeScene) {
-        pendingSceneSwitch = sceneIdx;
+    if (sceneIdx >= ts.scenes.length) {
+        /* Empty pad — just arm it */
+        ts.selectedSceneIdx = sceneIdx;
+        showStatus("Scene " + (sceneIdx + 1) + " armed", 30);
+        updateLeds();
+        return;
+    }
+    if (ts.playing && ts.playingSceneIdx >= 0 && ts.playingSceneIdx !== sceneIdx) {
+        /* Quantized: defer to next bar */
+        pendingSceneSwitch      = sceneIdx;
         pendingSceneSwitchTrack = trackIdx;
         showStatus("Cue S" + (sceneIdx + 1), 30);
     } else {
-        applySceneSwitch(trackIdx, sceneIdx);
+        applySceneLaunch(trackIdx, sceneIdx);
     }
+    updateLeds();
+}
+
+/**
+ * Remove scene at sceneIdx, shift subsequent scenes left.
+ * If the removed scene was playing, stop playback.
+ */
+function removeScene(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    if (sceneIdx < 0 || sceneIdx >= ts.scenes.length) return;
+
+    /* Stop playback if this scene is currently playing */
+    if (ts.playingSceneIdx === sceneIdx && ts.playing) {
+        host_module_set_param("t" + trackIdx + ":stop", "1");
+        ts.playing = false;
+        if (trackIdx === activeTrack) playing = false;
+    }
+
+    ts.scenes.splice(sceneIdx, 1);
+
+    /* Adjust playingSceneIdx after splice */
+    if (ts.playingSceneIdx === sceneIdx) {
+        ts.playingSceneIdx = -1;
+    } else if (ts.playingSceneIdx > sceneIdx) {
+        ts.playingSceneIdx--;
+    }
+
+    /* Clamp selectedSceneIdx to valid range */
+    if (ts.selectedSceneIdx >= ts.scenes.length) {
+        ts.selectedSceneIdx = Math.max(0, ts.scenes.length - 1);
+    }
+
+    if (ts.scenes.length > 0 && ts.playingSceneIdx >= 0) {
+        var newPath = ts.scenes[ts.playingSceneIdx];
+        host_module_set_param("t" + trackIdx + ":file_path", newPath);
+        if (trackIdx === activeTrack) {
+            openedFilePath = newPath;
+            waveformDirty = true;
+            refreshFileInfo();
+        }
+    } else if (ts.scenes.length === 0) {
+        ts.selectedSceneIdx = 0;
+        ts.playingSceneIdx  = -1;
+        ts.loaded = false;
+        if (trackIdx === activeTrack) {
+            openedFilePath = "";
+            totalFrames = 0;
+            waveformData = null;
+        }
+    }
+
+    saveSceneState(trackIdx);
+    saveProjectJson();
+    showStatus("Scene " + (sceneIdx + 1) + " removed", 60);
 }
 
 /**
@@ -2598,7 +2702,9 @@ function switchScene(trackIdx, sceneIdx) {
  */
 function doSkipback() {
     var ts = trackStates[activeTrack];
-    var slot = ts.scenes.length;
+    /* Target the armed (selectedSceneIdx) slot; clamp to valid range */
+    var slot = ts.selectedSceneIdx;
+    if (slot > ts.scenes.length) slot = ts.scenes.length;
     if (slot >= MAX_SCENES) {
         showStatus("Max " + MAX_SCENES + " scenes", 60);
         return;
@@ -2611,121 +2717,36 @@ function doSkipback() {
     if (typeof host_ensure_dir === "function") host_ensure_dir(dir);
     var path = dir + "/t" + activeTrack + "_scene" + slot + ".wav";
     host_module_set_param("skipback", source + "," + extractFrames + "," + path);
+    skipbackTargetSlot = slot;
     skipbackPending = true;
     skipbackCaptureSeconds = extractFrames / 44100;  /* informational */
     showStatus("Skipback " + bars + "b...", 90);
 }
 
-/**
- * Update LEDs for VIEW_SCENE.
- */
-function updateSceneLeds() {
-    var ts = trackStates[activeTrack];
-
-    /* All standard buttons off except Back */
-    setButtonLED(CC_BACK,    LED_DIM);
-    setButtonLED(CC_COPY,    LED_OFF);
-    setButtonLED(CC_MUTE,    LED_OFF);
-    setButtonLED(CC_DELETE,  LED_OFF);
-    setButtonLED(CC_UNDO,    LED_OFF);
-    setButtonLED(CC_LOOP,    LED_OFF);
-    setButtonLED(CC_CAPTURE, LED_OFF);
-    setButtonLED(CC_LEFT,    LED_OFF);
-    setButtonLED(CC_RIGHT,   LED_OFF);
-    setButtonLED(CC_UP,      LED_DIM);   /* UP = toggle source */
-    setButtonLED(CC_DOWN,    LED_OFF);
-    setButtonLED(CC_REC,     skipbackPending ? BrightRed : LED_DIM);
-
-    /* Step LEDs: 1-3 dim, Step 6 vivid yellow */
-    setLED(STEP_BASE + 0, DarkGrey);
-    setLED(STEP_BASE + 1, DarkGrey);
-    setLED(STEP_BASE + 2, DarkGrey);
-    setLED(STEP_BASE + 3, DarkGrey);
-    setLED(STEP_BASE + 4, DarkGrey);
-    setLED(STEP_BASE + 5, VividYellow);
-    for (var _sl = 6; _sl < 16; _sl++) setLED(STEP_BASE + _sl, Black);
-
-    /* Pad LEDs 1-4: map to scenes 0-3 */
-    sceneFlashCounter++;
-    var flashOn = (sceneFlashCounter % 12) < 6;
-    for (var _sp = 0; _sp < 32; _sp++) {
-        var padNote = PAD_NOTE_MIN + _sp;
-        if (_sp < MAX_SCENES) {
-            var isPending = (pendingSceneSwitch === _sp && pendingSceneSwitchTrack === activeTrack);
-            if (isPending) {
-                setLED(padNote, flashOn ? VividYellow : Black);
-            } else if (_sp === ts.activeScene && ts.scenes.length > _sp) {
-                setLED(padNote, BrightGreen);
-            } else if (_sp < ts.scenes.length) {
-                setLED(padNote, White);
-            } else {
-                setLED(padNote, DarkGrey);
-            }
-        } else {
-            setLED(padNote, Black);
-        }
-    }
-    updateTrackLEDs();
-    updatePlayLED();
-}
-
-/**
- * Draw VIEW_SCENE — scene launcher + skipback controls.
- */
-function drawSceneView() {
-    clear_screen();
-    var ts = trackStates[activeTrack];
-    var bars = SKIPBACK_BARS_OPTIONS[skipbackBarsIdx];
-    var srcLabel = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? "TRK" : "MIX";
-
-    /* Header */
-    print(0, 0, "T" + (activeTrack + 1) + " SCENES  SB:" + bars + "b " + srcLabel, 1);
-    fill_rect(0, 8, 128, 1, 1);
-
-    /* 4 scene boxes: 2x2 grid, each 62×22 px, left col x=0, right col x=64, rows y=11 and y=34 */
-    for (var _sc = 0; _sc < MAX_SCENES; _sc++) {
-        var bx = (_sc % 2) * 64;
-        var by = 11 + Math.floor(_sc / 2) * 23;
-        var hasScene = (_sc < ts.scenes.length);
-        var isActive = (_sc === ts.activeScene && hasScene);
-        var isPendSc = (pendingSceneSwitch === _sc && pendingSceneSwitchTrack === activeTrack);
-
-        if (isActive) {
-            fill_rect(bx, by, 62, 21, 1);
-        } else {
-            /* Draw outline: top, bottom, left, right */
-            fill_rect(bx,      by,      62, 1,  1);
-            fill_rect(bx,      by + 20, 62, 1,  1);
-            fill_rect(bx,      by,      1,  21, 1);
-            fill_rect(bx + 61, by,      1,  21, 1);
-        }
-
-        var label;
-        if (hasScene) {
-            var scPath = ts.scenes[_sc];
-            var scName = scPath.replace(/.*\//, "").replace(/\.wav$/i, "");
-            if (scName.length > 8) scName = scName.substring(0, 8);
-            label = "S" + (_sc + 1) + ":" + scName;
-        } else {
-            label = "S" + (_sc + 1) + ":-";
-        }
-
-        if (isPendSc) {
-            /* Blink label if pending switch */
-            if ((sceneFlashCounter % 12) < 6) {
-                print(bx + 2, by + 7, label, isActive ? 0 : 1);
-            }
-        } else {
-            print(bx + 2, by + 7, label, isActive ? 0 : 1);
-        }
-    }
-
-    /* Bottom hint */
-    var hint = skipbackPending ? "Recording..." : "REC=skip  JOG=bars  UP=src";
-    print(0, 57, hint, 1);
-}
-
 /* ============ Project folder browser ============ */
+
+/**
+ * Open the project browser overlay (VIEW_PROJECT).
+ * Called at startup (fresh session and reconnect) when no project is set.
+ */
+function initProjectBrowser() {
+    projectBrowserState = buildFilepathBrowserState(
+        { root: SCRATCH_DIR, name: "Project Folder" },
+        ""
+    );
+    refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
+    /* Remove file entries (only show dirs), then prepend action items */
+    if (projectBrowserState && projectBrowserState.items) {
+        projectBrowserState.items = projectBrowserState.items.filter(function(it) {
+            return it.kind !== "file";
+        });
+        projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
+        projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
+        projectBrowserState.selectedIndex = 0;
+    }
+    currentView = VIEW_PROJECT;
+    announce("Select or create project folder");
+}
 
 /**
  * Draw VIEW_PROJECT — project folder selection at startup.
@@ -4178,7 +4199,6 @@ function handleCC(cc, value) {
             case VIEW_JOG_MENU:
             case VIEW_JOG_SHIFT_MENU:
             case VIEW_BPM_TRIM:
-            case VIEW_SCENE:
                 switchView(VIEW_TRIM);
                 break;
             case VIEW_PROJECT:
@@ -4318,14 +4338,15 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* REC button — start/stop recording */
-    /* CC_REC in VIEW_SCENE: trigger skipback instead of recording */
-    if (cc === CC_REC && value > 0 && currentView === VIEW_SCENE) {
-        if (!skipbackPending) {
+    /* REC button — skipback when in scene mode, otherwise live recording */
+    if (cc === CC_REC && value > 0) {
+        var _inSceneMode = (projectDir && projectDir !== "_no_project") ||
+                           trackStates[activeTrack].scenes.length > 0;
+        if (_inSceneMode && !skipbackPending) {
             doSkipback();
             updateLeds();
+            return;
         }
-        return;
     }
 
     if (cc === CC_REC && value > 0) {
@@ -4480,15 +4501,6 @@ function handleCC(cc, value) {
 
     /* Up/Down arrows */
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
-        if (currentView === VIEW_SCENE) {
-            /* UP: toggle skipback source (active track / master mix) */
-            if (cc === CC_UP) {
-                skipbackSourceIdx = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? SKIPBACK_SOURCE_MIX : SKIPBACK_SOURCE_ACT;
-                showStatus(skipbackSourceIdx === SKIPBACK_SOURCE_ACT ? "Src:Track" : "Src:Mix", 60);
-                updateLeds();
-            }
-            return;
-        }
         if (currentView === VIEW_BPM_TRIM) {
             if (cc === CC_DOWN) {
                 /* Down: read BPM from filename */
@@ -4666,12 +4678,6 @@ function handleCC(cc, value) {
                 announce(jogShiftMenuItems[jogShiftMenuIndex]);
                 break;
 
-            case VIEW_SCENE:
-                /* Jog cycles skipback bar length */
-                skipbackBarsIdx = (skipbackBarsIdx + (delta > 0 ? 1 : -1) + SKIPBACK_BARS_OPTIONS.length) % SKIPBACK_BARS_OPTIONS.length;
-                showStatus("SB:" + SKIPBACK_BARS_OPTIONS[skipbackBarsIdx] + "b", 60);
-                break;
-
             case VIEW_BPM_TRIM:
                 /* Jog scrolls viewport (same as VIEW_TRIM when zoomed) */
                 if (zoomLevel > 0) {
@@ -4845,10 +4851,22 @@ function handleCC(cc, value) {
                         announce(oDirName + ", " + oFirst);
                     } else if (result.action === "select") {
                         openedFilePath = result.value;
-                        loadFileIntoEditor(result.value);
+                        /* Load file into the armed (selectedSceneIdx) scene slot */
+                        var _bts = trackStates[activeTrack];
+                        var _bslot = _bts.selectedSceneIdx;
+                        if (_bslot < _bts.scenes.length) {
+                            _bts.scenes[_bslot] = result.value;
+                        } else {
+                            /* Slot beyond current length — append up to that slot */
+                            while (_bts.scenes.length < _bslot) _bts.scenes.push("");
+                            _bts.scenes.push(result.value);
+                        }
+                        saveSceneState(activeTrack);
+                        saveProjectJson();
                         openFileBrowserState = null;
-                        announce("Loaded " + fileName);
                         switchView(VIEW_TRIM);
+                        applySceneLaunch(activeTrack, _bslot);
+                        announce("Loaded " + fileName);
                     }
                 }
                 break;
@@ -5238,15 +5256,12 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 6: Enter/exit VIEW_SCENE */
+    /* Step 6: Cycle skipback bar length (replaces old VIEW_SCENE toggle) */
     if (velocity > 0 && note === STEP_BASE + 5) {
-        var editViews2 = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE, VIEW_LOOP, VIEW_SCENE];
+        var editViews2 = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE, VIEW_LOOP];
         if (editViews2.indexOf(currentView) >= 0) {
-            if (currentView === VIEW_SCENE) {
-                currentView = VIEW_TRIM;
-            } else {
-                currentView = VIEW_SCENE;
-            }
+            skipbackBarsIdx = (skipbackBarsIdx + 1) % SKIPBACK_BARS_OPTIONS.length;
+            showStatus("SB:" + SKIPBACK_BARS_OPTIONS[skipbackBarsIdx] + "b", 60);
             updateLeds();
         }
         return;
@@ -5359,60 +5374,63 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Pad press/release: audition (hold to play, release to stop).
-     * Only the most recently pressed pad owns playback — releasing
-     * an earlier pad while a newer one is held does nothing. */
+    /* Pad press/release: scene launcher in Trim/BPM, audition in Loop/Slice. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_BPM_TRIM) {
+        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM) {
             var padIdx = note - PAD_NOTE_MIN;
 
-            /* Pad 9: stop current track */
+            if (velocity > 0) {
+                /* Pad 9: stop current track */
+                if (padIdx === 8) {
+                    stopPlayback();
+                    trackStates[activeTrack].playingSceneIdx = -1;
+                    showStatus("Stop", 20);
+                    updateLeds();
+                    return;
+                }
+
+                /* Pads 1-8: scene launch / arm / delete */
+                if (padIdx >= 0 && padIdx < MAX_SCENES) {
+                    if (deleteHeld) {
+                        removeScene(activeTrack, padIdx);
+                        deletePendingCut = false;
+                    } else {
+                        launchScene(activeTrack, padIdx);
+                    }
+                    updateLeds();
+                }
+            }
+            return;
+        } else if (currentView === VIEW_LOOP) {
+            /* Loop view keeps audition on Pad 1 */
+            var padIdx = note - PAD_NOTE_MIN;
             if (padIdx === 8 && velocity > 0) {
                 stopPlayback();
                 showStatus("Stop", 20);
                 updateLeds();
                 return;
             }
-
-            /* Pad 1: audition */
             if (padIdx === 0) {
-                var isGate = trackStates[activeTrack].gateMode;
+                var isGateL = trackStates[activeTrack].gateMode;
                 if (velocity > 0) {
-                    setLED(note, PAD_COLOR_PLAY);
                     activePadNote = note;
-                    if (shiftHeld) {
-                        /* Shift+Pad 1: preview from before end marker (~20% of selection) */
-                        var selLen = endSample - startSample;
-                        var previewLen = Math.min(Math.max(Math.floor(selLen * 0.20), sampleRate), sampleRate * 20);
-                        var from = endSample - previewLen;
-                        if (from < startSample) from = startSample;
-                        startPlaybackFrom(from);
-                        showStatus("Preview End", 20);
-                    } else if (isGate) {
-                        /* Gate mode: play selection while held */
+                    if (isGateL) {
                         host_module_set_param("t" + activeTrack + ":gate_held", "1");
                         startPlayback();
-                        showStatus("Gate", 20);
                     } else {
-                        /* Trigger mode: play selection on press */
                         startPlayback();
-                        showStatus("Trigger", 20);
                     }
                 } else {
-                    setLED(note, PAD_COLOR_DIM);
                     if (note === activePadNote) {
                         activePadNote = -1;
-                        if (isGate) {
-                            /* Gate mode: release silences via DSP gate, then stop */
+                        if (isGateL) {
                             host_module_set_param("t" + activeTrack + ":gate_held", "0");
                             stopPlayback();
                         }
-                        /* Trigger mode: do NOT stop — let selection play to end */
                     }
                 }
             }
-
-            return; /* Ignore other pads in Trim/BPM */
+            return;
         } else if (currentView === VIEW_SLICE) {
             var padIdx = note - PAD_NOTE_MIN;
             if (sliceMode === SLICE_MODE_LAZY && lazySub === LAZY_SUB_CHOP) {
@@ -5481,13 +5499,6 @@ function handleNote(note, velocity) {
                     }
                 }
             }
-        } else if (currentView === VIEW_SCENE) {
-            var padIdx = note - PAD_NOTE_MIN;
-            if (velocity > 0 && padIdx >= 0 && padIdx < MAX_SCENES) {
-                switchScene(activeTrack, padIdx);
-                updateLeds();
-            }
-            return;
         }
         return;
     }
@@ -5583,6 +5594,21 @@ globalThis.init = function() {
             selectedField = 0;
             announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
         }
+        /* Restore scene state on reconnect when audio is loaded */
+        if (!stillRecording && totalFrames > 0) {
+            for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
+                restoreSceneState(_ri);
+            }
+            if (trackStates[0].scenes.length === 0 && openedFilePath) {
+                trackStates[0].scenes.push(openedFilePath);
+                trackStates[0].selectedSceneIdx = 0;
+                trackStates[0].playingSceneIdx  = 0;
+            }
+        }
+        /* Show project browser on reconnect if no project was selected yet */
+        if (!projectDir && !stillRecording) {
+            initProjectBrowser();
+        }
         /* Force full LED repaint */
         ledInitPending = true;
         ledInitIndex = 0;
@@ -5601,34 +5627,28 @@ globalThis.init = function() {
             recordBrowserDir = SCRATCH_DIR;
             recordState = "ready";
             recordLedCounter = 0;
-
-            /* Show project browser at startup if no project is set yet */
-            if (!projectDir) {
-                projectBrowserState = buildFilepathBrowserState(
-                    { root: SCRATCH_DIR, name: "Project Folder" },
-                    ""
-                );
-                refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
-                /* Remove file entries (only show dirs), then prepend action items */
-                if (projectBrowserState && projectBrowserState.items) {
-                    projectBrowserState.items = projectBrowserState.items.filter(function(it) {
-                        return it.kind !== "file";
-                    });
-                    projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
-                    projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
-                    projectBrowserState.selectedIndex = 0;
-                }
-                currentView = VIEW_PROJECT;
-                announce("Select or create project folder");
-            } else {
-                announce("New Recording, press REC to record");
-            }
         } else {
-            /* Restore scene state for all tracks on reconnect/open-with-file */
+            /* Restore scene state for all tracks on open-with-file */
             for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
                 restoreSceneState(_ri);
             }
-            announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+            /* If no scene state was restored but a file is loaded, seed track 0 scene 0 */
+            if (trackStates[0].scenes.length === 0 && openedFilePath) {
+                trackStates[0].scenes.push(openedFilePath);
+                trackStates[0].selectedSceneIdx = 0;
+                trackStates[0].playingSceneIdx  = 0;
+            }
+        }
+
+        /* Always show project browser at startup if no project is set yet */
+        if (!projectDir) {
+            initProjectBrowser();
+        } else {
+            if (totalFrames === 0) {
+                announce("New Recording, press REC to record");
+            } else {
+                announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+            }
         }
     }
 };
@@ -5674,19 +5694,18 @@ globalThis.tick = function() {
         var _sbResult = host_module_get_param("skipback_result");
         if (_sbResult && _sbResult.length > 0) {
             skipbackPending = false;
-            var _sbSlot = trackStates[activeTrack].scenes.length;
-            trackStates[activeTrack].scenes.push(_sbResult);
-            trackStates[activeTrack].activeScene = _sbSlot;
+            var _sbSlot = skipbackTargetSlot >= 0 ? skipbackTargetSlot : trackStates[activeTrack].scenes.length;
+            if (_sbSlot < trackStates[activeTrack].scenes.length) {
+                trackStates[activeTrack].scenes[_sbSlot] = _sbResult;  /* overwrite armed slot */
+            } else {
+                trackStates[activeTrack].scenes.push(_sbResult);       /* append */
+            }
+            /* Advance selectedSceneIdx to next free slot */
+            trackStates[activeTrack].selectedSceneIdx = findNextFreeSceneSlot(activeTrack);
+            skipbackTargetSlot = -1;
             saveSceneState(activeTrack);
             saveProjectJson();
-            /* Load new scene into DSP for this track */
-            host_module_set_param("t" + activeTrack + ":file_path", _sbResult);
-            if (activeTrack === activeTrack) {  /* always true; keep pattern consistent */
-                openedFilePath = _sbResult;
-                waveformDirty = true;
-                refreshFileInfo();
-            }
-            showStatus("Scene " + (_sbSlot + 1) + " saved", 90);
+            showStatus("Scene " + (_sbSlot + 1) + " \u2192 Pad " + (_sbSlot + 1), 90);
             updateLeds();
         }
     }
@@ -5698,7 +5717,7 @@ globalThis.tick = function() {
             var _barsPassed = Math.floor((playPos - lastBarBoundaryPos) / _barF);
             if (_barsPassed >= 1) {
                 lastBarBoundaryPos += _barsPassed * _barF;
-                applySceneSwitch(pendingSceneSwitchTrack, pendingSceneSwitch);
+                applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
                 pendingSceneSwitch = -1;
                 pendingSceneSwitchTrack = -1;
             }
@@ -5829,9 +5848,6 @@ globalThis.tick = function() {
             break;
         case VIEW_BPM_TRIM:
             drawBpmTrim();
-            break;
-        case VIEW_SCENE:
-            drawSceneView();
             break;
         case VIEW_PROJECT:
             drawProjectView();

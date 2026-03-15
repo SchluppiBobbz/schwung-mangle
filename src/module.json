@@ -9,8 +9,6 @@
     "component_type": "tool",
     "tool_config": {
         "interactive": true,
-        "command": null,
-        "input_extensions": [".wav"],
-        "allow_new_file": true
+        "command": null
     }
 }
