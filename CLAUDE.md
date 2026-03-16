@@ -8,7 +8,7 @@ External tool module for Move Everything. 4-track audio editor with jamming, gat
 src/
   module.json       # Module metadata (component_type: "tool", interactive)
   ui.js             # QuickJS UI (waveform display, markers, editing)
-  dsp/plugin.c      # Audio DSP plugin source (cross-compiled to ARM64)
+  dsp/plugin.cpp      # Audio DSP plugin source (cross-compiled to ARM64)
   help.json         # On-device help content
 ```
 

@@ -587,8 +587,22 @@ function switchToTrack(idx) {
     /* Force waveform refresh */
     waveformDirty = true;
     seamWaveformDirty = true;
-    /* Re-fetch file info from DSP */
+    /* Re-fetch file info from DSP (frames, name, duration, rate).
+     * refreshFileInfo also overwrites startSample/endSample with DSP state,
+     * which may be stale if the track had a scene switch while non-active.
+     * Re-apply the saved JS markers afterwards and push them to DSP. */
     refreshFileInfo();
+    var _switchTs = trackStates[idx];
+    startSample = _switchTs.startSample || 0;
+    endSample   = (_switchTs.endSample > 0) ? _switchTs.endSample : totalFrames;
+    if (totalFrames > 0) {
+        if (endSample   > totalFrames) endSample   = totalFrames;
+        if (startSample > totalFrames) startSample = totalFrames;
+        if (startSample > endSample)   startSample = 0;
+    }
+    syncMarkersToDs();
+    /* Refresh pad LEDs for the new active track's scene layout */
+    updateLeds();
     announce("Track " + (idx + 1));
 }
 
@@ -2713,10 +2727,16 @@ function findNextFreeSceneSlot(trackIdx) {
 }
 
 /**
- * Apply a scene launch immediately: save current scene state, restore the
- * new scene's settings, load the WAV and start playback.
+ * Apply a scene launch: save current scene state, restore the new scene's
+ * settings, load the WAV, and optionally start playback.
+ *
+ * autoPlay (default true):
+ *   true  — sets playingSceneIdx, sets playing=true, defers play command.
+ *   false — loads the file and restores settings for editing, but does NOT
+ *           start playback and does NOT change playingSceneIdx.
  */
-function applySceneLaunch(trackIdx, sceneIdx) {
+function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
+    if (autoPlay === undefined) autoPlay = true;
     var ts = trackStates[trackIdx];
 
     /* Save state of the scene we are leaving */
@@ -2725,7 +2745,8 @@ function applySceneLaunch(trackIdx, sceneIdx) {
     }
 
     var scene = ts.scenes[sceneIdx];
-    ts.playingSceneIdx  = sceneIdx;
+    /* Only update playingSceneIdx when actually starting playback */
+    if (autoPlay) ts.playingSceneIdx = sceneIdx;
     ts.selectedSceneIdx = sceneIdx;
 
     if (trackIdx === activeTrack) {
@@ -2763,17 +2784,22 @@ function applySceneLaunch(trackIdx, sceneIdx) {
         host_module_set_param("tempo",     String(tempoPercent));
         host_module_set_param("play_loop", loopEnabled ? "1" : "0");
 
-        /* Defer marker + slice push + play until the DSP has loaded the file.
-         * Sending play: "whole" before the file is loaded causes the DSP to
-         * play the previously loaded file instead of the new one. */
+        /* Defer marker + slice push + (optional) play until DSP has loaded file.
+         * Store the expected basename so the tick loop can verify the correct
+         * file is loaded before processing (guards against the non-blocking
+         * set_param race where refreshFileInfo returns the old file's data). */
+        var _spath = scene.path;
+        var _sslash = _spath.lastIndexOf('/');
+        var _sname = (_sslash >= 0) ? _spath.substring(_sslash + 1) : _spath;
         pendingSceneRestore = {
             startSample:  scene.startSample,
             endSample:    scene.endSample,
             hasSlices:    scene.sliceBoundaries.length >= 2,
-            autoPlay:     true
+            autoPlay:     autoPlay,
+            expectedName: _sname
         };
-    } else {
-        /* Non-active track: restore state into trackState struct */
+    } else if (autoPlay) {
+        /* Non-active track with autoPlay: restore state into trackState struct */
         ts.startSample    = scene.startSample;
         ts.endSample      = scene.endSample;
         ts.gainDb         = scene.gainDb;
@@ -2800,19 +2826,34 @@ function applySceneLaunch(trackIdx, sceneIdx) {
     }
 
     host_module_set_param("t" + trackIdx + ":file_path", scene.path);
-    /* play is deferred to pendingSceneRestore (active track) or omitted (inactive) */
-    ts.playing = true;
-    if (trackIdx === activeTrack) playing = true;
+    /* For non-active tracks push markers immediately after file_path.
+     * DSP processes set_params in order, so by the time it handles "markers"
+     * the file will already be loaded (load_wav is synchronous in DSP).
+     * This ensures play_all and other commands use the correct scene boundaries
+     * instead of the DSP defaults (0, totalFrames) set after each file load. */
+    if (trackIdx !== activeTrack) {
+        host_module_set_param("t" + trackIdx + ":markers",
+                              ts.startSample + "," + ts.endSample);
+    }
+    /* play is deferred to pendingSceneRestore; only mark as playing if autoPlay */
+    if (autoPlay) {
+        ts.playing = true;
+        if (trackIdx === activeTrack) playing = true;
+    }
 
     saveSceneState(trackIdx);
     updateTrackLEDs();
-    showStatus("Scene " + (sceneIdx + 1), 30);
-    lastBarBoundaryPos = playPos;
+    if (autoPlay) {
+        showStatus("Scene " + (sceneIdx + 1), 30);
+        lastBarBoundaryPos = playPos;
+    }
 }
 
 /**
- * Launch a scene — quantized to next bar if already playing a different scene,
- * immediate otherwise. Pressing an empty pad just arms it.
+ * Launch a scene — two-click model:
+ *   First click  → select (arm) the scene only, allow edits.
+ *   Second click → launch: immediate if sync-off, quantized to next bar if sync-on.
+ * Pressing an empty pad just arms it.
  */
 function launchScene(trackIdx, sceneIdx) {
     var ts = trackStates[trackIdx];
@@ -2823,14 +2864,34 @@ function launchScene(trackIdx, sceneIdx) {
         updateLeds();
         return;
     }
-    if (ts.playing && ts.playingSceneIdx >= 0 && ts.playingSceneIdx !== sceneIdx) {
+
+    /* First click on a scene that is not yet selected: load for editing, no playback */
+    if (sceneIdx !== ts.selectedSceneIdx) {
+        /* Cancel any pending cued switch */
+        if (pendingSceneSwitch !== -1 && pendingSceneSwitchTrack === trackIdx) {
+            pendingSceneSwitch      = -1;
+            pendingSceneSwitchTrack = -1;
+        }
+        applySceneLaunch(trackIdx, sceneIdx, false);
+        showStatus("Scene " + (sceneIdx + 1) + " selected", 30);
+        updateLeds();
+        return;
+    }
+
+    /* Second click (same scene already selected): launch with possible quantization */
+    var syncOn = (host_module_get_param("sync_clock") === "1");
+    var anyPlaying = false;
+    for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
+        if (trackStates[_lsi].playing) { anyPlaying = true; break; }
+    }
+    if (syncOn && anyPlaying) {
         if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
-            /* Second press on the same cued scene — force immediate */
+            /* Second press on the already-cued scene — force immediate */
             pendingSceneSwitch      = -1;
             pendingSceneSwitchTrack = -1;
             applySceneLaunch(trackIdx, sceneIdx);
         } else {
-            /* First press: quantized, defer to next bar */
+            /* Queue for next bar boundary */
             pendingSceneSwitch      = sceneIdx;
             pendingSceneSwitchTrack = trackIdx;
             showStatus("Cue S" + (sceneIdx + 1), 30);
@@ -2931,8 +2992,12 @@ function doFinalize() {
     }
 
     /* Move exported file into project folder as t{n}_scene{i}_final.wav */
-    var sampleDir = SCRATCH_DIR;
-    var srcPath = sampleDir + "/" + exportedBasename;
+    /* DSP writes the export into the same directory as the source file,
+     * so derive sampleDir from the currently open file path, not SCRATCH_DIR. */
+    var srcDir = openedFilePath.lastIndexOf("/") >= 0
+        ? openedFilePath.substring(0, openedFilePath.lastIndexOf("/"))
+        : SCRATCH_DIR;
+    var srcPath = srcDir + "/" + exportedBasename;
     var finalName = "t" + activeTrack + "_scene" + sceneIdx + "_final.wav";
     var destPath = dir + "/" + finalName;
     var mvResult = host_system_cmd('mv "' + srcPath + '" "' + destPath + '"');
@@ -5551,17 +5616,20 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
-    /* Delete/Shift+Knob touch: reset the parameter assigned to this knob */
-    if (velocity > 0 && (deleteHeld)) {
+    /* Delete/Shift+Knob touch: reset the parameter assigned to this knob.
+     * Only intercept knob-touch notes; let pad notes fall through so that
+     * Remove+Pad can remove scenes in Trim/BPM view. */
+    if (velocity > 0 && deleteHeld) {
         var knobCc = null;
         if      (note === MoveKnob5Touch) knobCc = CC_E5;
         else if (note === MoveKnob6Touch) knobCc = CC_E6;
         else if (note === MoveKnob7Touch) knobCc = CC_E7;
         else if (note === MoveKnob8Touch) knobCc = CC_E8;
-        if (knobCc !== null && handleDeleteKnob(knobCc)) {
-            if (deleteHeld) deletePendingCut = false;
+        if (knobCc !== null) {
+            if (handleDeleteKnob(knobCc)) deletePendingCut = false;
+            return;
         }
-        return;
+        /* Not a knob touch — fall through to pad/step handling below */
     }
     /* Step 4: Toggle Gate/Trigger mode for active track */
     if (velocity > 0 && note === STEP_BASE + 3) {
@@ -6070,18 +6138,32 @@ globalThis.tick = function() {
     }
 
     /* If waveform is dirty but the file hasn't loaded yet, retry file info
-     * each tick until DSP delivers valid data (non-blocking set_param race). */
+     * each tick until DSP delivers valid data (non-blocking set_param race).
+     * When pendingSceneRestore has an expectedName, also verify the DSP has
+     * loaded the correct file before processing — guards against the race
+     * where refreshFileInfo returns the previous file's stale data. */
     if (waveformDirty && totalFrames === 0) {
         refreshFileInfo();
+        /* If we're waiting for a specific file and the DSP still reports the
+         * wrong name (old file not yet replaced), keep totalFrames at 0 to
+         * continue retrying next tick. */
+        if (totalFrames > 0 && pendingSceneRestore && pendingSceneRestore.expectedName &&
+                fileName !== pendingSceneRestore.expectedName) {
+            totalFrames = 0;  /* keep retrying */
+        }
         if (totalFrames > 0) {
             /* Apply deferred scene marker + slice state now that file is loaded */
             if (pendingSceneRestore) {
                 var _psr = pendingSceneRestore;
                 pendingSceneRestore = null;
-                /* Use saved endSample; fall back to totalFrames for new/unedited scenes */
+                /* Use saved endSample; fall back to totalFrames for new/unedited scenes.
+                 * Clamp both markers to the new file's length to avoid startSample >
+                 * endSample when the source scene was longer than the target scene. */
                 startSample = _psr.startSample || 0;
                 endSample   = (_psr.endSample > 0) ? _psr.endSample : totalFrames;
-                if (endSample > totalFrames) endSample = totalFrames;
+                if (endSample   > totalFrames) endSample   = totalFrames;
+                if (startSample > totalFrames) startSample = totalFrames;
+                if (startSample > endSample)   startSample = 0;
                 /* Save the resolved endSample back into the scene object */
                 var _psrTs = trackStates[activeTrack];
                 if (_psrTs.playingSceneIdx >= 0 && _psrTs.playingSceneIdx < _psrTs.scenes.length) {
@@ -6089,8 +6171,10 @@ globalThis.tick = function() {
                 }
                 syncMarkersToDs();
                 if (_psr.hasSlices) saveSliceState();
-                /* Now that the file is confirmed loaded, trigger playback */
-                if (_psr.autoPlay) pendingPlay = "whole";
+                /* Now that the file is confirmed loaded, trigger playback.
+                 * Use "selection" so play_whole=0 and marker boundaries are
+                 * respected immediately during playback (not ignored). */
+                if (_psr.autoPlay) pendingPlay = "selection";
             }
             refreshWaveform();
         }
@@ -6103,7 +6187,11 @@ globalThis.tick = function() {
         if (posRaw) playPos = parseInt(posRaw, 10) || 0;
 
         var playingRaw = host_module_get_param("playing");
-        if (totalFrames > 0 && (playingRaw === "0" || playingRaw === "false")) {
+        /* Guard: don't reset playing while a scene file is still loading
+         * (pendingSceneRestore != null). The DSP reports playing=0 between
+         * unloading the old file and starting the new one, which would
+         * cause the PLAY LED / track LED to go dark prematurely. */
+        if (totalFrames > 0 && !pendingSceneRestore && (playingRaw === "0" || playingRaw === "false")) {
             playing = false;
             trackStates[activeTrack].playing = false;
             if (lazyChopping) {
