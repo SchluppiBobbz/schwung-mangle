@@ -1155,9 +1155,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             }
         }
         if (load_result == 0) {
-            /* Recreate Bungee stretcher with the file's actual sample rate
-             * so pitch/tempo processing handles rate conversion correctly */
-            if (t->sample_rate != MOVE_SAMPLE_RATE && t->stretcher) {
+            /* Always recreate Bungee stretcher to match the file's sample rate.
+             * This handles both non-44.1k files AND the case where a previous
+             * 48kHz file left the stretcher at {48000,44100} and a 44.1kHz file
+             * is loaded next. */
+            if (t->stretcher) {
                 delete t->stretcher;
                 t->stretcher = new Bungee::Stretcher<Bungee::Basic>(
                     Bungee::SampleRates{t->sample_rate, MOVE_SAMPLE_RATE}, 2, 0);
@@ -1356,7 +1358,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 12.0f) v = 12.0f;
         t->pitch_semitones = v;
         recompute_ratios(t);
-        t->bng_req.pitch = pow(2.0, (double)v / 12.0);
+        /* Sync Bungee state to current playback position so the transition
+         * from direct path to Bungee path is seamless (no position jump,
+         * correct sample-rate-aware resampling from the start). */
+        if (t->playing) {
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, t->play_pos_frac);
+        } else {
+            t->bng_req.pitch = pow(2.0, (double)v / 12.0);
+        }
         return;
     }
 
@@ -1367,7 +1377,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 200) v = 200;
         t->tempo_percent = v;
         recompute_ratios(t);
-        t->bng_req.speed = (double)v / 100.0;
+        /* Sync Bungee state to current playback position so the transition
+         * from direct path to Bungee path is seamless. */
+        if (t->playing) {
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, t->play_pos_frac);
+        } else {
+            t->bng_req.speed = (double)v / 100.0;
+        }
         return;
     }
 

@@ -3008,17 +3008,10 @@ var pendingTrackReset = -1;
 var pendingTrackResetTimer = 0;
 
 function confirmTrackReset(trackIdx) {
-    if (pendingTrackReset === trackIdx && pendingTrackResetTimer > 0) {
-        /* Second press — confirmed */
-        resetTrack(trackIdx);
-        pendingTrackReset = -1;
-        pendingTrackResetTimer = 0;
-    } else {
-        /* First press — show confirmation */
-        pendingTrackReset = trackIdx;
-        pendingTrackResetTimer = 120;  /* ~2 seconds at 60 fps tick */
-        showStatus("Reset T" + (trackIdx + 1) + "? Press again", 120);
-    }
+    /* Start confirmation — user must click Jog Dial to confirm */
+    pendingTrackReset = trackIdx;
+    pendingTrackResetTimer = 150;  /* ~2.5 seconds at 60 fps tick */
+    showStatus("Reset T" + (trackIdx + 1) + "? Click JOG", 150);
 }
 
 function resetTrack(trackIdx) {
@@ -3055,6 +3048,13 @@ function resetTrack(trackIdx) {
     ts.sliceBoundaries = [];
     ts.sliceCount = 1;
     ts.selectedSlice = 0;
+    /* Clear cached waveform so track shows "No waveform data" */
+    ts.waveformData = null;
+    ts.waveformDirty = true;
+    ts.cachedVisStart = -1;
+    ts.cachedVisEnd = -1;
+    ts.seamWaveformData = null;
+    ts.seamWaveformDirty = true;
     /* Unload file in DSP */
     host_module_set_param("t" + trackIdx + ":file_path", "");
     host_module_set_param("t" + trackIdx + ":muted", "0");
@@ -5470,6 +5470,13 @@ function handleCC(cc, value) {
 
     /* Jog click */
     if (cc === CC_JOG_CLICK && value > 0) {
+        /* Jog click confirms pending track reset from any view */
+        if (pendingTrackReset >= 0 && pendingTrackResetTimer > 0) {
+            resetTrack(pendingTrackReset);
+            pendingTrackReset = -1;
+            pendingTrackResetTimer = 0;
+            return;
+        }
         switch (currentView) {
             case VIEW_MODE_MENU:
                 menuSelect();
