@@ -636,7 +636,13 @@ function switchToTrack(idx) {
         if (endSample   > totalFrames) endSample   = totalFrames;
         if (startSample > totalFrames) startSample = totalFrames;
         if (startSample > endSample)   startSample = 0;
-        syncMarkersToDs();
+        /* Push markers + pitch/tempo/gain to DSP for the now-active track.
+         * Must use blocking calls — single shared-memory slot race. */
+        host_module_set_param_blocking("markers", startSample + "," + endSample, 500);
+        host_module_set_param_blocking("gain_db",   gainDb.toFixed(1), 500);
+        host_module_set_param_blocking("pitch",     pitchSemitones.toFixed(2), 500);
+        host_module_set_param_blocking("tempo",     String(tempoPercent), 500);
+        host_module_set_param_blocking("play_loop", loopEnabled ? "1" : "0", 500);
     }
     /* Refresh pad LEDs for the new active track's scene layout */
     updateLeds();
@@ -2868,11 +2874,19 @@ function applySceneLaunch(trackIdx, sceneIdx) {
             host_module_set_param("file_path", scene.path);
         }
     } else {
+        var _tp = "t" + trackIdx + ":";
         if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("t" + trackIdx + ":file_path", scene.path, 2000);
+            host_module_set_param_blocking(_tp + "file_path", scene.path, 2000);
         } else {
-            host_module_set_param("t" + trackIdx + ":file_path", scene.path);
+            host_module_set_param(_tp + "file_path", scene.path);
         }
+        /* Send DSP params for non-active track with track prefix.
+         * Must use blocking calls — single shared-memory slot. */
+        host_module_set_param_blocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
+        host_module_set_param_blocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
+        host_module_set_param_blocking(_tp + "tempo",     String(scene.tempoPercent), 500);
+        host_module_set_param_blocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
+        host_module_set_param_blocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
     }
     ts.playing = true;
     if (trackIdx === activeTrack) playing = true;
@@ -6196,21 +6210,23 @@ globalThis.tick = function() {
                 }
                 /* Push deferred DSP settings now that file is loaded.
                  * These were NOT sent during applySceneLaunch to avoid
-                 * host_module_set_param queue overflow. */
+                 * host_module_set_param queue overflow.
+                 * MUST use blocking calls — rapid non-blocking calls
+                 * overwrite each other in the single shared-memory slot. */
                 if (_psr.gainDb !== undefined) {
-                    host_module_set_param("gain_db",   _psr.gainDb.toFixed(1));
+                    host_module_set_param_blocking("gain_db",   _psr.gainDb.toFixed(1), 500);
                     gainDb = _psr.gainDb;
                 }
                 if (_psr.pitchSemitones !== undefined) {
-                    host_module_set_param("pitch",     _psr.pitchSemitones.toFixed(2));
+                    host_module_set_param_blocking("pitch",     _psr.pitchSemitones.toFixed(2), 500);
                     pitchSemitones = _psr.pitchSemitones;
                 }
                 if (_psr.tempoPercent !== undefined) {
-                    host_module_set_param("tempo",     String(_psr.tempoPercent));
+                    host_module_set_param_blocking("tempo",     String(_psr.tempoPercent), 500);
                     tempoPercent = _psr.tempoPercent;
                 }
                 if (_psr.loopEnabled !== undefined) {
-                    host_module_set_param("play_loop", _psr.loopEnabled ? "1" : "0");
+                    host_module_set_param_blocking("play_loop", _psr.loopEnabled ? "1" : "0", 500);
                     loopEnabled = _psr.loopEnabled;
                 }
                 /* Use blocking markers call to guarantee the DSP has the
