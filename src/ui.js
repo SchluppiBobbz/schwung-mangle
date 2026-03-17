@@ -189,6 +189,12 @@ var currentView = VIEW_TRIM;
 var shiftHeld = false;
 var deleteHeld = false;
 var deletePendingCut = false;
+var muteHeld = false;
+var mutePendingAction = false;
+var copyHeld = false;
+var copyPendingAction = false;
+var sceneClipboard = null;   /* copied scene data */
+var trackClipboard = null;   /* copied track data */
 
 /* Twist-action knob state (touch + twist right = execute, twist left = cancel) */
 
@@ -339,7 +345,7 @@ function makeSceneState(path) {
         bpm:             bpm,
         baseBpm:         baseBpm,
         beatDivIndex:    beatDivIndex,
-        loopEnabled:     false,
+        loopEnabled:     true,
         sliceMode:       SLICE_MODE_EVEN,
         sliceCount:      1,
         sliceBoundaries: [],
@@ -407,7 +413,8 @@ function makeTrackState() {
         /* Scenes */
         scenes: [],           /* array of WAV paths */
         selectedSceneIdx: 0,  /* armed pad — target for new content */
-        playingSceneIdx:  -1  /* currently playing scene (-1 = none) */
+        playingSceneIdx:  -1, /* currently playing scene (-1 = none) */
+        muted: false           /* non-destructive track mute */
     };
 }
 
@@ -655,7 +662,9 @@ function switchToTrack(idx) {
 function updateTrackLEDs() {
     for (var i = 0; i < NUM_TRACKS; i++) {
         var color;
-        if (trackStates[i].playing) {
+        if (trackStates[i].muted) {
+            color = OrangeRed;
+        } else if (trackStates[i].playing) {
             color = BrightGreen;
         } else if (i === activeTrack) {
             color = WhiteLedBright;
@@ -1617,9 +1626,11 @@ function loadFileIntoEditor(filePath) {
         host_module_set_param("file_path", filePath);
     }
     host_module_set_param("dirty", "1");
-    /* Reset pitch/tempo on new file */
+    /* Reset pitch/tempo on new file, enable loop by default */
     pitchSemitones = 0.0;
     tempoPercent = 100;
+    loopEnabled = true;
+    host_module_set_param("play_loop", "1");
     refreshFileInfo();
     waveformDirty = true;
     refreshWaveform();
@@ -2992,6 +3003,289 @@ function removeScene(trackIdx, sceneIdx) {
     showStatus("Scene " + (sceneIdx + 1) + " removed", 60);
 }
 
+/* ---- Track reset (Delete+MoveRow) ---- */
+var pendingTrackReset = -1;
+var pendingTrackResetTimer = 0;
+
+function confirmTrackReset(trackIdx) {
+    if (pendingTrackReset === trackIdx && pendingTrackResetTimer > 0) {
+        /* Second press — confirmed */
+        resetTrack(trackIdx);
+        pendingTrackReset = -1;
+        pendingTrackResetTimer = 0;
+    } else {
+        /* First press — show confirmation */
+        pendingTrackReset = trackIdx;
+        pendingTrackResetTimer = 120;  /* ~2 seconds at 60 fps tick */
+        showStatus("Reset T" + (trackIdx + 1) + "? Press again", 120);
+    }
+}
+
+function resetTrack(trackIdx) {
+    var ts = trackStates[trackIdx];
+    /* Stop playback */
+    ts.playing = false;
+    if (trackIdx === activeTrack) {
+        playing = false;
+        host_module_set_param("play", "stop");
+    } else {
+        host_module_set_param("t" + trackIdx + ":play", "stop");
+    }
+    /* Clear all scenes */
+    ts.scenes = [];
+    ts.selectedSceneIdx = 0;
+    ts.playingSceneIdx = -1;
+    /* Reset track state */
+    ts.loaded = false;
+    ts.fileName = "";
+    ts.filePath = "";
+    ts.openedFilePath = "";
+    ts.totalFrames = 0;
+    ts.startSample = 0;
+    ts.endSample = 0;
+    ts.gainDb = 0.0;
+    ts.pitchSemitones = 0.0;
+    ts.tempoPercent = 100;
+    ts.loopEnabled = true;
+    ts.muted = false;
+    ts.gateMode = false;
+    ts.zoomLevel = 0;
+    ts.zoomCenter = 0;
+    ts.vScale = 1.0;
+    ts.sliceBoundaries = [];
+    ts.sliceCount = 1;
+    ts.selectedSlice = 0;
+    /* Unload file in DSP */
+    host_module_set_param("t" + trackIdx + ":file_path", "");
+    host_module_set_param("t" + trackIdx + ":muted", "0");
+    /* Sync globals if this is the active track */
+    if (trackIdx === activeTrack) {
+        restoreTrackUIState(trackIdx);
+        openedFilePath = "";
+        totalFrames = 0;
+        waveformData = null;
+        waveformDirty = true;
+    }
+    saveSceneState(trackIdx);
+    updateTrackLEDs();
+    updatePlayLED();
+    showStatus("T" + (trackIdx + 1) + " Reset", 60);
+}
+
+/* ---- Scene copy/paste ---- */
+
+function copyScene(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    if (sceneIdx < 0 || sceneIdx >= ts.scenes.length) {
+        showStatus("No scene to copy", 40);
+        return;
+    }
+    /* If this is the playing scene on the active track, save current state first */
+    if (trackIdx === activeTrack && ts.playingSceneIdx === sceneIdx) {
+        saveCurrentSceneState(trackIdx);
+    }
+    var src = ts.scenes[sceneIdx];
+    sceneClipboard = {
+        path:            src.path,
+        startSample:     src.startSample,
+        endSample:       src.endSample,
+        gainDb:          src.gainDb,
+        pitchSemitones:  src.pitchSemitones,
+        tempoPercent:    src.tempoPercent,
+        bpm:             src.bpm,
+        baseBpm:         src.baseBpm,
+        beatDivIndex:    src.beatDivIndex,
+        loopEnabled:     src.loopEnabled,
+        sliceMode:       src.sliceMode,
+        sliceCount:      src.sliceCount,
+        sliceBoundaries: src.sliceBoundaries.slice(),
+        selectedSlice:   src.selectedSlice,
+        slicePadOffset:  src.slicePadOffset,
+        sliceRegionStart: src.sliceRegionStart,
+        sliceRegionEnd:  src.sliceRegionEnd,
+        sliceThreshold:  src.sliceThreshold,
+        slicePitches:    src.slicePitches.slice(),
+        sliceTempos:     src.sliceTempos.slice(),
+        lazySub:         src.lazySub,
+        zoomLevel:       src.zoomLevel,
+        zoomCenter:      src.zoomCenter,
+        vScale:          src.vScale
+    };
+    showStatus("Scene " + (sceneIdx + 1) + " copied", 40);
+}
+
+function pasteScene(trackIdx, sceneIdx) {
+    if (!sceneClipboard) {
+        showStatus("No scene in clipboard", 40);
+        return;
+    }
+    var ts = trackStates[trackIdx];
+    /* Extend scenes array if needed */
+    while (ts.scenes.length <= sceneIdx) {
+        ts.scenes.push(makeSceneState(""));
+    }
+    var dst = ts.scenes[sceneIdx];
+    dst.path            = sceneClipboard.path;
+    dst.startSample     = sceneClipboard.startSample;
+    dst.endSample       = sceneClipboard.endSample;
+    dst.gainDb          = sceneClipboard.gainDb;
+    dst.pitchSemitones  = sceneClipboard.pitchSemitones;
+    dst.tempoPercent    = sceneClipboard.tempoPercent;
+    dst.bpm             = sceneClipboard.bpm;
+    dst.baseBpm         = sceneClipboard.baseBpm;
+    dst.beatDivIndex    = sceneClipboard.beatDivIndex;
+    dst.loopEnabled     = sceneClipboard.loopEnabled;
+    dst.sliceMode       = sceneClipboard.sliceMode;
+    dst.sliceCount      = sceneClipboard.sliceCount;
+    dst.sliceBoundaries = sceneClipboard.sliceBoundaries.slice();
+    dst.selectedSlice   = sceneClipboard.selectedSlice;
+    dst.slicePadOffset  = sceneClipboard.slicePadOffset;
+    dst.sliceRegionStart = sceneClipboard.sliceRegionStart;
+    dst.sliceRegionEnd  = sceneClipboard.sliceRegionEnd;
+    dst.sliceThreshold  = sceneClipboard.sliceThreshold;
+    dst.slicePitches    = sceneClipboard.slicePitches.slice();
+    dst.sliceTempos     = sceneClipboard.sliceTempos.slice();
+    dst.lazySub         = sceneClipboard.lazySub;
+    dst.zoomLevel       = sceneClipboard.zoomLevel;
+    dst.zoomCenter      = sceneClipboard.zoomCenter;
+    dst.vScale          = sceneClipboard.vScale;
+    saveSceneState(trackIdx);
+    showStatus("Pasted to P" + (sceneIdx + 1), 40);
+}
+
+/* ---- Track copy/paste ---- */
+
+function copyTrack(trackIdx) {
+    var ts = trackStates[trackIdx];
+    /* Save current UI state if this is the active track */
+    if (trackIdx === activeTrack) saveTrackUIState(trackIdx);
+    /* Save current scene state */
+    if (ts.playingSceneIdx >= 0 && ts.playingSceneIdx < ts.scenes.length) {
+        if (trackIdx === activeTrack) saveCurrentSceneState(trackIdx);
+    }
+    trackClipboard = {
+        scenes: [],
+        playingSceneIdx: ts.playingSceneIdx,
+        selectedSceneIdx: ts.selectedSceneIdx,
+        gainDb: ts.gainDb,
+        pitchSemitones: ts.pitchSemitones,
+        tempoPercent: ts.tempoPercent,
+        loopEnabled: ts.loopEnabled,
+        gateMode: ts.gateMode
+    };
+    for (var i = 0; i < ts.scenes.length; i++) {
+        var s = ts.scenes[i];
+        trackClipboard.scenes.push({
+            path:            s.path,
+            startSample:     s.startSample,
+            endSample:       s.endSample,
+            gainDb:          s.gainDb,
+            pitchSemitones:  s.pitchSemitones,
+            tempoPercent:    s.tempoPercent,
+            bpm:             s.bpm,
+            baseBpm:         s.baseBpm,
+            beatDivIndex:    s.beatDivIndex,
+            loopEnabled:     s.loopEnabled,
+            sliceMode:       s.sliceMode,
+            sliceCount:      s.sliceCount,
+            sliceBoundaries: s.sliceBoundaries.slice(),
+            selectedSlice:   s.selectedSlice,
+            slicePadOffset:  s.slicePadOffset,
+            sliceRegionStart: s.sliceRegionStart,
+            sliceRegionEnd:  s.sliceRegionEnd,
+            sliceThreshold:  s.sliceThreshold,
+            slicePitches:    s.slicePitches.slice(),
+            sliceTempos:     s.sliceTempos.slice(),
+            lazySub:         s.lazySub,
+            zoomLevel:       s.zoomLevel,
+            zoomCenter:      s.zoomCenter,
+            vScale:          s.vScale
+        });
+    }
+    showStatus("T" + (trackIdx + 1) + " copied", 40);
+}
+
+function pasteTrack(trackIdx) {
+    if (!trackClipboard) {
+        showStatus("No track in clipboard", 40);
+        return;
+    }
+    var ts = trackStates[trackIdx];
+    /* Stop playback on target track */
+    ts.playing = false;
+    if (trackIdx === activeTrack) {
+        playing = false;
+        host_module_set_param("play", "stop");
+    } else {
+        host_module_set_param("t" + trackIdx + ":play", "stop");
+    }
+    /* Copy scenes */
+    ts.scenes = [];
+    for (var i = 0; i < trackClipboard.scenes.length; i++) {
+        var s = trackClipboard.scenes[i];
+        ts.scenes.push({
+            path:            s.path,
+            startSample:     s.startSample,
+            endSample:       s.endSample,
+            gainDb:          s.gainDb,
+            pitchSemitones:  s.pitchSemitones,
+            tempoPercent:    s.tempoPercent,
+            bpm:             s.bpm,
+            baseBpm:         s.baseBpm,
+            beatDivIndex:    s.beatDivIndex,
+            loopEnabled:     s.loopEnabled,
+            sliceMode:       s.sliceMode,
+            sliceCount:      s.sliceCount,
+            sliceBoundaries: s.sliceBoundaries.slice(),
+            selectedSlice:   s.selectedSlice,
+            slicePadOffset:  s.slicePadOffset,
+            sliceRegionStart: s.sliceRegionStart,
+            sliceRegionEnd:  s.sliceRegionEnd,
+            sliceThreshold:  s.sliceThreshold,
+            slicePitches:    s.slicePitches.slice(),
+            sliceTempos:     s.sliceTempos.slice(),
+            lazySub:         s.lazySub,
+            zoomLevel:       s.zoomLevel,
+            zoomCenter:      s.zoomCenter,
+            vScale:          s.vScale
+        });
+    }
+    ts.playingSceneIdx = trackClipboard.playingSceneIdx;
+    ts.selectedSceneIdx = trackClipboard.selectedSceneIdx;
+    ts.gainDb = trackClipboard.gainDb;
+    ts.pitchSemitones = trackClipboard.pitchSemitones;
+    ts.tempoPercent = trackClipboard.tempoPercent;
+    ts.loopEnabled = trackClipboard.loopEnabled;
+    ts.gateMode = trackClipboard.gateMode;
+    ts.muted = false;
+    /* Load the playing scene's file into DSP */
+    if (ts.playingSceneIdx >= 0 && ts.playingSceneIdx < ts.scenes.length) {
+        var scene = ts.scenes[ts.playingSceneIdx];
+        ts.loaded = true;
+        ts.fileName = scene.path.split("/").pop();
+        ts.filePath = scene.path;
+        ts.openedFilePath = scene.path;
+        var _tp = "t" + trackIdx + ":";
+        host_module_set_param_blocking(_tp + "file_path", scene.path, 2000);
+        host_module_set_param_blocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
+        host_module_set_param_blocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
+        host_module_set_param_blocking(_tp + "tempo",     String(scene.tempoPercent), 500);
+        host_module_set_param_blocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
+        host_module_set_param_blocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
+        host_module_set_param(_tp + "muted", "0");
+    }
+    /* Sync globals if this is the active track */
+    if (trackIdx === activeTrack) {
+        restoreTrackUIState(trackIdx);
+        waveformDirty = true;
+        refreshFileInfo();
+        refreshWaveform();
+    }
+    saveSceneState(trackIdx);
+    updateTrackLEDs();
+    showStatus("Pasted to T" + (trackIdx + 1), 40);
+}
+
 /**
  * Finalize the current scene: truncate the WAV to the trim markers,
  * save it in the project folder, update the scene path, and reset markers.
@@ -3062,7 +3356,12 @@ function doFinalize() {
     sceneLoadFile(activeTrack, destPath);
     totalFrames = 0;
     waveformDirty = true;
-    pendingSceneRestore = { startSample: 0, endSample: 0, hasSlices: false };
+    pendingSceneRestore = {
+        startSample: 0, endSample: 0,
+        gainDb: gainDb, pitchSemitones: 0.0, tempoPercent: 100,
+        loopEnabled: loopEnabled, hasSlices: false,
+        autoPlay: playing
+    };
 
     saveSceneState(activeTrack);
     saveProjectJson();
@@ -4467,9 +4766,38 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* --- MoveRow1-4: Track selection / file browser --- */
+    /* --- MoveRow1-4: Track selection / file browser / combos --- */
     for (var _t = 0; _t < NUM_TRACKS; _t++) {
         if (cc === TRACK_CCS[_t] && value > 0) {
+            if (muteHeld) {
+                /* Mute+MoveRow: toggle track mute */
+                var _mts = trackStates[_t];
+                _mts.muted = !_mts.muted;
+                host_module_set_param("t" + _t + ":muted", _mts.muted ? "1" : "0");
+                updateTrackLEDs();
+                showStatus("T" + (_t + 1) + (_mts.muted ? " Muted" : " Unmuted"), 40);
+                mutePendingAction = false;
+                return;
+            }
+            if (deleteHeld) {
+                /* Delete+MoveRow: reset entire track (with confirmation) */
+                deleteHeld = false;
+                deletePendingCut = false;
+                confirmTrackReset(_t);
+                return;
+            }
+            if (copyHeld) {
+                if (shiftHeld) {
+                    /* Shift+Copy+MoveRow: paste/overwrite track */
+                    pasteTrack(_t);
+                    copyPendingAction = false;
+                } else {
+                    /* Copy+MoveRow: copy track */
+                    copyTrack(_t);
+                    copyPendingAction = false;
+                }
+                return;
+            }
             if (shiftHeld) {
                 /* Shift+MoveRow: open file browser for this track */
                 pendingBrowserTrack = _t;
@@ -4635,13 +4963,23 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Mute button — zero out selection (all views) */
-    if (cc === CC_MUTE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
-            doMute();
-        } else if (currentView === VIEW_LOOP) {
-            doMute();
-            invalidateSeamWaveform();
+    /* Mute button — press/release pattern for combos */
+    if (cc === CC_MUTE) {
+        if (value > 0) {
+            muteHeld = true;
+            mutePendingAction = true;
+        } else {
+            /* Release: execute destructive mute only if no combo was used */
+            if (mutePendingAction) {
+                if (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM || currentView === VIEW_SLICE) {
+                    doMute();
+                } else if (currentView === VIEW_LOOP) {
+                    doMute();
+                    invalidateSeamWaveform();
+                }
+            }
+            muteHeld = false;
+            mutePendingAction = false;
         }
         return;
     }
@@ -4656,21 +4994,31 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Copy button: copy (all views) / Shift+Copy: paste insert (all views) */
-    if (cc === CC_COPY && value > 0) {
-        if (shiftHeld) {
-            if (currentView === VIEW_SLICE) {
-                doSlicePasteInsert();
-            } else {
-                doPaste();
-                if (currentView === VIEW_LOOP) invalidateSeamWaveform();
-            }
+    /* Copy button: press/release for combos (Copy+Pad, Copy+MoveRow) */
+    if (cc === CC_COPY) {
+        if (value > 0) {
+            copyHeld = true;
+            copyPendingAction = true;
         } else {
-            if (currentView === VIEW_SLICE) {
-                doSliceCopy();
-            } else {
-                doCopy();
+            /* Release: execute audio copy/paste only if no combo was used */
+            if (copyPendingAction) {
+                if (shiftHeld) {
+                    if (currentView === VIEW_SLICE) {
+                        doSlicePasteInsert();
+                    } else {
+                        doPaste();
+                        if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+                    }
+                } else {
+                    if (currentView === VIEW_SLICE) {
+                        doSliceCopy();
+                    } else {
+                        doCopy();
+                    }
+                }
             }
+            copyHeld = false;
+            copyPendingAction = false;
         }
         return;
     }
@@ -5821,13 +6169,21 @@ function handleNote(note, velocity) {
                     return;
                 }
 
-                /* Pads 1-8: scene launch / arm / delete */
+                /* Pads 1-8: scene launch / arm / delete / copy / paste */
                 if (padIdx >= 0 && padIdx < MAX_SCENES) {
                     if (deleteHeld) {
                         removeScene(activeTrack, padIdx);
                         deletePendingCut = false;
+                    } else if (copyHeld) {
+                        if (shiftHeld) {
+                            /* Shift+Copy+Pad: paste/overwrite scene */
+                            pasteScene(activeTrack, padIdx);
+                        } else {
+                            /* Copy+Pad: copy scene */
+                            copyScene(activeTrack, padIdx);
+                        }
+                        copyPendingAction = false;
                     } else {
-                        showStatus("P" + (padIdx+1) + " pi=" + trackStates[activeTrack].playingSceneIdx + " pl=" + (trackStates[activeTrack].playing?1:0), 60);
                         launchScene(activeTrack, padIdx);
                     }
                     updateLeds();
@@ -6096,6 +6452,12 @@ globalThis.tick = function() {
             updateLeds();
             if (currentView === VIEW_SLICE) updateSlicePadLeds();
         }
+    }
+
+    /* Countdown for track reset confirmation */
+    if (pendingTrackResetTimer > 0) {
+        pendingTrackResetTimer--;
+        if (pendingTrackResetTimer === 0) pendingTrackReset = -1;
     }
 
     /* Poll for sampler finalization after recording stop */

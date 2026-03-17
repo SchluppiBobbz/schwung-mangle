@@ -138,6 +138,7 @@ typedef struct {
 
     int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play) */
     int gate_held;              /* 1 while gate is held (pad/key down) */
+    int muted;                  /* 1=track muted (non-destructive, skips render) */
 
     float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
     int   tempo_percent;        /* 50 to 200 */
@@ -1342,6 +1343,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(param, "muted") == 0) {
+        if (!val) return;
+        t->muted = atoi(val) ? 1 : 0;
+        return;
+    }
+
     if (strcmp(param, "pitch") == 0) {
         if (!val) return;
         float v = (float)atof(val);
@@ -1443,6 +1450,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         int new_frames = end - start;
         if (new_frames <= 0) return;
 
+        /* Save play state so we can resume after buffer swap */
+        int was_playing = t->playing;
+        int old_play_pos = t->play_pos;
+        double old_play_pos_frac = t->play_pos_frac;
+
+        /* Stop playback during buffer swap to prevent render_track
+         * from accessing freed memory. */
+        t->playing = 0;
+
         /* Save to undo */
         save_undo(t);
 
@@ -1451,6 +1467,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         int16_t *new_data = (int16_t *)malloc(buf_size);
         if (!new_data) {
             plugin_log("Trim: allocation failed");
+            t->playing = was_playing;
             return;
         }
 
@@ -1469,7 +1486,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->zoom_level = 0;
         t->zoom_center = new_frames / 2;
         t->dirty = 1;
-        t->playing = 0;
+
+        /* Resume playback with adjusted position */
+        if (was_playing) {
+            double new_pos = old_play_pos_frac - (double)start;
+            if (new_pos < 0) new_pos = 0;
+            if (new_pos >= (double)new_frames) {
+                /* Position was outside trimmed region — wrap to start */
+                new_pos = 0;
+            }
+            t->play_pos_frac = new_pos;
+            t->play_pos = (int)new_pos;
+            t->playing = 1;
+        }
 
         /* Recompute */
         compute_waveform(t, 128);
@@ -2448,6 +2477,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
+    if (strcmp(param, "muted") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%d", t->muted);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
     if (strcmp(param, "pitch") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%.2f", t->pitch_semitones);
         return (n >= 0 && n < buf_len) ? n : -1;
@@ -2542,6 +2576,13 @@ static void do_apply_pitch_tempo(track_t *t) {
     }
 
     save_undo(t);
+
+    /* Save play state so we can resume after buffer swap */
+    int was_playing = t->playing;
+    double old_play_pos_frac = t->play_pos_frac;
+
+    /* Stop playback during buffer swap to prevent render_track
+     * from accessing freed memory. */
     t->playing = 0;
     t->bng_out_count = 0;
 
@@ -2673,6 +2714,11 @@ static void do_apply_pitch_tempo(track_t *t) {
     t->start_sample = prefix_frames;
     t->end_sample   = prefix_frames + out_count;
 
+    /* The stretcher output is at MOVE_SAMPLE_RATE (44100).  Update sample_rate
+     * so that render_track's rate_inc = 1.0 and export writes the correct header. */
+    t->sample_rate = MOVE_SAMPLE_RATE;
+    t->duration_secs = (float)new_total / (float)MOVE_SAMPLE_RATE;
+
     /* Reset pitch/tempo to defaults */
     t->pitch_semitones = 0.0f;
     t->tempo_percent   = 100;
@@ -2680,10 +2726,40 @@ static void do_apply_pitch_tempo(track_t *t) {
     /* Sync Bungee playback request too */
     t->bng_req.pitch = 1.0;
     t->bng_req.speed = 1.0;
+    /* Rebuild stretcher for new sample rate */
+    if (t->stretcher) {
+        delete t->stretcher;
+        t->stretcher = new Bungee::Stretcher<Bungee::Basic>(
+            Bungee::SampleRates{MOVE_SAMPLE_RATE, MOVE_SAMPLE_RATE}, 2, 0);
+        t->bng_max_grain = t->stretcher->maxInputFrameCount();
+        free(t->bng_grain_input);
+        t->bng_grain_input = (float *)calloc(t->bng_max_grain * 2, sizeof(float));
+    }
 
     t->dirty = 1;
     compute_waveform(t, 128);
     t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
+
+    /* Resume playback with mapped position */
+    if (was_playing) {
+        double new_pos;
+        if (old_play_pos_frac < (double)start) {
+            /* Before processed region — unchanged */
+            new_pos = old_play_pos_frac;
+        } else if (old_play_pos_frac < (double)end) {
+            /* Inside processed region — scale proportionally */
+            double frac = (old_play_pos_frac - (double)start) / (double)region_frames;
+            new_pos = (double)prefix_frames + frac * (double)out_count;
+        } else {
+            /* After processed region — shift by size delta */
+            new_pos = old_play_pos_frac + (double)(out_count - region_frames);
+        }
+        if (new_pos < 0) new_pos = 0;
+        if (new_pos >= (double)new_total) new_pos = 0;
+        t->play_pos_frac = new_pos;
+        t->play_pos = (int)new_pos;
+        t->playing = 1;
+    }
 
     {
         char log_buf[128];
@@ -2702,6 +2778,7 @@ static void do_apply_pitch_tempo(track_t *t) {
  */
 static int render_track(track_t *t, int16_t *out, int frames) {
     if (!t->playing || !t->audio_data || t->audio_frames <= 0) return 0;
+    if (t->muted) return 0;
     if (t->gate_mode && !t->gate_held) return 0;
 
     /* Determine playback boundaries */
