@@ -975,6 +975,22 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (!instance || !key) return;
     instance_t *inst = (instance_t *)instance;
 
+    /* DSP-side: log every set_param call to see what actually arrives */
+    if (strncmp(key, "debug_log", 9) != 0 &&
+        strcmp(key, "markers") != 0 &&
+        strstr(key, "scene_state") == NULL &&
+        strstr(key, "slice_state") == NULL) {
+        FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
+        if (dbgf) {
+            struct timespec _ts;
+            clock_gettime(CLOCK_MONOTONIC, &_ts);
+            fprintf(dbgf, "[%ld.%03ld] DSP set_param key=%s val=%.80s\n",
+                    (long)_ts.tv_sec, _ts.tv_nsec / 1000000,
+                    key, val ? val : "(null)");
+            fclose(dbgf);
+        }
+    }
+
     /* --- Global params (no track prefix) --- */
 
     if (strcmp(key, "active_track") == 0) {
@@ -1012,6 +1028,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "sync_clock") == 0) {
         if (!val) return;
         inst->sync_to_clock = atoi(val) ? 1 : 0;
+        return;
+    }
+
+    /* --- Debug log: append message to /tmp/scene_debug.log --- */
+    if (strncmp(key, "debug_log", 9) == 0) {
+        if (!val) return;
+        FILE *f = fopen("/tmp/scene_debug.log", "a");
+        if (f) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            fprintf(f, "[%ld.%03ld] %s\n", (long)ts.tv_sec, ts.tv_nsec / 1000000, val);
+            fclose(f);
+        }
         return;
     }
 
@@ -1073,7 +1102,29 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "file_path") == 0) {
         if (!val || val[0] == '\0') return;
 
-        strncpy(t->file_path, val, sizeof(t->file_path) - 1);
+        /* Strip "?t=..." cache-bust suffix appended by the UI to defeat
+         * the host's file_path deduplication. */
+        char clean_path[1024];
+        strncpy(clean_path, val, sizeof(clean_path) - 1);
+        clean_path[sizeof(clean_path) - 1] = '\0';
+        {
+            char *q = strchr(clean_path, '?');
+            if (q) *q = '\0';
+        }
+
+        /* DSP-side debug log — writes directly, no set_param queue */
+        {
+            FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
+            if (dbgf) {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(dbgf, "[%ld.%03ld] DSP file_path track=%d val=%s\n",
+                        (long)_ts.tv_sec, _ts.tv_nsec / 1000000, track_idx, clean_path);
+                fclose(dbgf);
+            }
+        }
+
+        strncpy(t->file_path, clean_path, sizeof(t->file_path) - 1);
         t->file_path[sizeof(t->file_path) - 1] = '\0';
 
         /* Extract filename */
@@ -1090,7 +1141,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         recompute_ratios(t);
 
         /* Load the file */
-        if (load_wav(t, val) == 0) {
+        int load_result = load_wav(t, val);
+        {
+            FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
+            if (dbgf) {
+                struct timespec _ts;
+                clock_gettime(CLOCK_MONOTONIC, &_ts);
+                fprintf(dbgf, "[%ld.%03ld] DSP load_wav result=%d frames=%d name=%s\n",
+                        (long)_ts.tv_sec, _ts.tv_nsec / 1000000,
+                        load_result, t->audio_frames, t->file_name);
+                fclose(dbgf);
+            }
+        }
+        if (load_result == 0) {
             /* Recreate Bungee stretcher with the file's actual sample rate
              * so pitch/tempo processing handles rate conversion correctly */
             if (t->sample_rate != MOVE_SAMPLE_RATE && t->stretcher) {
@@ -2056,6 +2119,43 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     }
 
     if (strcmp(param, "slice_state") == 0) {
+        /* JSON {"load":"/path"} triggers a file reload, bypassing the host's
+         * file_path deduplication.  The host validates slice_state values and
+         * only passes JSON or numbers, so we wrap the path in JSON. */
+        if (val && strncmp(val, "{\"load\":\"", 9) == 0) {
+            /* Extract path from {"load":"/path/to/file.wav"} */
+            const char *new_path = val + 9;  /* skip {"load":" */
+            /* Find closing quote */
+            char extracted[1024];
+            strncpy(extracted, new_path, sizeof(extracted) - 1);
+            extracted[sizeof(extracted) - 1] = '\0';
+            char *end_quote = strchr(extracted, '"');
+            if (end_quote) *end_quote = '\0';
+            new_path = extracted;
+            if (new_path[0] != '\0') {
+                {
+                    FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
+                    if (dbgf) {
+                        struct timespec _ts;
+                        clock_gettime(CLOCK_MONOTONIC, &_ts);
+                        fprintf(dbgf, "[%ld.%03ld] DSP scene_reload track=%d val=%s\n",
+                                (long)_ts.tv_sec, _ts.tv_nsec / 1000000, track_idx, new_path);
+                        fclose(dbgf);
+                    }
+                }
+                strncpy(t->file_path, new_path, sizeof(t->file_path) - 1);
+                t->file_path[sizeof(t->file_path) - 1] = '\0';
+                int r = load_wav(t, new_path);
+                if (r == 0) {
+                    compute_waveform(t, 128);
+                    t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
+                    t->dirty = 1;
+                    t->pitch_semitones = 0.0;
+                    t->tempo_percent = 100.0;
+                }
+            }
+            return;
+        }
         /* Store UI slice state JSON for reconnect persistence */
         if (val) {
             strncpy(t->slice_state, val, sizeof(t->slice_state) - 1);

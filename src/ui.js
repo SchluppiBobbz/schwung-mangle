@@ -88,6 +88,27 @@ var VIEW_JOG_SHIFT_MENU = 11;
 var VIEW_BPM_TRIM = 12;
 var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
 
+/* ============ Debug Logging ============ */
+/* Set to true to enable debug logging to /tmp/scene_debug.log on device.
+ * IMPORTANT: each dbg() call uses host_module_set_param which consumes a
+ * slot in the host's limited param queue. Keep disabled in production to
+ * avoid starving critical set_param calls (e.g. file_path). */
+var _dbgEnabled = false;
+var _dbgSeq = 0;
+/**
+ * Trigger a file load in the DSP bypassing the host's file_path
+ * deduplication.  Sends path as JSON via slice_state (host validates
+ * slice_state values and only passes JSON/numbers).
+ */
+function sceneLoadFile(trackIdx, path) {
+    host_module_set_param("t" + trackIdx + ":slice_state", JSON.stringify({load: path}));
+}
+function dbg(msg) {
+    if (!_dbgEnabled) return;
+    _dbgSeq++;
+    host_module_set_param("debug_log", _dbgSeq + " " + msg);
+}
+
 /* Skipback / scenes constants */
 var MAX_SCENES = 8;
 var SKIPBACK_BARS_OPTIONS = [1, 2, 4, 8];
@@ -457,6 +478,7 @@ function saveCurrentSceneState(trackIdx) {
     var idx = ts.playingSceneIdx;
     if (idx < 0 || idx >= ts.scenes.length) return;
     var sc = ts.scenes[idx];
+    dbg("saveSceneState t" + trackIdx + " s" + idx + " start=" + (trackIdx === activeTrack ? startSample : ts.startSample) + " end=" + (trackIdx === activeTrack ? endSample : ts.endSample) + " path=" + sc.path);
     if (trackIdx === activeTrack) {
         sc.startSample    = startSample;
         sc.endSample      = endSample;
@@ -895,7 +917,7 @@ function loadProjectJson() {
                 ? trackStates[_lt].scenes[_ltPlayIdx]
                 : (trackStates[_lt].scenes.length > 0 ? trackStates[_lt].scenes[0] : null);
             var _ltPath = _ltScene ? _ltScene.path : null;
-            if (_ltPath) host_module_set_param("t" + _lt + ":file_path", _ltPath);
+            if (_ltPath) sceneLoadFile(_lt, _ltPath);
         }
         /* For the active track, trigger a waveform refresh once DSP loads the file */
         waveformDirty = true;
@@ -1515,12 +1537,16 @@ function refreshFileInfo() {
     if (!raw) return;
     try {
         var info = JSON.parse(raw);
+        var _prevStart = startSample, _prevEnd = endSample;
         fileName = info.name || "";
         if (isScratchFile()) fileName = "New Recording";
         fileDuration = info.duration || 0;
         totalFrames = info.frames || 0;
         startSample = info.start || 0;
         endSample = info.end || totalFrames;
+        if (startSample !== _prevStart || endSample !== _prevEnd) {
+            dbg("refreshFileInfo: markers changed! " + _prevStart + "," + _prevEnd + " → " + startSample + "," + endSample + " file=" + fileName + " frames=" + totalFrames);
+        }
         /* Fetch sample rate separately */
         var srRaw = host_module_get_param("sample_rate");
         if (srRaw) sampleRate = parseInt(srRaw, 10) || 44100;
@@ -2735,8 +2761,7 @@ function findNextFreeSceneSlot(trackIdx) {
  *   false — loads the file and restores settings for editing, but does NOT
  *           start playback and does NOT change playingSceneIdx.
  */
-function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
-    if (autoPlay === undefined) autoPlay = true;
+function applySceneLaunch(trackIdx, sceneIdx) {
     var ts = trackStates[trackIdx];
 
     /* Save state of the scene we are leaving */
@@ -2745,11 +2770,20 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
     }
 
     var scene = ts.scenes[sceneIdx];
-    /* Only update playingSceneIdx when actually starting playback */
-    if (autoPlay) ts.playingSceneIdx = sceneIdx;
+    var prevSceneIdx = ts.playingSceneIdx;
+    ts.playingSceneIdx  = sceneIdx;
     ts.selectedSceneIdx = sceneIdx;
 
+    /* Check if the file is already loaded (same path → skip reload) */
+    var currentPath = (trackIdx === activeTrack) ? openedFilePath : ts.openedFilePath;
+    var sameFile = (currentPath === scene.path && totalFrames > 0);
+    /* DEBUG: show decision on display */
+    var _curName = currentPath ? currentPath.substring(currentPath.lastIndexOf("/") + 1) : "?";
+    var _scnName = scene.path ? scene.path.substring(scene.path.lastIndexOf("/") + 1) : "?";
+    showStatus((sameFile ? "SAME" : "DIFF") + " cur:" + _curName.substring(0,15) + " sc:" + _scnName.substring(0,15), 180);
+
     if (trackIdx === activeTrack) {
+        showStatus("ACT ti=" + trackIdx + " at=" + activeTrack, 120);
         /* Restore scene settings into globals */
         startSample      = scene.startSample;
         endSample        = scene.endSample;
@@ -2775,31 +2809,58 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
         zoomCenter       = scene.zoomCenter;
         vScale           = scene.vScale;
         openedFilePath   = scene.path;
-        totalFrames      = 0;   /* reset — tick retry loop will refetch */
-        waveformDirty    = true;
 
-        /* Push settings that don't depend on file length immediately */
-        host_module_set_param("gain_db",   gainDb.toFixed(1));
-        host_module_set_param("pitch",     pitchSemitones.toFixed(2));
-        host_module_set_param("tempo",     String(tempoPercent));
-        host_module_set_param("play_loop", loopEnabled ? "1" : "0");
+        /* Clamp markers to file length */
+        if (endSample   > totalFrames) endSample   = totalFrames;
+        if (startSample > totalFrames) startSample = totalFrames;
+        if (startSample > endSample)   startSample = 0;
 
-        /* Defer marker + slice push + (optional) play until DSP has loaded file.
-         * Store the expected basename so the tick loop can verify the correct
-         * file is loaded before processing (guards against the non-blocking
-         * set_param race where refreshFileInfo returns the old file's data). */
-        var _spath = scene.path;
-        var _sslash = _spath.lastIndexOf('/');
-        var _sname = (_sslash >= 0) ? _spath.substring(_sslash + 1) : _spath;
-        pendingSceneRestore = {
-            startSample:  scene.startSample,
-            endSample:    scene.endSample,
-            hasSlices:    scene.sliceBoundaries.length >= 2,
-            autoPlay:     autoPlay,
-            expectedName: _sname
-        };
-    } else if (autoPlay) {
-        /* Non-active track with autoPlay: restore state into trackState struct */
+        if (sameFile) {
+            /* Same file: just update markers and refresh display — no reload.
+             * Push settings to DSP immediately since no file load resets them. */
+            host_module_set_param("gain_db",   gainDb.toFixed(1));
+            host_module_set_param("pitch",     pitchSemitones.toFixed(2));
+            host_module_set_param("tempo",     String(tempoPercent));
+            host_module_set_param("play_loop", loopEnabled ? "1" : "0");
+            syncMarkersToDs();
+            if (sliceBoundaries.length >= 2) saveSliceState();
+            waveformDirty = true;
+            refreshWaveform();
+            /* Restart playback from the new region */
+            playing = true;
+            ts.playing = true;
+            pendingPlay = "selection";
+            dbg("sceneLaunch SAME t" + trackIdx + " s" + sceneIdx + " (was s" + prevSceneIdx + ") start=" + startSample + " end=" + endSample + " frames=" + totalFrames);
+        } else {
+            /* Different file: send ONLY file_path to DSP — nothing else!
+             * The DSP resets pitch/tempo on file load anyway (plugin.cpp:1100).
+             * Gain/pitch/tempo/loop are deferred via pendingSceneRestore to
+             * avoid host_module_set_param queue overflow (limited buffer).
+             * They get applied in tick() after the file is confirmed loaded. */
+            var _spath  = scene.path;
+            var _sslash = _spath.lastIndexOf('/');
+            var _sname  = (_sslash >= 0) ? _spath.substring(_sslash + 1) : _spath;
+            showStatus("PRE:" + (typeof scene.path) + " " + scene.path.substring(scene.path.length - 15), 120);
+            sceneLoadFile(trackIdx, scene.path);
+            totalFrames   = 0;
+            waveformDirty = true;
+            pendingSceneRestore = {
+                startSample:     scene.startSample,
+                endSample:       scene.endSample,
+                gainDb:          scene.gainDb,
+                pitchSemitones:  scene.pitchSemitones,
+                tempoPercent:    scene.tempoPercent,
+                loopEnabled:     scene.loopEnabled,
+                hasSlices:       scene.sliceBoundaries.length >= 2,
+                autoPlay:        true,
+                expectedName:    _sname
+            };
+            playing = true;
+            ts.playing = true;
+            dbg("sceneLaunch DIFF t" + trackIdx + " s" + sceneIdx + " (was s" + prevSceneIdx + ") file=" + _sname + " path=" + scene.path);
+        }
+    } else {
+        /* Non-active track: restore state into trackState struct */
         ts.startSample    = scene.startSample;
         ts.endSample      = scene.endSample;
         ts.gainDb         = scene.gainDb;
@@ -2823,70 +2884,54 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
         ts.zoomLevel      = scene.zoomLevel;
         ts.zoomCenter     = scene.zoomCenter;
         ts.vScale         = scene.vScale;
-    }
+        ts.openedFilePath = scene.path;
 
-    host_module_set_param("t" + trackIdx + ":file_path", scene.path);
-    /* For non-active tracks push markers immediately after file_path.
-     * DSP processes set_params in order, so by the time it handles "markers"
-     * the file will already be loaded (load_wav is synchronous in DSP).
-     * This ensures play_all and other commands use the correct scene boundaries
-     * instead of the DSP defaults (0, totalFrames) set after each file load. */
-    if (trackIdx !== activeTrack) {
+        sceneLoadFile(trackIdx, scene.path);
         host_module_set_param("t" + trackIdx + ":markers",
                               ts.startSample + "," + ts.endSample);
-    }
-    /* play is deferred to pendingSceneRestore; only mark as playing if autoPlay */
-    if (autoPlay) {
         ts.playing = true;
-        if (trackIdx === activeTrack) playing = true;
     }
 
     saveSceneState(trackIdx);
     updateTrackLEDs();
-    if (autoPlay) {
-        showStatus("Scene " + (sceneIdx + 1), 30);
-        lastBarBoundaryPos = playPos;
-    }
+    /* DEBUG: show sameFile decision instead of just scene number */
+    showStatus("S" + (sceneIdx + 1) + (sameFile ? " SAME" : " DIFF") + " ti=" + trackIdx + " at=" + activeTrack, 120);
+    lastBarBoundaryPos = playPos;
 }
 
 /**
- * Launch a scene — two-click model:
- *   First click  → select (arm) the scene only, allow edits.
- *   Second click → launch: immediate if sync-off, quantized to next bar if sync-on.
+ * Launch a scene — single-click model:
+ *   Sync off → switch immediately.
+ *   Sync on  → queue for next bar boundary (press again = force immediate).
  * Pressing an empty pad just arms it.
  */
 function launchScene(trackIdx, sceneIdx) {
     var ts = trackStates[trackIdx];
+    dbg("launchScene t" + trackIdx + " s" + sceneIdx + " scenes.len=" + ts.scenes.length + " playingIdx=" + ts.playingSceneIdx + " playing=" + ts.playing);
     if (sceneIdx >= ts.scenes.length) {
         /* Empty pad — just arm it */
         ts.selectedSceneIdx = sceneIdx;
+        dbg("  empty pad — armed");
         showStatus("Scene " + (sceneIdx + 1) + " armed", 30);
         updateLeds();
         return;
     }
 
-    /* First click on a scene that is not yet selected: load for editing, no playback */
-    if (sceneIdx !== ts.selectedSceneIdx) {
-        /* Cancel any pending cued switch */
-        if (pendingSceneSwitch !== -1 && pendingSceneSwitchTrack === trackIdx) {
-            pendingSceneSwitch      = -1;
-            pendingSceneSwitchTrack = -1;
-        }
-        applySceneLaunch(trackIdx, sceneIdx, false);
-        showStatus("Scene " + (sceneIdx + 1) + " selected", 30);
-        updateLeds();
+    /* Already playing this scene — nothing to do */
+    if (sceneIdx === ts.playingSceneIdx && ts.playing) {
+        dbg("  already playing — skip");
         return;
     }
 
-    /* Second click (same scene already selected): launch with possible quantization */
     var syncOn = (host_module_get_param("sync_clock") === "1");
     var anyPlaying = false;
     for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
         if (trackStates[_lsi].playing) { anyPlaying = true; break; }
     }
+
     if (syncOn && anyPlaying) {
         if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
-            /* Second press on the already-cued scene — force immediate */
+            /* Already cued — force immediate */
             pendingSceneSwitch      = -1;
             pendingSceneSwitchTrack = -1;
             applySceneLaunch(trackIdx, sceneIdx);
@@ -2932,8 +2977,8 @@ function removeScene(trackIdx, sceneIdx) {
     }
 
     if (ts.scenes.length > 0 && ts.playingSceneIdx >= 0) {
-        var newPath = ts.scenes[ts.playingSceneIdx];
-        host_module_set_param("t" + trackIdx + ":file_path", newPath);
+        var newPath = ts.scenes[ts.playingSceneIdx].path;
+        sceneLoadFile(trackIdx, newPath);
         if (trackIdx === activeTrack) {
             openedFilePath = newPath;
             waveformDirty = true;
@@ -2972,6 +3017,15 @@ function doFinalize() {
     }
     var dir = (projectDir && projectDir !== "_no_project") ? projectDir : SCRATCH_DIR;
     if (typeof host_ensure_dir === "function") host_ensure_dir(dir);
+
+    /* Auto-apply pitch/tempo before export if modified */
+    if (pitchSemitones !== 0.0 || tempoPercent !== 100) {
+        syncMarkersToDs();
+        host_module_set_param("apply_pitch_tempo", "1");
+        pitchSemitones = 0.0;
+        tempoPercent = 100;
+        refreshState();
+    }
 
     /* Truncate to current trim markers via DSP export mechanism */
     syncMarkersToDs();
@@ -3013,7 +3067,7 @@ function doFinalize() {
     openedFilePath = destPath;
 
     /* Reload the finalized file */
-    host_module_set_param("t" + activeTrack + ":file_path", destPath);
+    sceneLoadFile(activeTrack, destPath);
     totalFrames = 0;
     waveformDirty = true;
     pendingSceneRestore = { startSample: 0, endSample: 0, hasSlices: false };
@@ -5741,9 +5795,9 @@ function handleNote(note, velocity) {
         if (editViews.indexOf(currentView) >= 0) {
             var targetView = [VIEW_TRIM, VIEW_BPM_TRIM, VIEW_SLICE][note - STEP_BASE];
             if (currentView !== targetView) {
-                /* Leaving slice mode: restore loop state and clear persisted slice state */
+                /* Leaving slice mode: restore loop state and clear persisted slice state.
+                 * Do NOT stop playback — jam workflow requires continuous playback across view switches. */
                 if (currentView === VIEW_SLICE) {
-                    stopPlayback();
                     if (savedLoopState) {
                         loopEnabled = true;
                         host_module_set_param("play_loop", "1");
@@ -5781,6 +5835,7 @@ function handleNote(note, velocity) {
                         removeScene(activeTrack, padIdx);
                         deletePendingCut = false;
                     } else {
+                        showStatus("P" + (padIdx+1) + " pi=" + trackStates[activeTrack].playingSceneIdx + " pl=" + (trackStates[activeTrack].playing?1:0), 60);
                         launchScene(activeTrack, padIdx);
                     }
                     updateLeds();
@@ -6149,6 +6204,7 @@ globalThis.tick = function() {
          * continue retrying next tick. */
         if (totalFrames > 0 && pendingSceneRestore && pendingSceneRestore.expectedName &&
                 fileName !== pendingSceneRestore.expectedName) {
+            dbg("tick: waiting for file '" + pendingSceneRestore.expectedName + "' but got '" + fileName + "' — retrying");
             totalFrames = 0;  /* keep retrying */
         }
         if (totalFrames > 0) {
@@ -6156,6 +6212,7 @@ globalThis.tick = function() {
             if (pendingSceneRestore) {
                 var _psr = pendingSceneRestore;
                 pendingSceneRestore = null;
+                dbg("tick: pendingSceneRestore APPLY — file=" + fileName + " frames=" + totalFrames + " psr.start=" + _psr.startSample + " psr.end=" + _psr.endSample);
                 /* Use saved endSample; fall back to totalFrames for new/unedited scenes.
                  * Clamp both markers to the new file's length to avoid startSample >
                  * endSample when the source scene was longer than the target scene. */
@@ -6164,10 +6221,30 @@ globalThis.tick = function() {
                 if (endSample   > totalFrames) endSample   = totalFrames;
                 if (startSample > totalFrames) startSample = totalFrames;
                 if (startSample > endSample)   startSample = 0;
+                dbg("tick: after clamp — start=" + startSample + " end=" + endSample + " totalFrames=" + totalFrames);
                 /* Save the resolved endSample back into the scene object */
                 var _psrTs = trackStates[activeTrack];
                 if (_psrTs.playingSceneIdx >= 0 && _psrTs.playingSceneIdx < _psrTs.scenes.length) {
                     _psrTs.scenes[_psrTs.playingSceneIdx].endSample = endSample;
+                }
+                /* Push deferred DSP settings now that file is loaded.
+                 * These were NOT sent during applySceneLaunch to avoid
+                 * host_module_set_param queue overflow. */
+                if (_psr.gainDb !== undefined) {
+                    host_module_set_param("gain_db",   _psr.gainDb.toFixed(1));
+                    gainDb = _psr.gainDb;
+                }
+                if (_psr.pitchSemitones !== undefined) {
+                    host_module_set_param("pitch",     _psr.pitchSemitones.toFixed(2));
+                    pitchSemitones = _psr.pitchSemitones;
+                }
+                if (_psr.tempoPercent !== undefined) {
+                    host_module_set_param("tempo",     String(_psr.tempoPercent));
+                    tempoPercent = _psr.tempoPercent;
+                }
+                if (_psr.loopEnabled !== undefined) {
+                    host_module_set_param("play_loop", _psr.loopEnabled ? "1" : "0");
+                    loopEnabled = _psr.loopEnabled;
                 }
                 syncMarkersToDs();
                 if (_psr.hasSlices) saveSliceState();
@@ -6192,6 +6269,7 @@ globalThis.tick = function() {
          * unloading the old file and starting the new one, which would
          * cause the PLAY LED / track LED to go dark prematurely. */
         if (totalFrames > 0 && !pendingSceneRestore && (playingRaw === "0" || playingRaw === "false")) {
+            dbg("tick: playing→false (DSP says stopped) frames=" + totalFrames + " pendingRestore=" + (pendingSceneRestore ? "yes" : "no"));
             playing = false;
             trackStates[activeTrack].playing = false;
             if (lazyChopping) {
