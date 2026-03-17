@@ -2118,44 +2118,36 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
-    if (strcmp(param, "slice_state") == 0) {
-        /* JSON {"load":"/path"} triggers a file reload, bypassing the host's
-         * file_path deduplication.  The host validates slice_state values and
-         * only passes JSON or numbers, so we wrap the path in JSON. */
-        if (val && strncmp(val, "{\"load\":\"", 9) == 0) {
-            /* Extract path from {"load":"/path/to/file.wav"} */
-            const char *new_path = val + 9;  /* skip {"load":" */
-            /* Find closing quote */
-            char extracted[1024];
-            strncpy(extracted, new_path, sizeof(extracted) - 1);
-            extracted[sizeof(extracted) - 1] = '\0';
-            char *end_quote = strchr(extracted, '"');
-            if (end_quote) *end_quote = '\0';
-            new_path = extracted;
-            if (new_path[0] != '\0') {
-                {
-                    FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
-                    if (dbgf) {
-                        struct timespec _ts;
-                        clock_gettime(CLOCK_MONOTONIC, &_ts);
-                        fprintf(dbgf, "[%ld.%03ld] DSP scene_reload track=%d val=%s\n",
-                                (long)_ts.tv_sec, _ts.tv_nsec / 1000000, track_idx, new_path);
-                        fclose(dbgf);
-                    }
-                }
-                strncpy(t->file_path, new_path, sizeof(t->file_path) - 1);
-                t->file_path[sizeof(t->file_path) - 1] = '\0';
-                int r = load_wav(t, new_path);
-                if (r == 0) {
-                    compute_waveform(t, 128);
-                    t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
-                    t->dirty = 1;
-                    t->pitch_semitones = 0.0;
-                    t->tempo_percent = 100.0;
+    /* scene_load: dedicated param for loading files during scene switches.
+     * Bypasses host's file_path deduplication without sharing the
+     * slice_state channel (which caused race conditions). */
+    if (strcmp(param, "scene_load") == 0) {
+        if (val && val[0] != '\0') {
+            {
+                FILE *dbgf = fopen("/tmp/scene_debug.log", "a");
+                if (dbgf) {
+                    struct timespec _ts;
+                    clock_gettime(CLOCK_MONOTONIC, &_ts);
+                    fprintf(dbgf, "[%ld.%03ld] DSP scene_load track=%d val=%s\n",
+                            (long)_ts.tv_sec, _ts.tv_nsec / 1000000, track_idx, val);
+                    fclose(dbgf);
                 }
             }
-            return;
+            strncpy(t->file_path, val, sizeof(t->file_path) - 1);
+            t->file_path[sizeof(t->file_path) - 1] = '\0';
+            int r = load_wav(t, val);
+            if (r == 0) {
+                compute_waveform(t, 128);
+                t->peak_db = compute_peak_db(t->audio_data, t->audio_frames);
+                t->dirty = 1;
+                t->pitch_semitones = 0.0;
+                t->tempo_percent = 100.0;
+            }
         }
+        return;
+    }
+
+    if (strcmp(param, "slice_state") == 0) {
         /* Store UI slice state JSON for reconnect persistence */
         if (val) {
             strncpy(t->slice_state, val, sizeof(t->slice_state) - 1);
