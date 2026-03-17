@@ -109,7 +109,11 @@ function sceneLoadFile(trackIdx, path) {
             host_module_set_param("file_path", path);
         }
     } else {
-        host_module_set_param("t" + trackIdx + ":file_path", path);
+        if (typeof host_module_set_param_blocking === "function") {
+            host_module_set_param_blocking("t" + trackIdx + ":file_path", path, 2000);
+        } else {
+            host_module_set_param("t" + trackIdx + ":file_path", path);
+        }
     }
 }
 function dbg(msg) {
@@ -2813,18 +2817,18 @@ function applySceneLaunch(trackIdx, sceneIdx) {
         totalFrames      = 0;   /* reset — tick retry loop will refetch */
         waveformDirty    = true;
 
-        /* Push settings that don't depend on file length immediately */
-        host_module_set_param("gain_db",   gainDb.toFixed(1));
-        host_module_set_param("pitch",     pitchSemitones.toFixed(2));
-        host_module_set_param("tempo",     String(tempoPercent));
-        host_module_set_param("play_loop", loopEnabled ? "1" : "0");
-
-        /* Defer marker + slice push + play until the DSP has loaded the file */
+        /* Defer ALL DSP params until the file is confirmed loaded.
+         * Sending non-blocking params before the blocking file_path
+         * loses them in the single shared-memory slot. */
         pendingSceneRestore = {
-            startSample:  scene.startSample,
-            endSample:    scene.endSample,
-            hasSlices:    scene.sliceBoundaries.length >= 2,
-            autoPlay:     true
+            startSample:     scene.startSample,
+            endSample:       scene.endSample,
+            gainDb:          scene.gainDb,
+            pitchSemitones:  scene.pitchSemitones,
+            tempoPercent:    scene.tempoPercent,
+            loopEnabled:     scene.loopEnabled,
+            hasSlices:       scene.sliceBoundaries.length >= 2,
+            autoPlay:        true
         };
     } else {
         /* Non-active track: restore state into trackState struct */
@@ -2864,7 +2868,11 @@ function applySceneLaunch(trackIdx, sceneIdx) {
             host_module_set_param("file_path", scene.path);
         }
     } else {
-        host_module_set_param("t" + trackIdx + ":file_path", scene.path);
+        if (typeof host_module_set_param_blocking === "function") {
+            host_module_set_param_blocking("t" + trackIdx + ":file_path", scene.path, 2000);
+        } else {
+            host_module_set_param("t" + trackIdx + ":file_path", scene.path);
+        }
     }
     ts.playing = true;
     if (trackIdx === activeTrack) playing = true;
@@ -6163,27 +6171,9 @@ globalThis.tick = function() {
     }
 
     /* If waveform is dirty but the file hasn't loaded yet, retry file info
-     * each tick until DSP delivers valid data (non-blocking set_param race).
-     * When pendingSceneRestore has an expectedName, also verify the DSP has
-     * loaded the correct file before processing — guards against the race
-     * where refreshFileInfo returns the previous file's stale data. */
+     * each tick until DSP delivers valid data (blocking set_param race). */
     if (waveformDirty && totalFrames === 0) {
         refreshFileInfo();
-        /* If we're waiting for a specific file and the DSP still reports the
-         * wrong name (old file not yet replaced), keep totalFrames at 0 to
-         * continue retrying next tick.  Give up after ~60 ticks (~1s) to
-         * avoid an infinite retry loop if names never match. */
-        if (totalFrames > 0 && pendingSceneRestore && pendingSceneRestore.expectedName &&
-                fileName !== pendingSceneRestore.expectedName) {
-            if (!pendingSceneRestore._retries) pendingSceneRestore._retries = 0;
-            pendingSceneRestore._retries++;
-            if (pendingSceneRestore._retries < 60) {
-                dbg("tick: waiting for file '" + pendingSceneRestore.expectedName + "' but got '" + fileName + "' — retry " + pendingSceneRestore._retries);
-                totalFrames = 0;  /* keep retrying */
-            } else {
-                dbg("tick: gave up waiting for '" + pendingSceneRestore.expectedName + "', proceeding with '" + fileName + "'");
-            }
-        }
         if (totalFrames > 0) {
             /* Apply deferred scene marker + slice state now that file is loaded */
             if (pendingSceneRestore) {
@@ -6223,7 +6213,15 @@ globalThis.tick = function() {
                     host_module_set_param("play_loop", _psr.loopEnabled ? "1" : "0");
                     loopEnabled = _psr.loopEnabled;
                 }
-                syncMarkersToDs();
+                /* Use blocking markers call to guarantee the DSP has the
+                 * correct start/end before the play command fires next tick.
+                 * Non-blocking syncMarkersToDs() can be lost in the single
+                 * shared-memory slot race with other params. */
+                if (typeof host_module_set_param_blocking === "function") {
+                    host_module_set_param_blocking("markers", startSample + "," + endSample, 500);
+                } else {
+                    syncMarkersToDs();
+                }
                 if (_psr.hasSlices) saveSliceState();
                 /* Now that the file is confirmed loaded, trigger playback.
                  * Use "selection" so play_whole=0 and marker boundaries are
@@ -6242,10 +6240,13 @@ globalThis.tick = function() {
 
         var playingRaw = host_module_get_param("playing");
         /* Guard: don't reset playing while a scene file is still loading
-         * (pendingSceneRestore != null). The DSP reports playing=0 between
-         * unloading the old file and starting the new one, which would
-         * cause the PLAY LED / track LED to go dark prematurely. */
-        if (totalFrames > 0 && !pendingSceneRestore && (playingRaw === "0" || playingRaw === "false")) {
+         * (pendingSceneRestore != null) or a play command is pending.
+         * The DSP reports playing=0 between unloading the old file and
+         * starting the new one, which would cause the PLAY LED / track
+         * LED to go dark prematurely. pendingPlay guards the tick where
+         * pendingSceneRestore was just processed (nulled) but the play
+         * command hasn't been sent yet (next tick). */
+        if (totalFrames > 0 && !pendingSceneRestore && !pendingPlay && (playingRaw === "0" || playingRaw === "false")) {
             dbg("tick: playing→false (DSP says stopped) frames=" + totalFrames + " pendingRestore=" + (pendingSceneRestore ? "yes" : "no"));
             playing = false;
             trackStates[activeTrack].playing = false;
