@@ -43,7 +43,7 @@ import * as os from 'os';
 /* Shared utilities - absolute path for module location independence */
 import {
     MidiNoteOn, MidiCC,
-    MoveShift, MoveMainKnob, MoveMainButton, MoveBack,
+    MoveShift, MoveMainKnob, MoveMainButton, MoveBack, MoveMenu,
     MoveCapture, MoveRec, MoveSample, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
     MoveLeft, MoveRight, MoveDown, MoveUp,
     MovePads,
@@ -87,6 +87,8 @@ var VIEW_JOG_MENU = 10;
 var VIEW_JOG_SHIFT_MENU = 11;
 var VIEW_BPM_TRIM = 12;
 var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
+var VIEW_MAIN_MENU = 14; /* MoveMenu button — main project menu */
+var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) */
 
 /* ============ Debug Logging ============ */
 /* Set to true to enable debug logging to /tmp/scene_debug.log on device.
@@ -152,6 +154,7 @@ var CC_RIGHT = MoveRight;
 var CC_DOWN = MoveDown;
 var CC_UP = MoveUp;
 var CC_SAMPLE = MoveSample;
+var CC_MENU = MoveMenu;
 var CC_REC = MoveRec;
 
 /* Pad note range */
@@ -727,6 +730,16 @@ var JOG_MENU_VISIBLE = 4;
 var jogShiftMenuItems = ["Paste (insert)", "Paste (overwrite)", "Export"];
 var jogShiftMenuIndex = 0;
 
+/* Main menu (MoveMenu button) */
+var mainMenuItems = ["Save Project", "Switch Project", "Close"];
+var mainMenuIndex = 0;
+var mainMenuReturnView = VIEW_TRIM;
+
+/* Close confirmation dialog (Shift+Back) */
+var closeDialogItems = ["Save & Close", "Discard & Close", "Cancel"];
+var closeDialogIndex = 0;
+var closeDialogReturnView = VIEW_TRIM;
+
 /* Confirm save overlay */
 var saveName = "";               /* Editable filename (without .wav) shown at top */
 var saveActions = [];            /* Action items below the filename */
@@ -902,12 +915,17 @@ function restoreSceneState(trackIdx) {
  */
 function saveProjectJson() {
     if (!projectDir || projectDir === "_no_project") return;
-    var d = { version: 1, tracks: [] };
+    /* Flush active track's current editor state into trackStates and scene */
+    saveTrackUIState(activeTrack);
+    saveCurrentSceneState(activeTrack);
+    var d = { version: 1, activeTrack: activeTrack, tracks: [] };
     for (var _st = 0; _st < NUM_TRACKS; _st++) {
         d.tracks.push({
-            scenes: trackStates[_st].scenes,
+            scenes:           trackStates[_st].scenes,
             selectedSceneIdx: trackStates[_st].selectedSceneIdx,
-            playingSceneIdx:  trackStates[_st].playingSceneIdx
+            playingSceneIdx:  trackStates[_st].playingSceneIdx,
+            muted:            !!trackStates[_st].muted,
+            gateMode:         !!trackStates[_st].gateMode
         });
     }
     if (typeof host_write_file === "function") {
@@ -926,30 +944,124 @@ function loadProjectJson() {
     if (!raw || raw.length < 2) return false;
     try {
         var d = JSON.parse(raw);
+        var _savedActiveTrack = (d.activeTrack !== undefined && d.activeTrack >= 0 && d.activeTrack < NUM_TRACKS)
+            ? d.activeTrack : 0;
+
+        /* Switch DSP active track first so subsequent unprefixed params land correctly */
+        if (_savedActiveTrack !== activeTrack) {
+            activeTrack = _savedActiveTrack;
+            host_module_set_param("active_track", String(activeTrack));
+        }
+
         for (var _lt = 0; _lt < NUM_TRACKS; _lt++) {
             var td = (d.tracks && d.tracks[_lt]) || {};
+            var ts = trackStates[_lt];
+
             /* Migrate plain-string scenes (legacy format) to scene objects */
             var _rawScenes = td.scenes || [];
-            trackStates[_lt].scenes = _rawScenes.map(function(sc) {
+            ts.scenes = _rawScenes.map(function(sc) {
                 if (typeof sc === "string") return makeSceneState(sc);
                 return sc;
             });
-            trackStates[_lt].playingSceneIdx = (td.playingSceneIdx !== undefined) ? td.playingSceneIdx : -1;
+            ts.playingSceneIdx = (td.playingSceneIdx !== undefined) ? td.playingSceneIdx : -1;
             /* Always point selectedSceneIdx at the next free (empty) slot so
              * that the first skipback doesn't overwrite an existing scene. */
-            trackStates[_lt].selectedSceneIdx = trackStates[_lt].scenes.length;
-            if (trackStates[_lt].selectedSceneIdx >= MAX_SCENES) {
-                trackStates[_lt].selectedSceneIdx = MAX_SCENES - 1;
+            ts.selectedSceneIdx = ts.scenes.length;
+            if (ts.selectedSceneIdx >= MAX_SCENES) ts.selectedSceneIdx = MAX_SCENES - 1;
+
+            /* Restore muted / gateMode */
+            ts.muted    = !!td.muted;
+            ts.gateMode = !!td.gateMode;
+            host_module_set_param("t" + _lt + ":muted",     ts.muted    ? "1" : "0");
+            host_module_set_param("t" + _lt + ":gate_mode", ts.gateMode ? "1" : "0");
+
+            /* Find the scene to load (playing scene, or first available) */
+            var _ltPlayIdx = ts.playingSceneIdx;
+            var _ltScene = (_ltPlayIdx >= 0 && _ltPlayIdx < ts.scenes.length)
+                ? ts.scenes[_ltPlayIdx]
+                : (ts.scenes.length > 0 ? ts.scenes[0] : null);
+
+            if (!_ltScene) continue;
+
+            /* Copy all scene properties into the flat trackState fields */
+            ts.startSample      = _ltScene.startSample      || 0;
+            ts.endSample        = _ltScene.endSample        || 0;
+            ts.gainDb           = _ltScene.gainDb           !== undefined ? _ltScene.gainDb           : 0;
+            ts.pitchSemitones   = _ltScene.pitchSemitones   !== undefined ? _ltScene.pitchSemitones   : 0;
+            ts.tempoPercent     = _ltScene.tempoPercent     !== undefined ? _ltScene.tempoPercent     : 100;
+            ts.bpm              = _ltScene.bpm              || 120;
+            ts.baseBpm          = _ltScene.baseBpm          || 120;
+            ts.beatDivIndex     = _ltScene.beatDivIndex     !== undefined ? _ltScene.beatDivIndex     : 2;
+            ts.loopEnabled      = !!_ltScene.loopEnabled;
+            ts.sliceMode        = _ltScene.sliceMode        || 0;
+            ts.sliceCount       = _ltScene.sliceCount       || 1;
+            ts.sliceBoundaries  = (_ltScene.sliceBoundaries || []).slice();
+            ts.selectedSlice    = _ltScene.selectedSlice    || 0;
+            ts.slicePadOffset   = _ltScene.slicePadOffset   || 0;
+            ts.sliceRegionStart = _ltScene.sliceRegionStart || 0;
+            ts.sliceRegionEnd   = _ltScene.sliceRegionEnd   || 0;
+            ts.sliceThreshold   = _ltScene.sliceThreshold   !== undefined ? _ltScene.sliceThreshold   : 25;
+            ts.slicePitches     = (_ltScene.slicePitches    || []).slice();
+            ts.sliceTempos      = (_ltScene.sliceTempos     || []).slice();
+            ts.lazySub          = _ltScene.lazySub          || 0;
+            ts.zoomLevel        = _ltScene.zoomLevel        || 0;
+            ts.zoomCenter       = _ltScene.zoomCenter       || 0;
+            ts.vScale           = _ltScene.vScale           !== undefined ? _ltScene.vScale           : 1;
+            ts.openedFilePath   = _ltScene.path;
+            ts.loaded           = true;
+
+            if (_lt === activeTrack) {
+                /* Active track: set globals from scene, load file, then use
+                 * pendingSceneRestore to defer remaining DSP params until the
+                 * file is confirmed loaded (direct params after file_path are
+                 * lost in the single shared-memory slot). */
+                startSample    = ts.startSample;
+                endSample      = ts.endSample;
+                gainDb         = ts.gainDb;
+                pitchSemitones = ts.pitchSemitones;
+                tempoPercent   = ts.tempoPercent;
+                bpm            = ts.bpm;
+                baseBpm        = ts.baseBpm;
+                beatDivIndex   = ts.beatDivIndex;
+                loopEnabled    = ts.loopEnabled;
+                sliceMode      = ts.sliceMode;
+                sliceCount     = ts.sliceCount;
+                sliceBoundaries = ts.sliceBoundaries.slice();
+                selectedSlice  = ts.selectedSlice;
+                slicePadOffset = ts.slicePadOffset;
+                sliceRegionStart = ts.sliceRegionStart;
+                sliceRegionEnd = ts.sliceRegionEnd;
+                sliceThreshold = ts.sliceThreshold;
+                slicePitches   = ts.slicePitches.slice();
+                sliceTempos    = ts.sliceTempos.slice();
+                lazySub        = ts.lazySub;
+                zoomLevel      = ts.zoomLevel;
+                zoomCenter     = ts.zoomCenter;
+                vScale         = ts.vScale;
+                openedFilePath = ts.openedFilePath;
+
+                sceneLoadFile(_lt, _ltScene.path);
+                pendingSceneRestore = {
+                    startSample:    ts.startSample,
+                    endSample:      ts.endSample,
+                    gainDb:         ts.gainDb,
+                    pitchSemitones: ts.pitchSemitones,
+                    tempoPercent:   ts.tempoPercent,
+                    loopEnabled:    ts.loopEnabled,
+                    hasSlices:      ts.sliceBoundaries.length >= 2,
+                    autoPlay:       false
+                };
+            } else {
+                /* Non-active track: send all DSP params via blocking prefixed calls */
+                var _ltp = "t" + _lt + ":";
+                sceneLoadFile(_lt, _ltScene.path);
+                host_module_set_param_blocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
+                host_module_set_param_blocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
+                host_module_set_param_blocking(_ltp + "tempo",     String(ts.tempoPercent), 500);
+                host_module_set_param_blocking(_ltp + "play_loop", ts.loopEnabled ? "1" : "0", 500);
+                host_module_set_param_blocking(_ltp + "markers",   ts.startSample + "," + ts.endSample, 500);
             }
-            /* Load the playing scene (or first available) into DSP */
-            var _ltPlayIdx = trackStates[_lt].playingSceneIdx;
-            var _ltScene = (_ltPlayIdx >= 0 && _ltPlayIdx < trackStates[_lt].scenes.length)
-                ? trackStates[_lt].scenes[_ltPlayIdx]
-                : (trackStates[_lt].scenes.length > 0 ? trackStates[_lt].scenes[0] : null);
-            var _ltPath = _ltScene ? _ltScene.path : null;
-            if (_ltPath) sceneLoadFile(_lt, _ltPath);
         }
-        /* For the active track, trigger a waveform refresh once DSP loads the file */
         waveformDirty = true;
         return true;
     } catch (e) {
@@ -2529,6 +2641,44 @@ function drawConfirmNormalize() {
     }
 }
 
+/* ============ Drawing: Main Menu ============ */
+
+function drawMainMenu() {
+    clear_screen();
+    printCentered(2, "Menu");
+    drawDivider(12);
+    var startY = 16;
+    var itemH = 13;
+    for (var i = 0; i < mainMenuItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === mainMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, mainMenuItems[i], 0);
+        } else {
+            print(8, y + 3, mainMenuItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: Confirm Close ============ */
+
+function drawConfirmClose() {
+    clear_screen();
+    printCentered(2, "Close project?");
+    drawDivider(12);
+    var startY = 18;
+    var itemH = 14;
+    for (var i = 0; i < closeDialogItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === closeDialogIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, closeDialogItems[i], 0);
+        } else {
+            print(8, y + 3, closeDialogItems[i], 1);
+        }
+    }
+}
+
 /* ============ Drawing: Confirm Save ============ */
 
 function drawConfirmSave() {
@@ -2732,6 +2882,10 @@ function switchView(view) {
     } else if (view === VIEW_CONFIRM_SAVE) {
         var savePrompt = (saveReturnView === VIEW_SLICE) ? "Export, " : "Save, ";
         announce(savePrompt + saveName);
+    } else if (view === VIEW_MAIN_MENU) {
+        announce("Menu: " + mainMenuItems[mainMenuIndex]);
+    } else if (view === VIEW_CONFIRM_CLOSE) {
+        announce("Close project? " + closeDialogItems[closeDialogIndex]);
     }
 }
 
@@ -3408,6 +3562,8 @@ function doSkipback() {
  * Called at startup (fresh session and reconnect) when no project is set.
  */
 function initProjectBrowser() {
+    /* Save current project state before switching projects */
+    saveProjectJson();
     projectBrowserState = buildFilepathBrowserState(
         { root: SCRATCH_DIR, name: "Project Folder" },
         ""
@@ -4860,9 +5016,11 @@ function handleCC(cc, value) {
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
-        /* Shift+Back: full exit (unload DSP) for quick iteration */
+        /* Shift+Back: show Save/Discard/Cancel dialog before closing */
         if (shiftHeld) {
-            fullExit();
+            closeDialogIndex = 0;
+            closeDialogReturnView = currentView;
+            switchView(VIEW_CONFIRM_CLOSE);
             return;
         }
         /* During recording or record-ready, just hide — DSP keeps recording */
@@ -4908,6 +5066,12 @@ function handleCC(cc, value) {
             case VIEW_JOG_SHIFT_MENU:
             case VIEW_BPM_TRIM:
                 switchView(VIEW_TRIM);
+                break;
+            case VIEW_MAIN_MENU:
+                switchView(mainMenuReturnView);
+                break;
+            case VIEW_CONFIRM_CLOSE:
+                switchView(closeDialogReturnView);
                 break;
             case VIEW_PROJECT:
                 /* Back on project browser = skip without selecting a project */
@@ -5122,6 +5286,18 @@ function handleCC(cc, value) {
     if (cc === CC_CAPTURE && value > 0) {
         if (shiftHeld && (currentView === VIEW_TRIM || currentView === VIEW_BPM_TRIM)) {
             doFinalize();
+        }
+        return;
+    }
+
+    /* Menu button — open main project menu */
+    if (cc === CC_MENU && value > 0) {
+        if (currentView === VIEW_MAIN_MENU) {
+            switchView(mainMenuReturnView);
+        } else {
+            mainMenuIndex = 0;
+            mainMenuReturnView = currentView;
+            switchView(VIEW_MAIN_MENU);
         }
         return;
     }
@@ -5426,6 +5602,20 @@ function handleCC(cc, value) {
                 announce(jogShiftMenuItems[jogShiftMenuIndex]);
                 break;
 
+            case VIEW_MAIN_MENU:
+                mainMenuIndex += delta;
+                if (mainMenuIndex < 0) mainMenuIndex = 0;
+                if (mainMenuIndex >= mainMenuItems.length) mainMenuIndex = mainMenuItems.length - 1;
+                announce(mainMenuItems[mainMenuIndex]);
+                break;
+
+            case VIEW_CONFIRM_CLOSE:
+                closeDialogIndex += delta;
+                if (closeDialogIndex < 0) closeDialogIndex = 0;
+                if (closeDialogIndex >= closeDialogItems.length) closeDialogIndex = closeDialogItems.length - 1;
+                announce(closeDialogItems[closeDialogIndex]);
+                break;
+
             case VIEW_BPM_TRIM:
                 /* Jog scrolls viewport (same as VIEW_TRIM when zoomed) */
                 if (zoomLevel > 0) {
@@ -5531,6 +5721,40 @@ function handleCC(cc, value) {
                     case 2: doExport(); break;
                 }
                 switchView(VIEW_TRIM);
+                break;
+
+            case VIEW_MAIN_MENU:
+                switch (mainMenuIndex) {
+                    case 0: /* Save Project */
+                        saveProjectJson();
+                        showStatus("Project saved", 60);
+                        switchView(mainMenuReturnView);
+                        break;
+                    case 1: /* Switch Project */
+                        saveProjectJson();
+                        initProjectBrowser();
+                        break;
+                    case 2: /* Close */
+                        closeDialogIndex = 0;
+                        closeDialogReturnView = mainMenuReturnView;
+                        switchView(VIEW_CONFIRM_CLOSE);
+                        break;
+                }
+                break;
+
+            case VIEW_CONFIRM_CLOSE:
+                switch (closeDialogIndex) {
+                    case 0: /* Save & Close */
+                        saveProjectJson();
+                        fullExit();
+                        break;
+                    case 1: /* Discard & Close */
+                        fullExit();
+                        break;
+                    case 2: /* Cancel */
+                        switchView(closeDialogReturnView);
+                        break;
+                }
                 break;
 
             case VIEW_LOOP:
@@ -6735,6 +6959,12 @@ globalThis.tick = function() {
             break;
         case VIEW_PROJECT:
             drawProjectView();
+            break;
+        case VIEW_MAIN_MENU:
+            drawMainMenu();
+            break;
+        case VIEW_CONFIRM_CLOSE:
+            drawConfirmClose();
             break;
     }
 };
