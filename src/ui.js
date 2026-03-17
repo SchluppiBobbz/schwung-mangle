@@ -2980,9 +2980,10 @@ function removeScene(trackIdx, sceneIdx) {
     }
 
     if (ts.scenes.length > 0 && ts.playingSceneIdx >= 0) {
-        var newPath = ts.scenes[ts.playingSceneIdx].path;
-        sceneLoadFile(trackIdx, newPath);
+        /* DSP is already playing the correct file — only update UI state,
+         * do NOT call sceneLoadFile as it would interrupt playback. */
         if (trackIdx === activeTrack) {
+            var newPath = ts.scenes[ts.playingSceneIdx].path;
             openedFilePath = newPath;
             waveformDirty = true;
             refreshFileInfo();
@@ -4807,9 +4808,10 @@ function handleCC(cc, value) {
                     host_module_set_param("active_track", String(_t));
                     restoreTrackUIState(_t);
                 }
-                /* Enter file browser — always start at UserLibrary root */
+                /* Enter file browser — open in last used folder for this track */
                 openFileBrowserState = buildFilepathBrowserState(
-                    { root: "/data/UserData/UserLibrary", filter: ".wav" }
+                    { root: "/data/UserData/UserLibrary", filter: ".wav" },
+                    trackStates[_t].filePath || ""
                 );
                 refreshBrowserWithRecording();
                 switchView(VIEW_OPEN_FILE);
