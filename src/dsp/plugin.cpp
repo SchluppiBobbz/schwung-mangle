@@ -178,6 +178,7 @@ typedef struct {
     int16_t *track_rb[NUM_TRACKS];   /* per-track stereo circular buffers */
     int      track_rb_write[NUM_TRACKS];
     char     skipback_result[512];   /* path of last successfully written skipback WAV */
+    char     project_dir[512];       /* current project dir, persisted for UI reconnect */
 } instance_t;
 
 /* ============================================================================
@@ -1091,6 +1092,16 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(key, "project_dir") == 0) {
+        if (val) {
+            strncpy(inst->project_dir, val, sizeof(inst->project_dir) - 1);
+            inst->project_dir[sizeof(inst->project_dir) - 1] = '\0';
+        } else {
+            inst->project_dir[0] = '\0';
+        }
+        return;
+    }
+
     /* --- Route to track --- */
     const char *param;
     int track_idx = parse_track_prefix(key, &param);
@@ -1354,8 +1365,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "pitch") == 0) {
         if (!val) return;
         float v = (float)atof(val);
-        if (v < -12.0f) v = -12.0f;
-        if (v > 12.0f) v = 12.0f;
+        if (v < -36.0f) v = -36.0f;
+        if (v > 36.0f) v = 36.0f;
         t->pitch_semitones = v;
         recompute_ratios(t);
         /* Sync Bungee state to current playback position so the transition
@@ -1373,8 +1384,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "tempo") == 0) {
         if (!val) return;
         int v = atoi(val);
-        if (v < 50) v = 50;
-        if (v > 200) v = 200;
+        if (v < 30) v = 30;
+        if (v > 300) v = 300;
         t->tempo_percent = v;
         recompute_ratios(t);
         /* Sync Bungee state to current playback position so the transition
@@ -2210,6 +2221,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
 
     if (strcmp(key, "sync_clock") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%d", inst->sync_to_clock);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
+    if (strcmp(key, "project_dir") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%s", inst->project_dir);
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 

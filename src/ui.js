@@ -89,6 +89,7 @@ var VIEW_BPM_TRIM = 12;
 var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
 var VIEW_MAIN_MENU = 14; /* MoveMenu button — main project menu */
 var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) */
+var VIEW_CONFIRM_RESUME = 16; /* Resume previous session or start new project */
 
 /* ============ Debug Logging ============ */
 /* Set to true to enable debug logging to /tmp/scene_debug.log on device.
@@ -741,6 +742,10 @@ var mainMenuReturnView = VIEW_TRIM;
 var closeDialogItems = ["Save & Close", "Discard & Close", "Cancel"];
 var closeDialogIndex = 0;
 var closeDialogReturnView = VIEW_TRIM;
+
+/* Resume session dialog (shown on reconnect when a project is active) */
+var resumeItems = ["Resume", "New Project"];
+var resumeDialogIndex = 0;
 
 /* Confirm save overlay */
 var saveName = "";               /* Editable filename (without .wav) shown at top */
@@ -2726,6 +2731,25 @@ function drawConfirmClose() {
     }
 }
 
+/* ============ Drawing: Confirm Resume ============ */
+
+function drawConfirmResume() {
+    clear_screen();
+    printCentered(2, "Resume Project?");
+    drawDivider(12);
+    var startY = 22;
+    var itemH = 14;
+    for (var i = 0; i < resumeItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === resumeDialogIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, resumeItems[i], 0);
+        } else {
+            print(8, y + 3, resumeItems[i], 1);
+        }
+    }
+}
+
 /* ============ Drawing: Confirm Save ============ */
 
 function drawConfirmSave() {
@@ -2933,6 +2957,8 @@ function switchView(view) {
         announce("Menu: " + mainMenuItems[mainMenuIndex]);
     } else if (view === VIEW_CONFIRM_CLOSE) {
         announce("Close project? " + closeDialogItems[closeDialogIndex]);
+    } else if (view === VIEW_CONFIRM_RESUME) {
+        announce("Resume project? " + resumeItems[resumeDialogIndex]);
     }
 }
 
@@ -5120,9 +5146,14 @@ function handleCC(cc, value) {
             case VIEW_CONFIRM_CLOSE:
                 switchView(closeDialogReturnView);
                 break;
+            case VIEW_CONFIRM_RESUME:
+                /* Back = treat as Resume */
+                doReconnectRestore();
+                break;
             case VIEW_PROJECT:
                 /* Back on project browser = skip without selecting a project */
                 projectDir = "_no_project";
+                host_module_set_param("project_dir", projectDir);
                 projectBrowserState = null;
                 newProjectFileBrowser = false;
                 recordState = "ready";
@@ -5689,6 +5720,13 @@ function handleCC(cc, value) {
                 announce(closeDialogItems[closeDialogIndex]);
                 break;
 
+            case VIEW_CONFIRM_RESUME:
+                resumeDialogIndex += delta;
+                if (resumeDialogIndex < 0) resumeDialogIndex = 0;
+                if (resumeDialogIndex >= resumeItems.length) resumeDialogIndex = resumeItems.length - 1;
+                announce(resumeItems[resumeDialogIndex]);
+                break;
+
             case VIEW_BPM_TRIM:
                 /* Jog scrolls viewport (same as VIEW_TRIM when zoomed) */
                 if (zoomLevel > 0) {
@@ -5830,6 +5868,17 @@ function handleCC(cc, value) {
                 }
                 break;
 
+            case VIEW_CONFIRM_RESUME:
+                switch (resumeDialogIndex) {
+                    case 0: /* Resume */
+                        doReconnectRestore();
+                        break;
+                    case 1: /* New Project */
+                        initProjectBrowser();
+                        break;
+                }
+                break;
+
             case VIEW_LOOP:
                 /* Toggle loop point / end field */
                 loopSelectedField = loopSelectedField === 0 ? 1 : 0;
@@ -5849,6 +5898,7 @@ function handleCC(cc, value) {
                         var ts = String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate()) +
                                  "_" + pad2(now.getHours()) + pad2(now.getMinutes());
                         projectDir = SCRATCH_DIR + "/Project_" + ts;
+                        host_module_set_param("project_dir", projectDir);
                         if (typeof host_ensure_dir === "function") host_ensure_dir(projectDir);
                         projectBrowserState = null;
                         /* Pre-set recording dir to project folder */
@@ -5858,6 +5908,7 @@ function handleCC(cc, value) {
                         announce("Project " + projectDir.replace(/.*\//, "") + ", select file or record");
                     } else if (pItem && pItem.kind === "skip") {
                         projectDir = "_no_project";
+                        host_module_set_param("project_dir", projectDir);
                         projectBrowserState = null;
                         newProjectFileBrowser = false;
                         recordState = "ready";
@@ -5877,6 +5928,7 @@ function handleCC(cc, value) {
                         } else if (pItem.kind === "dir") {
                             /* Select existing project folder — load it directly */
                             projectDir = pItem.path;
+                            host_module_set_param("project_dir", projectDir);
                             projectBrowserState = null;
                             newProjectFileBrowser = false;
                             loadProjectJson();
@@ -6244,15 +6296,15 @@ function handleCC(cc, value) {
                 /* Fine: cents, +-1 cent per click */
                 var cents = Math.round(pitchSemitones * 100);
                 cents += delta;
-                if (cents < -1200) cents = -1200;
-                if (cents > 1200) cents = 1200;
+                if (cents < -3600) cents = -3600;
+                if (cents > 3600) cents = 3600;
                 pitchSemitones = cents / 100.0;
             } else {
                 /* Coarse: semitones, +-1 per click */
                 var semi = Math.round(pitchSemitones);
                 semi += delta;
-                if (semi < -12) semi = -12;
-                if (semi > 12) semi = 12;
+                if (semi < -36) semi = -36;
+                if (semi > 36) semi = 36;
                 pitchSemitones = semi;
             }
             host_module_set_param("pitch", pitchSemitones.toFixed(2));
@@ -6268,8 +6320,8 @@ function handleCC(cc, value) {
             var step = shiftHeld ? 1 : 5;
             var st = sliceTempos[selectedSlice] || 100;
             st -= delta * step;
-            if (st < 50) st = 50;
-            if (st > 200) st = 200;
+            if (st < 30) st = 30;
+            if (st > 300) st = 300;
             sliceTempos[selectedSlice] = st;
             tempoPercent = st;
             host_module_set_param("tempo", String(st));
@@ -6286,8 +6338,8 @@ function handleCC(cc, value) {
             /* Derive tempoPercent from ratio to base BPM */
             if (baseBpm > 0) {
                 tempoPercent = Math.round(bpm / baseBpm * 100);
-                if (tempoPercent < 50) { tempoPercent = 50; bpm = baseBpm * 0.5; }
-                if (tempoPercent > 200) { tempoPercent = 200; bpm = baseBpm * 2.0; }
+                if (tempoPercent < 30) { tempoPercent = 30; bpm = baseBpm * 0.5; }
+                if (tempoPercent > 300) { tempoPercent = 300; bpm = baseBpm * 2.0; }
             }
             host_module_set_param("tempo", String(tempoPercent));
             showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)");
@@ -6297,8 +6349,8 @@ function handleCC(cc, value) {
         if (delta !== 0 && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
             var step = shiftHeld ? 1 : 5;
             tempoPercent -= delta * step;
-            if (tempoPercent < 50) tempoPercent = 50;
-            if (tempoPercent > 200) tempoPercent = 200;
+            if (tempoPercent < 30) tempoPercent = 30;
+            if (tempoPercent > 300) tempoPercent = 300;
             host_module_set_param("tempo", String(tempoPercent));
             /* Keep bpm in sync with tempoPercent if baseBpm is known */
             if (baseBpm > 0) bpm = Math.round(baseBpm * tempoPercent / 10) / 10;
@@ -6625,6 +6677,149 @@ function handleNote(note, velocity) {
     }
 }
 
+/* ============ Reconnect Restore ============ */
+
+/**
+ * Restore UI state from DSP on reconnect (called after user confirms Resume,
+ * or immediately when reconnecting without a saved project).
+ */
+function doReconnectRestore() {
+    /* Restore per-track state from DSP without reloading files.
+     * We only READ from DSP here — no file_path is sent, so playback
+     * continues uninterrupted in the DSP. */
+    for (var _rci = 0; _rci < NUM_TRACKS; _rci++) {
+        var _rcts = trackStates[_rci];
+        var _rcp = "t" + _rci + ":";
+
+        var _rcfi = host_module_get_param(_rcp + "file_info");
+        if (_rcfi) {
+            try {
+                var _rcinfo = JSON.parse(_rcfi);
+                _rcts.totalFrames = _rcinfo.frames || 0;
+                _rcts.startSample = _rcinfo.start || 0;
+                _rcts.endSample = (_rcinfo.end > 0) ? _rcinfo.end : _rcts.totalFrames;
+                _rcts.fileName = _rcinfo.name || "";
+                _rcts.loaded = (_rcts.totalFrames > 0);
+            } catch (e) {}
+        }
+
+        var _rcPlay = host_module_get_param(_rcp + "playing");
+        _rcts.playing = (_rcPlay === "1");
+
+        var _rcGain = host_module_get_param(_rcp + "gain_db");
+        if (_rcGain) { var _rcg = parseFloat(_rcGain); if (!isNaN(_rcg)) _rcts.gainDb = _rcg; }
+
+        var _rcLoop = host_module_get_param(_rcp + "play_loop");
+        _rcts.loopEnabled = (_rcLoop === "1");
+
+        var _rcGate = host_module_get_param(_rcp + "gate_mode");
+        _rcts.gateMode = (_rcGate === "1");
+
+        var _rcMuted = host_module_get_param(_rcp + "muted");
+        _rcts.muted = (_rcMuted === "1");
+    }
+
+    /* Promote active track state into globals */
+    restoreTrackUIState(activeTrack);
+
+    /* Check if DSP is still recording */
+    var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
+    if (stillRecording) {
+        recordState = "recording";
+        recordFilePath = SCRATCH_PATH;
+        openedFilePath = SCRATCH_PATH;
+        recordLedCounter = 0;
+        currentView = VIEW_TRIM;
+        selectedField = 0;
+
+        /* Recover actual elapsed time from sampler's sample counter */
+        var samplesWritten = 0;
+        if (typeof host_sampler_get_samples_written === "function") {
+            samplesWritten = host_sampler_get_samples_written();
+        }
+        var elapsedSec = samplesWritten / 44100;
+        recordStartTime = Date.now() - (elapsedSec * 1000);
+
+        /* Reconstruct waveform array with placeholder entries so the
+         * write head position reflects actual recording progress.
+         * Each tick adds one entry, ticks are ~16ms apart. */
+        var estimatedTicks = Math.round(elapsedSec * 1000 / 16);
+        recordWaveform = [];
+        for (var i = 0; i < estimatedTicks; i++) {
+            recordWaveform.push(0.05);  /* dim baseline so it's visible */
+        }
+        recordWriteHead = recordWaveform.length;
+
+        var timeStr = Math.floor(elapsedSec / 60) + ":" +
+            (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
+        announce("Wave Edit, recording in progress, " + timeStr);
+    } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
+        /* DSP is paused — restore paused state */
+        recordState = "paused";
+        recordFilePath = SCRATCH_PATH;
+        openedFilePath = SCRATCH_PATH;
+        recordLedCounter = 0;
+        currentView = VIEW_TRIM;
+        selectedField = 0;
+
+        /* Recover elapsed time from sampler's sample counter */
+        var pausedSamples = 0;
+        if (typeof host_sampler_get_samples_written === "function") {
+            pausedSamples = host_sampler_get_samples_written();
+        }
+        var pausedElapsed = pausedSamples / 44100;
+        recordStartTime = Date.now() - (pausedElapsed * 1000);
+        recordPauseStart = Date.now();
+        /* pausedTotal covers the gap between reconstructed start and now,
+           minus actual recorded time, so elapsed stays correct after resume */
+        recordPausedTotal = Date.now() - recordStartTime - (pausedElapsed * 1000);
+
+        /* Reconstruct waveform with placeholder entries */
+        var pausedTicks = Math.round(pausedElapsed * 1000 / 16);
+        recordWaveform = [];
+        for (var j = 0; j < pausedTicks; j++) {
+            recordWaveform.push(0.05);
+        }
+        recordWriteHead = recordWaveform.length;
+
+        announce("Wave Edit, recording paused");
+    } else if (openedFilePath && totalFrames === 0) {
+        /* File path set but no audio data — restore record-ready state */
+        recordBrowserDir = SCRATCH_DIR;
+        recordFilePath = SCRATCH_PATH;
+        recordState = "ready";
+        recordLedCounter = 0;
+        currentView = VIEW_TRIM;
+        selectedField = 0;
+        announce("New Recording, press REC to record");
+    } else if (restoreSliceState()) {
+        /* Restored slice state from DSP — resume slice mode */
+        currentView = VIEW_SLICE;
+        selectedField = 0;
+        selectSlice(selectedSlice);
+        syncMarkersToDs();
+        announce("Wave Edit, slice mode, " + sliceCount + " slices");
+    } else {
+        currentView = VIEW_TRIM;
+        selectedField = 0;
+        announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+    }
+    /* Restore scene state on reconnect when audio is loaded */
+    if (!stillRecording && totalFrames > 0) {
+        for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
+            restoreSceneState(_ri);
+        }
+        if (trackStates[0].scenes.length === 0 && openedFilePath) {
+            trackStates[0].scenes.push(makeSceneState(openedFilePath));
+            trackStates[0].selectedSceneIdx = 0;
+            trackStates[0].playingSceneIdx  = 0;
+        }
+    }
+    /* Force full LED repaint */
+    ledInitPending = true;
+    ledInitIndex = 0;
+}
+
 /* ============ Exported Entry Points ============ */
 
 globalThis.init = function() {
@@ -6636,107 +6831,25 @@ globalThis.init = function() {
     refreshState();
 
     if (isReconnect) {
-        /* Reconnecting to existing session — restore view based on DSP state */
-        /* Check if DSP is still recording */
-        var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
-        if (stillRecording) {
-            recordState = "recording";
-            recordFilePath = SCRATCH_PATH;
-            openedFilePath = SCRATCH_PATH;
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
+        /* Reconnecting to existing session — read minimal DSP state first */
 
-            /* Recover actual elapsed time from sampler's sample counter */
-            var samplesWritten = 0;
-            if (typeof host_sampler_get_samples_written === "function") {
-                samplesWritten = host_sampler_get_samples_written();
-            }
-            var elapsedSec = samplesWritten / 44100;
-            recordStartTime = Date.now() - (elapsedSec * 1000);
+        /* Restore projectDir from DSP */
+        var _savedProjectDir = host_module_get_param("project_dir");
+        if (_savedProjectDir) projectDir = _savedProjectDir;
 
-            /* Reconstruct waveform array with placeholder entries so the
-             * write head position reflects actual recording progress.
-             * Each tick adds one entry, ticks are ~16ms apart. */
-            var estimatedTicks = Math.round(elapsedSec * 1000 / 16);
-            recordWaveform = [];
-            for (var i = 0; i < estimatedTicks; i++) {
-                recordWaveform.push(0.05);  /* dim baseline so it's visible */
-            }
-            recordWriteHead = recordWaveform.length;
-
-            var timeStr = Math.floor(elapsedSec / 60) + ":" +
-                (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
-            announce("Wave Edit, recording in progress, " + timeStr);
-        } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
-            /* DSP is paused — restore paused state */
-            recordState = "paused";
-            recordFilePath = SCRATCH_PATH;
-            openedFilePath = SCRATCH_PATH;
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-
-            /* Recover elapsed time from sampler's sample counter */
-            var pausedSamples = 0;
-            if (typeof host_sampler_get_samples_written === "function") {
-                pausedSamples = host_sampler_get_samples_written();
-            }
-            var pausedElapsed = pausedSamples / 44100;
-            recordStartTime = Date.now() - (pausedElapsed * 1000);
-            recordPauseStart = Date.now();
-            /* pausedTotal covers the gap between reconstructed start and now,
-               minus actual recorded time, so elapsed stays correct after resume */
-            recordPausedTotal = Date.now() - recordStartTime - (pausedElapsed * 1000);
-
-            /* Reconstruct waveform with placeholder entries */
-            var pausedTicks = Math.round(pausedElapsed * 1000 / 16);
-            recordWaveform = [];
-            for (var j = 0; j < pausedTicks; j++) {
-                recordWaveform.push(0.05);
-            }
-            recordWriteHead = recordWaveform.length;
-
-            announce("Wave Edit, recording paused");
-        } else if (openedFilePath && totalFrames === 0) {
-            /* File path set but no audio data — restore record-ready state */
-            recordBrowserDir = SCRATCH_DIR;
-            recordFilePath = SCRATCH_PATH;
-            recordState = "ready";
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-            announce("New Recording, press REC to record");
-        } else if (restoreSliceState()) {
-            /* Restored slice state from DSP — resume slice mode */
-            currentView = VIEW_SLICE;
-            selectedField = 0;
-            selectSlice(selectedSlice);
-            syncMarkersToDs();
-            announce("Wave Edit, slice mode, " + sliceCount + " slices");
-        } else {
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-            announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+        /* Restore active track from DSP */
+        var _atRaw = host_module_get_param("active_track");
+        if (_atRaw) {
+            var _at = parseInt(_atRaw, 10);
+            if (!isNaN(_at) && _at >= 0 && _at < NUM_TRACKS) activeTrack = _at;
         }
-        /* Restore scene state on reconnect when audio is loaded */
-        if (!stillRecording && totalFrames > 0) {
-            for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
-                restoreSceneState(_ri);
-            }
-            if (trackStates[0].scenes.length === 0 && openedFilePath) {
-                trackStates[0].scenes.push(makeSceneState(openedFilePath));
-                trackStates[0].selectedSceneIdx = 0;
-                trackStates[0].playingSceneIdx  = 0;
-            }
-        }
-        /* Show project browser on reconnect if no project was selected yet */
-        if (!projectDir && !stillRecording) {
-            initProjectBrowser();
-        }
-        /* Force full LED repaint */
+
+        /* Always ask — DSP state is alive so playback may be running */
+        resumeDialogIndex = 0;
+        currentView = VIEW_CONFIRM_RESUME;
         ledInitPending = true;
         ledInitIndex = 0;
+        announce("Resume project? Resume");
     } else {
         /* Fresh session */
         currentView = VIEW_TRIM;
@@ -7074,6 +7187,9 @@ globalThis.tick = function() {
             break;
         case VIEW_CONFIRM_CLOSE:
             drawConfirmClose();
+            break;
+        case VIEW_CONFIRM_RESUME:
+            drawConfirmResume();
             break;
     }
 };
