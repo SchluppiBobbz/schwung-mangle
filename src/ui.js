@@ -50,7 +50,7 @@ import {
     MoveStep1,
     MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob6, MoveKnob7, MoveKnob8,
     MoveKnob5Touch, MoveKnob6Touch, MoveKnob7Touch, MoveKnob8Touch,
-    White, Black, DarkGrey, LightGrey, BrightRed, OrangeRed, BrightGreen, VividYellow, Blue,
+    White, Black, DarkGrey, LightGrey, BrightRed, DeepRed, OrangeRed, BrightGreen, VividYellow, Blue,
     WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
@@ -286,16 +286,18 @@ var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Scratch file — all recordings go here, user "Save As" to keep */
-var SCRATCH_DIR = "/data/UserData/UserLibrary/Recordings";
+var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Move Everything/Recordings";
 var SCRATCH_PATH = SCRATCH_DIR + "/.wave-edit-scratch.wav";
 var SAVE_DIR = SCRATCH_DIR;  /* default destination for saved files */
 
 /* Record state */
 var isRecordedFile = false;      /* true if current file came from recording (unsaved) */
-var recordState = "idle";        /* "idle" | "ready" | "recording" | "stopping" */
+var recordState = "idle";        /* "idle" | "ready" | "recording" | "paused" | "stopping" */
 var recordStoppingTicks = 0;     /* tick counter while waiting for sampler to finalize */
 var recordFilePath = "";         /* auto-generated path */
 var recordStartTime = 0;         /* Date.now() when recording started */
+var recordPausedTotal = 0;       /* total ms spent paused (for elapsed display) */
+var recordPauseStart = 0;        /* Date.now() when pause began */
 var recordBrowserDir = "";       /* directory user was browsing */
 var recordLedCounter = 0;        /* tick counter for LED flash */
 var recordWaveform = null;       /* Array of peak values (0.0-1.0) for live display */
@@ -2223,8 +2225,8 @@ function drawTrimView() {
         recordWaveform.push(peak);
         recordWriteHead++;
 
-        /* Header: REC + elapsed time + debug peak value */
-        var elapsed = (Date.now() - recordStartTime) / 1000;
+        /* Header: REC + elapsed time (excluding paused intervals) */
+        var elapsed = (Date.now() - recordStartTime - recordPausedTotal) / 1000;
         var mins = Math.floor(elapsed / 60);
         var secs = elapsed % 60;
         var timeStr = mins + ":" + (secs < 10 ? "0" : "") + secs.toFixed(1);
@@ -2262,7 +2264,52 @@ function drawTrimView() {
         draw_line(headX, WAVE_Y_TOP, headX, WAVE_Y_BOT, 1);
 
         drawDivider(WAVE_Y_BOT + 1);
-        printCentered(54, "REC: stop");
+        printCentered(54, "REC: stop  Sh+REC: pause");
+        return;
+    }
+
+    /* Paused state: frozen waveform + PAUSED indicator */
+    if (recordState === "paused") {
+        var elapsed = (recordPauseStart - recordStartTime - recordPausedTotal) / 1000;
+        var mins = Math.floor(elapsed / 60);
+        var secs = elapsed % 60;
+        var timeStr = mins + ":" + (secs < 10 ? "0" : "") + secs.toFixed(1);
+        print(0, 0, "PAUSED  " + timeStr, 1);
+        drawDivider(10);
+
+        /* Draw frozen waveform (no new data appended) */
+        if (recordWaveform && recordWaveform.length > 0) {
+            var halfH = WAVE_HEIGHT / 2;
+            var dataLen = recordWaveform.length;
+            var headX;
+            var dataOffset;
+
+            if (dataLen <= RECORD_SCROLL_X) {
+                headX = dataLen - 1;
+                dataOffset = 0;
+            } else {
+                headX = RECORD_SCROLL_X;
+                dataOffset = dataLen - RECORD_SCROLL_X - 1;
+            }
+
+            for (var x = 0; x <= headX; x++) {
+                var amp = recordWaveform[dataOffset + x];
+                if (amp <= 0) continue;
+                var h = Math.round(amp * halfH);
+                if (h < 1) h = 1;
+                draw_line(x, WAVE_MID - h, x, WAVE_MID + h, 1);
+            }
+
+            /* Blinking write head cursor (counter driven by tick()) */
+            if (recordLedCounter % 30 < 15) {
+                draw_line(headX, WAVE_Y_TOP, headX, WAVE_Y_BOT, 1);
+            }
+        } else {
+            draw_line(0, WAVE_MID, SCREEN_W - 1, WAVE_MID, 1);
+        }
+
+        drawDivider(WAVE_Y_BOT + 1);
+        printCentered(54, "REC: resume");
         return;
     }
 
@@ -5006,8 +5053,8 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* During record states, only allow Back and Rec buttons */
-    if (recordState !== "idle" && recordState !== "stopping" && cc !== CC_BACK && cc !== CC_REC) {
+    /* During record states, only allow Back, Rec, and Shift buttons */
+    if (recordState !== "idle" && recordState !== "stopping" && cc !== CC_BACK && cc !== CC_REC && cc !== CC_SHIFT) {
         return;
     }
 
@@ -5023,8 +5070,8 @@ function handleCC(cc, value) {
             switchView(VIEW_CONFIRM_CLOSE);
             return;
         }
-        /* During recording or record-ready, just hide — DSP keeps recording */
-        if (recordState === "recording" || recordState === "ready") {
+        /* During recording/paused/record-ready, just hide — DSP keeps recording */
+        if (recordState === "recording" || recordState === "ready" || recordState === "paused") {
             exitEditor();
             return;
         }
@@ -5258,26 +5305,52 @@ function handleCC(cc, value) {
         }
     }
 
+    /* REC button — start/stop/resume recording; Shift+REC = pause/start */
     if (cc === CC_REC && value > 0) {
         if (recordState === "ready") {
-            /* Ensure parent directory exists */
+            /* Start recording (both plain Rec and Shift+Rec) */
             if (typeof host_ensure_dir === "function") {
                 host_ensure_dir(recordBrowserDir);
             }
             host_sampler_start(recordFilePath);
+            if (typeof host_sampler_set_external_stop === "function") {
+                host_sampler_set_external_stop(1);
+            }
             recordStartTime = Date.now();
+            recordPausedTotal = 0;
+            recordPauseStart = 0;
             recordState = "recording";
             recordWaveform = [];
             recordWriteHead = 0;
             setButtonLED(CC_REC, BrightRed);
             announce("Recording");
+        } else if (recordState === "recording" && shiftHeld) {
+            /* Shift+Rec while recording = pause */
+            host_sampler_pause();
+            recordPauseStart = Date.now();
+            recordState = "paused";
+            recordLedCounter = 0;
+            setButtonLED(CC_REC, LED_OFF);
+            announce("Recording paused");
         } else if (recordState === "recording") {
+            /* Rec while recording = stop */
+            if (typeof host_sampler_set_external_stop === "function") {
+                host_sampler_set_external_stop(0);
+            }
             host_sampler_stop();
             recordState = "stopping";
             recordStoppingTicks = 0;
             recordWaveform = null;
             setButtonLED(CC_REC, LED_OFF);
             showStatus("Saving...", 90);
+        } else if (recordState === "paused") {
+            /* Rec (or Shift+Rec) while paused = resume */
+            host_sampler_resume();
+            recordPausedTotal += (Date.now() - recordPauseStart);
+            recordPauseStart = 0;
+            recordState = "recording";
+            setButtonLED(CC_REC, BrightRed);
+            announce("Recording resumed");
         }
         return;
     }
@@ -6595,8 +6668,38 @@ globalThis.init = function() {
             var timeStr = Math.floor(elapsedSec / 60) + ":" +
                 (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
             announce("Wave Edit, recording in progress, " + timeStr);
-        } else if (totalFrames === 0) {
-            /* No audio data — restore record-ready state */
+        } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
+            /* DSP is paused — restore paused state */
+            recordState = "paused";
+            recordFilePath = SCRATCH_PATH;
+            openedFilePath = SCRATCH_PATH;
+            recordLedCounter = 0;
+            currentView = VIEW_TRIM;
+            selectedField = 0;
+
+            /* Recover elapsed time from sampler's sample counter */
+            var pausedSamples = 0;
+            if (typeof host_sampler_get_samples_written === "function") {
+                pausedSamples = host_sampler_get_samples_written();
+            }
+            var pausedElapsed = pausedSamples / 44100;
+            recordStartTime = Date.now() - (pausedElapsed * 1000);
+            recordPauseStart = Date.now();
+            /* pausedTotal covers the gap between reconstructed start and now,
+               minus actual recorded time, so elapsed stays correct after resume */
+            recordPausedTotal = Date.now() - recordStartTime - (pausedElapsed * 1000);
+
+            /* Reconstruct waveform with placeholder entries */
+            var pausedTicks = Math.round(pausedElapsed * 1000 / 16);
+            recordWaveform = [];
+            for (var j = 0; j < pausedTicks; j++) {
+                recordWaveform.push(0.05);
+            }
+            recordWriteHead = recordWaveform.length;
+
+            announce("Wave Edit, recording paused");
+        } else if (openedFilePath && totalFrames === 0) {
+            /* File path set but no audio data — restore record-ready state */
             recordBrowserDir = SCRATCH_DIR;
             recordFilePath = SCRATCH_PATH;
             recordState = "ready";
@@ -6919,6 +7022,12 @@ globalThis.tick = function() {
         recordLedCounter++;
         if (recordLedCounter % 15 === 0) {
             setButtonLED(CC_REC, (recordLedCounter % 30 < 15) ? BrightRed : LED_OFF);
+        }
+    }
+    if (recordState === "paused") {
+        recordLedCounter++;
+        if (recordLedCounter % 30 === 0) {
+            setButtonLED(CC_REC, (recordLedCounter % 60 < 30) ? DeepRed : LED_OFF);
         }
     }
 
