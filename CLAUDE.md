@@ -66,16 +66,22 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 - `restoreTrackUIState(idx)` copies from `trackStates[idx]` into globals
 - On track switch: save old, restore new — existing draw/edit functions work unchanged
 
+**View modes (Step LEDs):**
+- Step 1: FREE mode (Pale Green) — markers in seconds, tempo = playback speed
+- Step 2: SYNC mode (Bright Orange) — markers in bars:beats, tempo = BPM, length stays fixed
+- Step 3: SLICE mode
+- Step 4: toggle Gate/Trigger for active track
+- Step 5: toggle Clock Sync
+
 **Button mapping:**
 - MoveRow1-4 (CC 43,42,41,40): select track (second press = toggle play)
 - Shift+MoveRow: open file browser for that track
 - MovePlay (CC 85): start/stop ALL loaded tracks
-- Step 4: toggle Gate/Trigger for active track
-- Step 5: toggle Clock Sync
 
 **LEDs:**
 - Track LEDs: Green=playing, WhiteBright=active, WhiteDim=loaded, Black=empty
 - Play LED: Green if any track playing
+- Step 1: PaleGreen = FREE active, Step 2: BrightOrange = SYNC active
 
 **Header:** Shows `T1`..`T4` prefix + gate indicator `G`
 
