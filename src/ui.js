@@ -453,14 +453,14 @@ function saveTrackUIState(idx) {
     /* Slice */
     ts.sliceMode = sliceMode;
     ts.sliceCount = sliceCount;
-    ts.sliceBoundaries = sliceBoundaries;
+    ts.sliceBoundaries = sliceBoundaries.slice();
     ts.selectedSlice = selectedSlice;
     ts.slicePadOffset = slicePadOffset;
     ts.sliceRegionStart = sliceRegionStart;
     ts.sliceRegionEnd = sliceRegionEnd;
     ts.sliceThreshold = sliceThreshold;
-    ts.slicePitches = slicePitches;
-    ts.sliceTempos = sliceTempos;
+    ts.slicePitches = slicePitches.slice();
+    ts.sliceTempos = sliceTempos.slice();
     ts.lazySub = lazySub;
     ts.lazyChopping = lazyChopping;
     /* Waveform */
