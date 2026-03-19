@@ -126,6 +126,26 @@ function setParamBlockingWithBarrier(key, value, timeoutMs) {
 }
 
 /**
+ * Queue a CC inject to Move global transport (press + release as two packets).
+ * drainInjectQueue() must be called each tick().
+ */
+function queuePlayToggle() {
+    injectQueue.push([0x0B, 0xB0, CC_PLAY, 127]);
+    injectQueue.push([0x0B, 0xB0, CC_PLAY, 0]);
+}
+
+function drainInjectQueue() {
+    if (injectQueue.length === 0) return;
+    if (typeof move_midi_inject_to_move !== "function") return;
+    var now = Date.now();
+    if ((now - lastInjectTime) >= INJECT_INTERVAL_MS) {
+        var pkt = injectQueue.shift();
+        move_midi_inject_to_move(pkt);
+        lastInjectTime = now;
+    }
+}
+
+/**
  * Trigger a file load in the DSP.  For the active track uses blocking
  * unprefixed "file_path" (same as the file browser — the host ignores
  * non-blocking set_param for file_path).  For non-active tracks uses
@@ -302,6 +322,21 @@ var loopSelectedField = 0;
 /* BPM state */
 var bpm = 120.0;
 var baseBpm = 120.0;   /* reference BPM at tempoPercent=100 (set by Up/Down in BPM view) */
+var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
+var lastClockCount = -1;    /* samplerClockCount from previous tick (-1 = uninitialized) */
+
+/* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
+var injectQueue = [];
+var lastInjectTime = 0;
+var INJECT_INTERVAL_MS = 50;
+var lastClockFrame = 0;     /* tickFrame when clock last advanced */
+var tickFrame = 0;          /* increments each tick() call */
+var CLOCK_STALE_FRAMES = 4; /* ~130ms at 30fps — transport stopped if no clock change */
+var transportPlaying = false;      /* true if Move transport is running (clock-detected) */
+var lastTransportPlaying = false;  /* previous tick value — used to detect transitions */
+var clockTicksFromStart = 0;       /* ticks since transport started (bar tracking) */
+var PPQN = 24;                     /* MIDI clock pulses per quarter note */
+var TICKS_PER_BAR = PPQN * 4;     /* 96 ticks = one 4/4 bar */
 var beatDivIndex = 2;  /* default: 1/4 */
 var BEAT_DIVISIONS = [1, 2, 4, 8, 16];
 var BEAT_DIVISION_LABELS = ["1/1", "1/2", "1/4", "1/8", "1/16"];
@@ -4822,29 +4857,9 @@ function handleCC(cc, value) {
         }
     }
 
-    /* --- MovePlay: start/stop ALL loaded tracks --- */
+    /* --- MovePlay: toggle Move global transport; tracks follow via transportPlaying in tick() --- */
     if (cc === CC_PLAY && value > 0) {
-        var anyPlaying = false;
-        for (var _p = 0; _p < NUM_TRACKS; _p++) {
-            if (trackStates[_p].playing) { anyPlaying = true; break; }
-        }
-        if (anyPlaying) {
-            /* Stop all */
-            host_module_set_param("play_all", "0");
-            for (var _p2 = 0; _p2 < NUM_TRACKS; _p2++) {
-                trackStates[_p2].playing = false;
-            }
-            playing = false;
-        } else {
-            /* Start all loaded */
-            host_module_set_param("play_all", "1");
-            for (var _p3 = 0; _p3 < NUM_TRACKS; _p3++) {
-                if (trackStates[_p3].loaded) {
-                    trackStates[_p3].playing = true;
-                }
-            }
-            if (trackStates[activeTrack].loaded) playing = true;
-        }
+        queuePlayToggle();
         return;
     }
 
@@ -6669,6 +6684,51 @@ globalThis.tick = function() {
             /* Init just finished — sync LEDs to current state */
             updateLeds();
             if (currentView === VIEW_SLICE) updateSlicePadLeds();
+        }
+    }
+
+    drainInjectQueue();
+
+    /* Read overlay state once per tick: transport detection via clock + BPM push */
+    tickFrame++;
+    if (typeof shadow_get_overlay_state === "function") {
+        var _ov = shadow_get_overlay_state();
+        if (_ov) {
+            /* Transport detection: clock ticking = transport running */
+            var _cc = _ov.samplerClockCount | 0;
+            if (lastClockCount === -1) lastClockCount = _cc;
+            if (_cc !== lastClockCount) {
+                var _delta = (_cc - lastClockCount + 0x100000000) >>> 0;
+                clockTicksFromStart += _delta;
+                lastClockCount = _cc;
+                lastClockFrame = tickFrame;
+                transportPlaying = true;
+            } else if (tickFrame - lastClockFrame > CLOCK_STALE_FRAMES) {
+                transportPlaying = false;
+            }
+            /* React to transport start/stop transitions */
+            if (transportPlaying !== lastTransportPlaying) {
+                lastTransportPlaying = transportPlaying;
+                if (transportPlaying) {
+                    clockTicksFromStart = 0;
+                    host_module_set_param("play_all", "1");
+                    for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
+                        if (trackStates[_ti].loaded) trackStates[_ti].playing = true;
+                    }
+                    if (trackStates[activeTrack].loaded) playing = true;
+                } else {
+                    host_module_set_param("play_all", "0");
+                    for (var _ti2 = 0; _ti2 < NUM_TRACKS; _ti2++) {
+                        trackStates[_ti2].playing = false;
+                    }
+                    playing = false;
+                }
+            }
+            /* Push BPM to DSP when changed */
+            if (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0 && _ov.samplerBpm !== lastProjectBpm) {
+                host_module_set_param("project_bpm", String(_ov.samplerBpm));
+                lastProjectBpm = _ov.samplerBpm;
+            }
         }
     }
 

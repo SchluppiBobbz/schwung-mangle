@@ -170,6 +170,7 @@ typedef struct {
     track_t tracks[NUM_TRACKS];
     int active_track;           /* 0-3, which track is being edited */
     int sync_to_clock;          /* Global clock sync flag */
+    float project_bpm;          /* Global project BPM from host (used in SYNC mode) */
     char module_dir[512];
 
     /* Skipback ring buffers — filled continuously during render_block */
@@ -912,6 +913,7 @@ static void* v2_create(const char *module_dir, const char *json_defaults) {
 
     inst->active_track = 0;
     inst->sync_to_clock = 0;
+    inst->project_bpm = 120.0f;
 
     /* Allocate skipback ring buffers */
     inst->master_rb = (int16_t *)calloc((size_t)RB_FRAMES * 2, sizeof(int16_t));
@@ -1030,6 +1032,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(key, "sync_clock") == 0) {
         if (!val) return;
         inst->sync_to_clock = atoi(val) ? 1 : 0;
+        return;
+    }
+
+    if (strcmp(key, "project_bpm") == 0) {
+        if (!val) return;
+        float bpm = atof(val);
+        if (bpm > 0) inst->project_bpm = bpm;
         return;
     }
 
