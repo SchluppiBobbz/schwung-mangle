@@ -1114,6 +1114,8 @@ function loadProjectJson() {
                  * lost in the single shared-memory slot). */
                 restoreSceneToGlobals(ts);
                 openedFilePath = ts.openedFilePath;
+                totalFrames = 0;  /* reset — tick retry loop will refetch and apply pendingSceneRestore */
+                waveformDirty = true;
 
                 pendingSceneRestore = {
                     startSample:    ts.startSample,
@@ -1660,7 +1662,8 @@ function snapLengthFloor(samples) {
  * Returns true if a valid BPM was found.
  */
 function detectBpmFromFilename() {
-    var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
+    var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i) ||
+                   fileName.match(/\[(\d+(?:\.\d+)?)\]/);
     if (!bpmMatch) return false;
     var detectedBpm = parseFloat(bpmMatch[1]);
     if (detectedBpm < 20 || detectedBpm > 999) {
@@ -6604,6 +6607,24 @@ function doReconnectRestore() {
         _rcts.muted = (_rcMuted === "1");
     }
 
+    /* Restore scene state (bpm, syncMode, tempoPercent, beatDivIndex) from the
+     * playing scene — these aren't surfaced as individual DSP params so we pull
+     * them from the scene_state JSON that was saved the last time saveSceneState
+     * was called. Must run BEFORE restoreTrackUIState so the flat fields are
+     * correct when they get promoted to globals. */
+    for (var _rsi = 0; _rsi < NUM_TRACKS; _rsi++) {
+        restoreSceneState(_rsi);
+        var _rsts = trackStates[_rsi];
+        var _rsPlayIdx = _rsts.playingSceneIdx;
+        if (_rsPlayIdx >= 0 && _rsPlayIdx < _rsts.scenes.length) {
+            var _rsSc = _rsts.scenes[_rsPlayIdx];
+            if (_rsSc.bpm !== undefined) _rsts.bpm = _rsSc.bpm;
+            if (_rsSc.beatDivIndex !== undefined) _rsts.beatDivIndex = _rsSc.beatDivIndex;
+            if (_rsSc.syncMode !== undefined) _rsts.syncMode = !!_rsSc.syncMode;
+            if (_rsSc.tempoPercent !== undefined) _rsts.tempoPercent = _rsSc.tempoPercent;
+        }
+    }
+
     /* Promote active track state into globals */
     restoreTrackUIState(activeTrack);
 
@@ -6689,11 +6710,8 @@ function doReconnectRestore() {
         selectedField = 0;
         announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
     }
-    /* Restore scene state on reconnect when audio is loaded */
+    /* Seed a default scene if none were restored and a file is loaded */
     if (!stillRecording && totalFrames > 0) {
-        for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
-            restoreSceneState(_ri);
-        }
         if (trackStates[0].scenes.length === 0 && openedFilePath) {
             trackStates[0].scenes.push(makeSceneState(openedFilePath));
             trackStates[0].selectedSceneIdx = 0;
@@ -6823,6 +6841,12 @@ globalThis.tick = function() {
                         trackStates[_ti2].playing = false;
                     }
                     playing = false;
+                    /* Flush current state to project.json on transport stop so that
+                     * unsaved edits (markers, loopEnabled, tempo) survive a module reload. */
+                    saveTrackUIState(activeTrack);
+                    saveCurrentSceneState(activeTrack);
+                    saveSceneState(activeTrack);
+                    saveProjectJson();
                 }
             }
             /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes */
