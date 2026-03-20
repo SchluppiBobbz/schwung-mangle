@@ -254,6 +254,7 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 /* ============ State ============ */
 
 var currentView = VIEW_FREE;
+var editMode = VIEW_SYNC;   /* last FREE/SYNC mode selected; default SYNC */
 var shiftHeld = false;
 var deleteHeld = false;
 var deletePendingCut = false;
@@ -1288,9 +1289,9 @@ function updateLeds() {
     setButtonLED(CC_DOWN, (isSync || isSlice) ? LED_DIM : LED_OFF);
 
     /* Step view-selector LEDs */
-    setLED(STEP_BASE + 0, isFree  ? PaleGreen : DarkGrey);
-    setLED(STEP_BASE + 1, isSync  ? Bright    : DarkGrey);  /* Bright = Bright Orange */
-    setLED(STEP_BASE + 2, isSlice ? OrangeRed : DarkGrey);
+    setLED(STEP_BASE + 0, (editMode === VIEW_SYNC) ? Bright : PaleGreen);  /* shows editMode: Bright Orange=SYNC, PaleGreen=FREE */
+    setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
+    setLED(STEP_BASE + 2, Black);  /* freed */
 
     /* Step 4: Gate/Trigger mode LED */
     setLED(STEP_BASE + 3, isEdit ? (trackStates[activeTrack].gateMode ? BrightRed : DarkGrey) : Black);
@@ -3000,6 +3001,7 @@ function switchView(view) {
         host_module_set_param("tempo", String(tempoPercent));
     }
     currentView = view;
+    if (view === VIEW_FREE || view === VIEW_SYNC) editMode = view;
     if (view === VIEW_FREE) {
         refreshState();
         refreshWaveform();
@@ -6337,12 +6339,14 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 1–3: view switcher (VIEW_FREE / VIEW_SYNC / VIEW_SLICE) */
-    if (velocity > 0 && note >= STEP_BASE && note <= STEP_BASE + 2) {
+    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 toggles between FREE and SYNC */
+    if (velocity > 0 && note === STEP_BASE) {
         var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
         if (editViews.indexOf(currentView) >= 0) {
-            var targetView = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE][note - STEP_BASE];
-            if (currentView !== targetView) {
+            if (shiftHeld) {
+                editMode = (editMode === VIEW_SYNC) ? VIEW_FREE : VIEW_SYNC;
+            }
+            if (currentView !== editMode) {
                 /* Leaving slice mode: restore loop state and clear persisted slice state.
                  * Do NOT stop playback — jam workflow requires continuous playback across view switches. */
                 if (currentView === VIEW_SLICE) {
@@ -6356,8 +6360,20 @@ function handleNote(note, velocity) {
                     host_module_set_param("slice_state", "");
                     syncMarkersToDs();
                 }
-                switchView(targetView);
+                switchView(editMode);
+            } else if (shiftHeld) {
+                /* Already in editMode but toggled — update LED to reflect new editMode */
+                updateLeds();
             }
+        }
+        return;
+    }
+
+    /* Step 2: enter SLICE mode */
+    if (velocity > 0 && note === STEP_BASE + 1) {
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        if (editViews.indexOf(currentView) >= 0 && currentView !== VIEW_SLICE) {
+            switchView(VIEW_SLICE);
         }
         return;
     }
