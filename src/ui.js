@@ -164,7 +164,7 @@ function sceneLoadFile(trackIdx, path) {
  */
 var SCENE_FIELDS = [
     "startSample", "endSample", "gainDb", "pitchSemitones", "tempoPercent",
-    "bpm", "baseBpm", "beatDivIndex", "loopEnabled",
+    "bpm", "beatDivIndex", "syncMode", "loopEnabled",
     "sliceMode", "sliceCount", "sliceBoundaries", "selectedSlice",
     "slicePadOffset", "sliceRegionStart", "sliceRegionEnd", "sliceThreshold",
     "slicePitches", "sliceTempos", "lazySub",
@@ -321,7 +321,8 @@ var loopSelectedField = 0;
 
 /* BPM state */
 var bpm = 120.0;
-var baseBpm = 120.0;   /* reference BPM at tempoPercent=100 (set by Up/Down in BPM view) */
+var globalBpm = 120;       /* project BPM from host, default 120 */
+var syncMode = false;      /* true when active scene/file uses BPM sync */
 var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
 var lastClockCount = -1;    /* samplerClockCount from previous tick (-1 = uninitialized) */
 
@@ -337,9 +338,10 @@ var lastTransportPlaying = false;  /* previous tick value — used to detect tra
 var clockTicksFromStart = 0;       /* ticks since transport started (bar tracking) */
 var PPQN = 24;                     /* MIDI clock pulses per quarter note */
 var TICKS_PER_BAR = PPQN * 4;     /* 96 ticks = one 4/4 bar */
-var beatDivIndex = 2;  /* default: 1/4 */
-var BEAT_DIVISIONS = [1, 2, 4, 8, 16];
-var BEAT_DIVISION_LABELS = ["1/1", "1/2", "1/4", "1/8", "1/16"];
+var beatDivIndex = 5;  /* default: 1/4 (index 5 in expanded array) */
+var beatDivPopupOpen = false;  /* true while Shift+E1/E2 popup is showing in SYNC view */
+var BEAT_DIVISIONS       = [0.125, 0.25, 0.5, 1,     2,     4,     8,     16,     32,     64];
+var BEAT_DIVISION_LABELS = ["8bar","4bar","2bar","1bar","1/2","1/4","1/8","1/16","1/32","1/64"];
 
 /* Slice state */
 var SLICE_MODE_EVEN = 0;
@@ -428,8 +430,8 @@ function makeSceneState(path) {
         pitchSemitones:  0.0,
         tempoPercent:    100,
         bpm:             bpm,
-        baseBpm:         baseBpm,
         beatDivIndex:    beatDivIndex,
+        syncMode:        (currentView === VIEW_SYNC),
         loopEnabled:     true,
         sliceMode:       SLICE_MODE_EVEN,
         sliceCount:      1,
@@ -488,7 +490,7 @@ function makeTrackState() {
         /* Loop */
         loopSelectedField: 0,
         /* BPM */
-        bpm: 120.0, baseBpm: 120.0, beatDivIndex: 2,
+        bpm: 120.0, beatDivIndex: 5, syncMode: false,
         /* Flags */
         dirty: false, hasUndo: false, hasClipboard: false,
         /* Misc */
@@ -558,8 +560,8 @@ function saveTrackUIState(idx) {
     ts.loopSelectedField = loopSelectedField;
     /* BPM */
     ts.bpm = bpm;
-    ts.baseBpm = baseBpm;
     ts.beatDivIndex = beatDivIndex;
+    ts.syncMode = syncMode;
     /* Flags */
     ts.dirty = dirty;
     ts.hasUndo = hasUndo;
@@ -599,10 +601,11 @@ function restoreSceneToGlobals(scene) {
     endSample = scene.endSample;
     gainDb = scene.gainDb;
     pitchSemitones = scene.pitchSemitones;
-    tempoPercent = scene.tempoPercent;
     bpm = scene.bpm;
-    baseBpm = scene.baseBpm;
     beatDivIndex = scene.beatDivIndex;
+    syncMode = scene.syncMode || false;
+    /* SYNC scenes: recalculate tempoPercent from current globalBpm so it stays accurate */
+    tempoPercent = syncMode ? Math.round(bpm / globalBpm * 100) : scene.tempoPercent;
     loopEnabled = scene.loopEnabled;
     sliceMode = scene.sliceMode;
     sliceCount = scene.sliceCount;
@@ -628,7 +631,7 @@ function getGlobalsAsSceneSource() {
     return {
         startSample: startSample, endSample: endSample,
         gainDb: gainDb, pitchSemitones: pitchSemitones, tempoPercent: tempoPercent,
-        bpm: bpm, baseBpm: baseBpm, beatDivIndex: beatDivIndex, loopEnabled: loopEnabled,
+        bpm: bpm, beatDivIndex: beatDivIndex, syncMode: syncMode, loopEnabled: loopEnabled,
         sliceMode: sliceMode, sliceCount: sliceCount, sliceBoundaries: sliceBoundaries,
         selectedSlice: selectedSlice, slicePadOffset: slicePadOffset,
         sliceRegionStart: sliceRegionStart, sliceRegionEnd: sliceRegionEnd,
@@ -689,8 +692,8 @@ function restoreTrackUIState(idx) {
     loopSelectedField = ts.loopSelectedField;
     /* BPM */
     bpm = ts.bpm;
-    baseBpm = ts.baseBpm;
     beatDivIndex = ts.beatDivIndex;
+    syncMode = ts.syncMode || false;
     /* Flags — these will be refreshed from DSP in tick() */
     dirty = ts.dirty;
     hasUndo = ts.hasUndo;
@@ -1078,8 +1081,8 @@ function loadProjectJson() {
             ts.pitchSemitones   = _ltScene.pitchSemitones   !== undefined ? _ltScene.pitchSemitones   : 0;
             ts.tempoPercent     = _ltScene.tempoPercent     !== undefined ? _ltScene.tempoPercent     : 100;
             ts.bpm              = _ltScene.bpm              || 120;
-            ts.baseBpm          = _ltScene.baseBpm          || 120;
-            ts.beatDivIndex     = _ltScene.beatDivIndex     !== undefined ? _ltScene.beatDivIndex     : 2;
+            ts.beatDivIndex     = _ltScene.beatDivIndex     !== undefined ? _ltScene.beatDivIndex     : 5;
+            ts.syncMode         = !!_ltScene.syncMode;
             ts.loopEnabled      = !!_ltScene.loopEnabled;
             ts.sliceMode        = _ltScene.sliceMode        || 0;
             ts.sliceCount       = _ltScene.sliceCount       || 1;
@@ -1277,8 +1280,8 @@ function updateLeds() {
     setButtonLED(CC_CAPTURE, (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
 
     /* Left/Right: Trim, BPM, Slice */
-    setButtonLED(CC_LEFT,  (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
-    setButtonLED(CC_RIGHT, (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_LEFT,  (isFree || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_RIGHT, (isFree || isSlice) ? LED_DIM : LED_OFF);
 
     /* Up/Down: BPM, Slice */
     setButtonLED(CC_UP,   (isSync || isSlice) ? LED_DIM : LED_OFF);
@@ -1421,10 +1424,12 @@ function showStatus(msg, frames) {
  */
 function getKnobLabel(knobIndex) {
     if (knobIndex === 0) {
+        if (currentView === VIEW_SYNC) return shiftHeld ? "Step:" + BEAT_DIVISION_LABELS[beatDivIndex] : "Start:" + formatBarsBeats(startSample);
         if (currentView === VIEW_FREE) return shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample);
         if (currentView === VIEW_LOOP) return shiftHeld ? "S:" + startSample : "Pt:" + formatTime(startSample);
         if (currentView === VIEW_SLICE) return "Start:" + formatTime(sliceBoundaries[selectedSlice]);
     } else if (knobIndex === 1) {
+        if (currentView === VIEW_SYNC) return shiftHeld ? "Step:" + BEAT_DIVISION_LABELS[beatDivIndex] : "Len:" + formatBarsBeats(endSample - startSample);
         if (currentView === VIEW_FREE || currentView === VIEW_LOOP) return shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample);
         if (currentView === VIEW_SLICE) return "End:" + formatTime(sliceBoundaries[selectedSlice + 1]);
     } else if (knobIndex === 2) {
@@ -1509,7 +1514,7 @@ function resetSliceTempo() {
 }
 
 function resetBpm() {
-    bpm = baseBpm;
+    bpm = globalBpm;
     tempoPercent = 100;
     host_module_set_param("tempo", "100");
     showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (100%)");
@@ -1625,6 +1630,59 @@ function getBeatStepSamples() {
     var samplesPerQuarter = sampleRate / beatsPerSec;
     var div = BEAT_DIVISIONS[beatDivIndex];
     return Math.max(1, Math.round(samplesPerQuarter * 4 / div));
+}
+
+/**
+ * Snap sample count down to the nearest musical division:
+ * whole bar (≥1 bar), whole beat (≥1 beat), or whole sixteenth note.
+ */
+function snapLengthFloor(samples) {
+    var samplesPerQuarter = sampleRate / (bpm / 60.0);
+    var bar      = Math.round(samplesPerQuarter * 4);
+    var beat     = Math.round(samplesPerQuarter);
+    var sixteenth = Math.max(1, Math.round(samplesPerQuarter / 4));
+    if (samples >= bar)  return Math.floor(samples / bar)  * bar;
+    if (samples >= beat) return Math.floor(samples / beat) * beat;
+    return Math.max(sixteenth, Math.floor(samples / sixteenth) * sixteenth);
+}
+
+/**
+ * Detect BPM from the current filename and snap end marker to the nearest beat step.
+ * Returns true if a valid BPM was found.
+ */
+function detectBpmFromFilename() {
+    var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
+    if (!bpmMatch) return false;
+    var detectedBpm = parseFloat(bpmMatch[1]);
+    if (detectedBpm < 20 || detectedBpm > 999) {
+        showStatus("BPM out of range", 60);
+        return false;
+    }
+    bpm = Math.round(detectedBpm * 10) / 10;
+    syncMode = true;
+    tempoPercent = Math.round(bpm / globalBpm * 100);
+    host_module_set_param("tempo", String(tempoPercent));
+    var snapped = snapLengthFloor(endSample - startSample);
+    endSample = startSample + Math.max(1, snapped);
+    if (endSample > totalFrames) endSample = totalFrames;
+    syncMarkersToDs();
+    refreshWaveform();
+    showStatus("BPM: " + bpm.toFixed(1), 90);
+    return true;
+}
+
+/**
+ * Format a sample count as bars:beats:sixteenths using the current BPM.
+ * Assumes 4/4 time. Always non-negative.
+ */
+function formatBarsBeats(samples) {
+    if (bpm <= 0 || sampleRate <= 0 || samples < 0) return "0:0:0";
+    var samplesPerBeat = sampleRate * 60.0 / bpm;
+    var totalSixteenths = Math.round(samples / (samplesPerBeat / 4));
+    var bar        = Math.floor(totalSixteenths / 16);
+    var beat       = Math.floor((totalSixteenths % 16) / 4);
+    var sixteenth  = totalSixteenths % 4;
+    return bar + ":" + beat + ":" + sixteenth;
 }
 
 /**
@@ -1806,6 +1864,12 @@ function loadFileIntoEditor(filePath) {
     host_module_set_param("play_loop", "1");
     refreshFileInfo();
     waveformDirty = true;
+    /* In SYNC mode: auto-detect BPM from filename; fall back to globalBpm */
+    if (currentView === VIEW_SYNC && !detectBpmFromFilename()) {
+        bpm = globalBpm;
+        tempoPercent = 100;
+        host_module_set_param("tempo", "100");
+    }
     refreshWaveform();
     refreshState();
     /* Update track state */
@@ -2881,25 +2945,46 @@ function drawJogShiftMenu() {
 
 /* ============ Drawing: BPM Trim ============ */
 
+function drawBeatDivPopup() {
+    var POP_W = 52, POP_H = 12;
+    var px = (SCREEN_W - POP_W) >> 1;
+    var py = (SCREEN_H - POP_H) >> 1;
+    /* Background + border via fill_rect */
+    fill_rect(px - 1, py - 1, POP_W + 2, POP_H + 2, 0);
+    fill_rect(px - 1, py - 1, POP_W + 2, 1, 1);           /* top */
+    fill_rect(px - 1, py + POP_H, POP_W + 2, 1, 1);       /* bottom */
+    fill_rect(px - 1, py - 1, 1, POP_H + 2, 1);           /* left */
+    fill_rect(px + POP_W, py - 1, 1, POP_H + 2, 1);       /* right */
+    var label = "Step: " + BEAT_DIVISION_LABELS[beatDivIndex];
+    print(px + 2, py + 2, label, 1);
+}
+
 function drawSyncView() {
     /* Reuse trim view, then overlay BPM label and status bar */
     drawFreeView();
 
-    /* Replace "FREE" header label with "SYNC" (keep dirty/loop indicators) */
-    var trimHeader = buildModeHeader("FREE");
-    var bpmHeader  = buildModeHeader("SYNC");
-    var eraseW = Math.max(trimHeader.length, bpmHeader.length) * 6 + 2;
-    fill_rect(0, 0, eraseW, 10, 0);
+    /* Rewrite full header: SYNC label left, globalBpm right (replaces file-duration) */
+    var bpmHeader = buildModeHeader("SYNC");
+    fill_rect(0, 0, SCREEN_W, 10, 0);
     print(0, 0, bpmHeader, 1);
+    var nameX = (bpmHeader.length + 1) * 6;
+    var gbStr = globalBpm.toFixed(0) + "B";
+    var maxNameW = SCREEN_W - nameX - gbStr.length * 6 - 6;
+    var maxNameChars = Math.floor(maxNameW / 6);
+    if (maxNameChars > 0) print(nameX, 0, truncate(fileName, maxNameChars), 1);
+    print(SCREEN_W - gbStr.length * 6, 0, gbStr, 1);
 
     /* Overwrite the status area at very bottom with BPM info (unless a timed status or knob status is showing) */
     if (getActiveStatus() === "") {
-        var tempoStr = (tempoPercent !== 100) ? " " + tempoPercent + "%" : "";
-        var bpmStatus = "BPM:" + bpm.toFixed(1) + tempoStr + " " + BEAT_DIVISION_LABELS[beatDivIndex] +
-                        "  " + (selectedField === 0 ? "[Start]" : "[End]");
+        var startBB = formatBarsBeats(startSample);
+        var lenBB   = formatBarsBeats(endSample - startSample);
+        var bpmStatus = "BPM:" + bpm.toFixed(1) + " S" + startBB + " L" + lenBB +
+                        " " + BEAT_DIVISION_LABELS[beatDivIndex];
         fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
         print(0, SCREEN_H - 9, bpmStatus, 1);
     }
+
+    if (beatDivPopupOpen) drawBeatDivPopup();
 }
 
 /* ============ Navigation & Actions ============ */
@@ -4797,6 +4882,10 @@ function handleCC(cc, value) {
     /* Shift tracking */
     if (cc === CC_SHIFT) {
         shiftHeld = (value === 127);
+        if (!shiftHeld && beatDivPopupOpen) {
+            beatDivPopupOpen = false;
+            refreshWaveform();
+        }
         return;
     }
 
@@ -5216,28 +5305,7 @@ function handleCC(cc, value) {
 
     /* Left/Right arrows — nudge selection or jump by selection length */
     if ((cc === CC_LEFT || cc === CC_RIGHT) && value > 0) {
-        if (currentView === VIEW_SYNC) {
-            var dir = (cc === CC_LEFT) ? -1 : 1;
-            var beatStep = getBeatStepSamples();
-            if (shiftHeld) {
-                /* Shift: move entire selection by one beat division */
-                var selLen = endSample - startSample;
-                var newStart = startSample + dir * beatStep;
-                var newEnd   = endSample   + dir * beatStep;
-                if (newStart < 0) { newStart = 0; newEnd = selLen; }
-                if (newEnd > totalFrames) { newEnd = totalFrames; newStart = newEnd - selLen; if (newStart < 0) newStart = 0; }
-                startSample = newStart;
-                endSample   = newEnd;
-                showStatus("Start:" + formatTime(startSample), 30);
-            } else {
-                /* Normal: move selected marker by one beat division */
-                adjustMarker(selectedField, dir * beatStep);
-                showStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample), 30);
-            }
-            syncMarkersToDs();
-            refreshWaveform();
-            return;
-        } else if (currentView === VIEW_FREE) {
+        if (currentView === VIEW_FREE) {
             var selLen = endSample - startSample;
             var dir = (cc === CC_LEFT) ? -1 : 1;
 
@@ -5315,28 +5383,8 @@ function handleCC(cc, value) {
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
         if (currentView === VIEW_SYNC) {
             if (cc === CC_DOWN) {
-                /* Down: read BPM from filename */
-                var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i);
-                if (bpmMatch) {
-                    var detectedBpm = parseFloat(bpmMatch[1]);
-                    if (detectedBpm >= 20 && detectedBpm <= 999) {
-                        bpm = Math.round(detectedBpm * 10) / 10;
-                        baseBpm = bpm;
-                        tempoPercent = 100;
-                        host_module_set_param("tempo", "100");
-                        var beatStep = getBeatStepSamples();
-                        var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
-                        endSample = startSample + beats * beatStep;
-                        if (endSample > totalFrames) endSample = totalFrames;
-                        syncMarkersToDs();
-                        refreshWaveform();
-                        showStatus("BPM: " + bpm.toFixed(1), 90);
-                    } else {
-                        showStatus("BPM out of range", 60);
-                    }
-                } else {
-                    showStatus("No BPM in filename", 60);
-                }
+                /* Down: read BPM from filename and snap end marker */
+                if (!detectBpmFromFilename()) showStatus("No BPM in filename", 60);
             } else {
                 /* Up: estimate BPM from selection length */
                 var selLen = endSample - startSample;
@@ -5348,9 +5396,9 @@ function handleCC(cc, value) {
                     showStatus("BPM out of range", 60); return;
                 }
                 bpm = estimatedBpm;
-                baseBpm = bpm;
-                tempoPercent = 100;
-                host_module_set_param("tempo", "100");
+                syncMode = true;
+                tempoPercent = Math.round(bpm / globalBpm * 100);
+                host_module_set_param("tempo", String(tempoPercent));
                 showStatus("BPM: " + bpm.toFixed(1), 90);
             }
             return;
@@ -5805,9 +5853,25 @@ function handleCC(cc, value) {
         if (delta === 0) return;
 
         if (currentView === VIEW_SYNC) {
-            var step = shiftHeld ? 1 : getBeatStepSamples();
-            adjustMarker(0, delta * step);
-            showKnobStatus(0, "Start:" + formatTime(startSample));
+            if (shiftHeld) {
+                /* Shift+E1 in SYNC: open popup and cycle beat division */
+                beatDivPopupOpen = true;
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                refreshWaveform();
+                return;
+            }
+            /* Move whole selection: start + end shift together, length stays fixed */
+            var _selLen = endSample - startSample;
+            var _newStart = startSample + delta * getBeatStepSamples();
+            if (_newStart < 0) _newStart = 0;
+            if (_newStart + _selLen > totalFrames) _newStart = totalFrames - _selLen;
+            if (_newStart < 0) _newStart = 0;
+            startSample = _newStart;
+            endSample   = _newStart + _selLen;
+            syncMarkersToDs();
+            showKnobStatus(0, "Start:" + formatBarsBeats(startSample));
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
@@ -5858,9 +5922,17 @@ function handleCC(cc, value) {
         if (delta === 0) return;
 
         if (currentView === VIEW_SYNC) {
-            var step = shiftHeld ? 1 : getBeatStepSamples();
-            adjustMarker(1, delta * step);
-            showKnobStatus(1, "End:" + formatTime(endSample));
+            if (shiftHeld) {
+                /* Shift+E2 in SYNC: open popup and cycle beat division */
+                beatDivPopupOpen = true;
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                refreshWaveform();
+                return;
+            }
+            adjustMarker(1, delta * getBeatStepSamples());
+            showKnobStatus(1, "Len:" + formatBarsBeats(endSample - startSample));
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
@@ -6029,21 +6101,18 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* E6 (Knob 6): Division in VIEW_SYNC and VIEW_SLICE (BPM mode) */
+    /* E6 (Knob 6): Division in VIEW_SLICE (BPM mode) */
     if (cc === CC_E6) {
         var delta = decodeDelta(value);
         if (delta !== 0) {
-            if (currentView === VIEW_SYNC ||
-                (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_BPM && !lazyChopping)) {
+            if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_BPM && !lazyChopping) {
                 beatDivIndex += (delta > 0 ? 1 : -1);
                 if (beatDivIndex < 0) beatDivIndex = 0;
                 if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
-                if (currentView === VIEW_SLICE) {
-                    recomputeSliceBoundaries();
-                    selectSlice(selectedSlice);
-                    syncMarkersToDs();
-                    updateSlicePadLeds();
-                }
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
                 showKnobStatus(5, "Div:" + BEAT_DIVISION_LABELS[beatDivIndex]);
                 return;
             }
@@ -6119,13 +6188,11 @@ function handleCC(cc, value) {
             if (bpm < 20) bpm = 20;
             if (bpm > 999) bpm = 999;
             bpm = Math.round(bpm * 10) / 10;
-            /* Derive tempoPercent from ratio to base BPM */
-            if (baseBpm > 0) {
-                tempoPercent = Math.round(bpm / baseBpm * 100);
-                if (tempoPercent < 30) { tempoPercent = 30; bpm = baseBpm * 0.5; }
-                if (tempoPercent > 300) { tempoPercent = 300; bpm = baseBpm * 2.0; }
-            }
+            tempoPercent = Math.round(bpm / globalBpm * 100);
+            if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm * 0.3 * 10) / 10; }
+            if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm * 3.0 * 10) / 10; }
             host_module_set_param("tempo", String(tempoPercent));
+            syncMarkersToDs(); /* re-assert markers — DSP must not re-snap on tempo change */
             showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)");
             return;
         }
@@ -6136,9 +6203,8 @@ function handleCC(cc, value) {
             if (tempoPercent < 30) tempoPercent = 30;
             if (tempoPercent > 300) tempoPercent = 300;
             host_module_set_param("tempo", String(tempoPercent));
-            /* Keep bpm in sync with tempoPercent if baseBpm is known */
-            if (baseBpm > 0) bpm = Math.round(baseBpm * tempoPercent / 10) / 10;
-            showKnobStatus(7, "Tempo:" + tempoPercent + "%" + (baseBpm > 0 ? " BPM:" + bpm.toFixed(1) : ""));
+            bpm = Math.round(globalBpm * tempoPercent / 100 * 10) / 10;
+            showKnobStatus(7, "Tempo:" + tempoPercent + "% BPM:" + bpm.toFixed(1));
             return;
         }
     }
@@ -6724,10 +6790,22 @@ globalThis.tick = function() {
                     playing = false;
                 }
             }
-            /* Push BPM to DSP when changed */
+            /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes */
             if (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0 && _ov.samplerBpm !== lastProjectBpm) {
                 host_module_set_param("project_bpm", String(_ov.samplerBpm));
                 lastProjectBpm = _ov.samplerBpm;
+                globalBpm = lastProjectBpm;
+                for (var _bi = 0; _bi < NUM_TRACKS; _bi++) {
+                    var _bts = trackStates[_bi];
+                    var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
+                        ? _bts.scenes[_bts.playingSceneIdx] : null;
+                    if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
+                        var _tp = Math.round(_bsc.bpm / globalBpm * 100);
+                        var _tkey = (_bi === activeTrack) ? "tempo" : "t" + _bi + ":tempo";
+                        host_module_set_param(_tkey, String(_tp));
+                        if (_bi === activeTrack) tempoPercent = _tp;
+                    }
+                }
             }
         }
     }
