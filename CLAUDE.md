@@ -67,11 +67,19 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 - On track switch: save old, restore new — existing draw/edit functions work unchanged
 
 **View modes (Step LEDs):**
-- Step 1: FREE mode (Pale Green) — markers in seconds, tempo = playback speed
-- Step 2: SYNC mode (Bright Orange) — markers in bars:beats, tempo = BPM, length stays fixed
-- Step 3: SLICE mode
+- Step 1: enter `editMode` (FREE or SYNC — whichever was last active). LED: BrightOrange = SYNC, PaleGreen = FREE
+- Shift+Step 1: toggle `editMode` between FREE and SYNC
+- Step 2: SLICE mode
+- Step 3: freed (no function)
 - Step 4: toggle Gate/Trigger for active track
 - Step 5: toggle Clock Sync
+
+**SYNC mode behaviour:**
+- Clip has `sceneBpm` (scene BPM) and a musical length in bars:beats
+- `musicalLength` is preserved when `sceneBpm` changes: `endSample = startSample + oldLen * oldBpm / newBpm`
+- `tempoPercent = sceneBpm / globalBpm * 100` → Bungee stretch ratio
+- DSP `sync_tempo` param updates `start_sample`, `end_sample`, `sync_play_end`, `bng_play_end`, and `bng_req.speed` atomically — no stretcher reset during playback so loop boundary takes effect on the next audio block
+- E1: start marker (bars:beats, Shift: cycle beat division), E2: length (bars:beats), E8: scene BPM
 
 **Button mapping:**
 - MoveRow1-4 (CC 43,42,41,40): select track (second press = toggle play)
@@ -81,11 +89,10 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 **LEDs:**
 - Track LEDs: Green=playing, WhiteBright=active, WhiteDim=loaded, Black=empty
 - Play LED: Green if any track playing
-- Step 1: PaleGreen = FREE active, Step 2: BrightOrange = SYNC active
+- Step 1: PaleGreen = FREE active, BrightOrange = SYNC active
 
 **Header:** Shows `T1`..`T4` prefix + gate indicator `G`
 
 ### Known Issues / Not Yet Tested
-- Feature is implemented but not yet tested on hardware
 - Clock sync parameter is wired but MIDI clock tracking in `on_midi` is minimal
 - Gate mode pad hold/release needs hardware verification

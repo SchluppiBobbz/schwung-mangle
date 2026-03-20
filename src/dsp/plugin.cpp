@@ -155,6 +155,7 @@ typedef struct {
     int    bng_out_count;       /* frames currently buffered */
     int    bng_play_start;      /* playback region start for Bungee */
     int    bng_play_end;        /* playback region end for Bungee */
+    int    sync_play_end;       /* SYNC mode: tempo-scaled loop boundary (0 = not set, use end_sample) */
 
     char copy_result[256];
     char load_error[256];
@@ -1301,7 +1302,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             t->play_pos = t->start_sample;
             t->play_pos_frac = (double)t->start_sample;
             t->bng_play_start = t->start_sample;
-            t->bng_play_end = t->end_sample;
+            t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
             t->bng_out_count = 0;
             bng_reset_stretcher(t, (double)t->start_sample);
         }
@@ -1329,7 +1330,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->play_pos_frac = (double)pos;
         /* Reset Bungee state */
         t->bng_play_start = t->start_sample;
-        t->bng_play_end = t->end_sample;
+        t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
         t->bng_out_count = 0;
         bng_reset_stretcher(t, (double)pos);
         return;
@@ -1396,6 +1397,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v < 30) v = 30;
         if (v > 300) v = 300;
         t->tempo_percent = v;
+        t->sync_play_end = 0; /* FREE mode: disable SYNC loop boundary */
         recompute_ratios(t);
         /* Sync Bungee state to current playback position so the transition
          * from direct path to Bungee path is seamless. */
@@ -1405,6 +1407,38 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         } else {
             t->bng_req.speed = (double)v / 100.0;
         }
+        return;
+    }
+
+    /* --- SYNC mode: atomic tempo + loop-boundary update ---
+     * Format: "tempoPercent,startSample,logicalEndSample"
+     * Sets tempo_percent and uses the logical end sample directly as bng_play_end.
+     * Output loop duration = (logicalEnd - start) / (tempoPercent/100), which
+     * correctly scales with sceneBpm/projectBpm ratio — matching musicalLength.
+     * The edit markers (start_sample / end_sample) are NOT changed so that
+     * file_info always returns the logical positions. */
+    if (strcmp(param, "sync_tempo") == 0) {
+        if (!val) return;
+        int tp, s, e;
+        if (sscanf(val, "%d,%d,%d", &tp, &s, &e) != 3) return;
+        if (tp < 30) tp = 30;
+        if (tp > 300) tp = 300;
+        t->tempo_percent = tp;
+        recompute_ratios(t);
+        if (e > t->audio_frames) e = t->audio_frames;
+        if (e < s) e = s;
+        /* Also update the physical markers so render_track (which reads
+         * play_end = t->end_sample directly) picks up the change immediately.
+         * Previously only sync_play_end / bng_play_end were set here, but
+         * render_track never reads those — it reads end_sample. */
+        t->start_sample = s;
+        t->end_sample   = e;
+        t->sync_play_end = e;
+        t->bng_play_start = s;
+        t->bng_play_end = e;
+        /* Update speed directly without resetting the stretcher so the loop
+         * boundary takes effect on the very next audio block (same as E2). */
+        t->bng_req.speed = (double)tp / 100.0;
         return;
     }
 

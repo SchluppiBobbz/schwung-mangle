@@ -43,13 +43,15 @@ cd move-anything-waveform-editor
 
 ### View Selection (Step Buttons)
 
-| Step | View |
-|------|------|
-| Step 1 | Trim view |
-| Step 2 | BPM Step mode |
-| Step 3 | Slice mode |
+| Step | Action |
+|------|--------|
+| Step 1 | Enter edit mode (FREE or SYNC — whichever was last used). LED: Orange = SYNC, PaleGreen = FREE |
+| Shift+Step 1 | Toggle between FREE and SYNC edit mode |
+| Step 2 | Enter Slice mode |
+| Step 4 | Toggle Gate / Trigger mode for active track |
+| Step 5 | Toggle Clock Sync on/off |
 
-### Trim View
+### FREE View (Step 1, FREE mode)
 
 | Control | Function |
 |---------|----------|
@@ -82,27 +84,27 @@ cd move-anything-waveform-editor
 | Back | Hide (keeps DSP alive) |
 | Shift+Back | Full exit (unload DSP) |
 
-### BPM Step Mode (Step 2, or Jog click → BPM Step)
+### SYNC View (Shift+Step 1 to activate)
+
+Tempo-synchronous playback with time-stretching and constant pitch. The clip has a **scene BPM** and a **musical length** (bars:beats). The audio is time-stretched to fit the project tempo — pitch is always preserved.
 
 | Control | Function |
 |---------|----------|
 | Jog wheel | Scroll view when zoomed in |
 | Jog click | Toggle active marker (Start/End) |
-| Knob 1 | Move start marker (in beat steps) |
-| Knob 2 | Move end marker (in beat steps) |
+| Knob 1 | Move start marker (in beat steps, Shift: cycle beat division) |
+| Knob 2 | Adjust musical length (in beat steps, Shift: cycle beat division) |
 | Knob 3 | Zoom |
-| Knob 5 | Set BPM (Shift: fine ±0.1) — snaps end marker to beat grid |
-| Knob 6 | Set beat division (1/1–1/16) |
+| Knob 8 | Adjust scene BPM (Shift: fine ±0.1) — end marker rescales automatically to keep musical length constant |
 | Copy | Copy selection |
 | Shift+Copy | Paste at cursor (insert) |
 | Down | Read BPM from filename |
 | Up | Estimate BPM from selection length (assumes 1 bar, 4/4) |
-| Left/Right | Move active marker by one division |
+| Left/Right | Move entire selection by one division |
 | Shift+L/R | Move entire selection by one division |
 | Step 15 | Set start marker at playback position (while playing) |
 | Step 16 | Set end marker at playback position (while playing) |
 | Shift+Loop | Toggle loop on/off |
-| Back | Return to Trim view |
 
 ### Slice Mode (Step 3)
 

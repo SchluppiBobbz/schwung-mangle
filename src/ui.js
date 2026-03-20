@@ -739,7 +739,11 @@ function switchToTrack(idx) {
         setParamBlocking("markers", startSample + "," + endSample, 500);
         setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
         setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
-        setParamBlocking("tempo",     String(tempoPercent), 500);
+        if (syncMode) {
+            setParamBlocking("sync_tempo", tempoPercent + "," + startSample + "," + endSample, 500);
+        } else {
+            setParamBlocking("tempo", String(tempoPercent), 500);
+        }
         setParamBlocking("play_loop", loopEnabled ? "1" : "0", 500);
     }
     /* Refresh pad LEDs for the new active track's scene layout */
@@ -1126,7 +1130,11 @@ function loadProjectJson() {
                 var _ltp = "t" + _lt + ":";
                 setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
                 setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
-                setParamBlocking(_ltp + "tempo",     String(ts.tempoPercent), 500);
+                if (ts.syncMode) {
+                    setParamBlocking(_ltp + "sync_tempo", ts.tempoPercent + "," + ts.startSample + "," + ts.endSample, 500);
+                } else {
+                    setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
+                }
                 setParamBlocking(_ltp + "play_loop", ts.loopEnabled ? "1" : "0", 500);
                 setParamBlocking(_ltp + "markers",   ts.startSample + "," + ts.endSample, 500);
             }
@@ -1517,7 +1525,7 @@ function resetSliceTempo() {
 function resetBpm() {
     bpm = globalBpm;
     tempoPercent = 100;
-    host_module_set_param("tempo", "100");
+    syncSyncModeToDs();
     showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (100%)");
     showStatus("BPM Reset", 60);
 }
@@ -1662,11 +1670,11 @@ function detectBpmFromFilename() {
     bpm = Math.round(detectedBpm * 10) / 10;
     syncMode = true;
     tempoPercent = Math.round(bpm / globalBpm * 100);
-    host_module_set_param("tempo", String(tempoPercent));
     var snapped = snapLengthFloor(endSample - startSample);
     endSample = startSample + Math.max(1, snapped);
     if (endSample > totalFrames) endSample = totalFrames;
     syncMarkersToDs();
+    syncSyncModeToDs();
     refreshWaveform();
     showStatus("BPM: " + bpm.toFixed(1), 90);
     return true;
@@ -1782,6 +1790,17 @@ function adjustMarker(field, deltaSamples) {
  */
 function syncMarkersToDs() {
     host_module_set_param("markers", startSample + "," + endSample);
+}
+
+/**
+ * SYNC mode: atomically update tempo + loop boundary in one DSP call.
+ * Sends "sync_tempo" = "tempoPercent,startSample,logicalEndSample".
+ * DSP computes dspEnd = startSample + (logicalEnd - startSample) * tempoPercent/100
+ * so the output loop duration stays fixed regardless of tempo.
+ * Logical markers in JS are never modified.
+ */
+function syncSyncModeToDs() {
+    host_module_set_param("sync_tempo", tempoPercent + "," + startSample + "," + endSample);
 }
 
 /**
@@ -3209,7 +3228,11 @@ function applySceneLaunch(trackIdx, sceneIdx) {
         var _tp = "t" + trackIdx + ":";
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
-        setParamBlocking(_tp + "tempo",     String(scene.tempoPercent), 500);
+        if (scene.syncMode) {
+            setParamBlocking(_tp + "sync_tempo", scene.tempoPercent + "," + scene.startSample + "," + scene.endSample, 500);
+        } else {
+            setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+        }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
     }
@@ -3490,7 +3513,11 @@ function pasteTrack(trackIdx) {
         setParamBlocking(_tp + "file_path", scene.path, 2000);
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
-        setParamBlocking(_tp + "tempo",     String(scene.tempoPercent), 500);
+        if (scene.syncMode) {
+            setParamBlocking(_tp + "sync_tempo", scene.tempoPercent + "," + scene.startSample + "," + scene.endSample, 500);
+        } else {
+            setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+        }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
         host_module_set_param(_tp + "muted", "0");
@@ -5400,7 +5427,7 @@ function handleCC(cc, value) {
                 bpm = estimatedBpm;
                 syncMode = true;
                 tempoPercent = Math.round(bpm / globalBpm * 100);
-                host_module_set_param("tempo", String(tempoPercent));
+                syncSyncModeToDs();
                 showStatus("BPM: " + bpm.toFixed(1), 90);
             }
             return;
@@ -6026,23 +6053,6 @@ function handleCC(cc, value) {
 
     /* E5 turn: gain (trim/loop) | threshold (slice auto) | Shift+E5: normalize */
     if (cc === CC_E5) {
-        if (currentView === VIEW_SYNC) {
-            var delta = decodeDelta(value);
-            if (delta === 0) return;
-            bpm += delta * (shiftHeld ? 0.1 : 1.0);
-            if (bpm < 20) bpm = 20;
-            if (bpm > 999) bpm = 999;
-            bpm = Math.round(bpm * 10) / 10;
-            /* Snap end marker so selection stays a multiple of one beat division */
-            var beatStep = getBeatStepSamples();
-            var beats = Math.max(1, Math.round((endSample - startSample) / beatStep));
-            endSample = startSample + beats * beatStep;
-            if (endSample > totalFrames) endSample = totalFrames;
-            syncMarkersToDs();
-            refreshWaveform();
-            showKnobStatus(4, "BPM:" + bpm.toFixed(1));
-            return;
-        }
         if (currentView === VIEW_SLICE && !lazyChopping) {
             var delta = decodeDelta(value);
             if (delta === 0) return;
@@ -6186,6 +6196,7 @@ function handleCC(cc, value) {
         /* BPM direct adjust in VIEW_SYNC — right = faster (higher BPM) */
         if (delta !== 0 && currentView === VIEW_SYNC) {
             var step = shiftHeld ? 0.1 : 1.0;
+            var oldBpm = bpm;
             bpm += delta * step;
             if (bpm < 20) bpm = 20;
             if (bpm > 999) bpm = 999;
@@ -6193,9 +6204,17 @@ function handleCC(cc, value) {
             tempoPercent = Math.round(bpm / globalBpm * 100);
             if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm * 0.3 * 10) / 10; }
             if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm * 3.0 * 10) / 10; }
-            host_module_set_param("tempo", String(tempoPercent));
-            syncMarkersToDs(); /* re-assert markers — DSP must not re-snap on tempo change */
-            showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)");
+            /* Rescale endSample so musical length stays constant:
+             * musicalLength (beats) = (endSample - startSample) / sampleRate * oldBpm / 60
+             * newEndSample = startSample + musicalLength * 60 / newBpm * sampleRate
+             *              = startSample + (endSample - startSample) * oldBpm / newBpm */
+            var oldLen = endSample - startSample;
+            endSample = startSample + Math.round(oldLen * oldBpm / bpm);
+            if (endSample > totalFrames) endSample = totalFrames;
+            if (endSample < startSample + 1) endSample = startSample + 1;
+            syncMarkersToDs();
+            syncSyncModeToDs();
+            showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " L:" + formatBarsBeats(endSample - startSample));
             return;
         }
         /* Tempo adjust in VIEW_FREE/VIEW_LOOP — right = faster */
@@ -6817,8 +6836,12 @@ globalThis.tick = function() {
                         ? _bts.scenes[_bts.playingSceneIdx] : null;
                     if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
                         var _tp = Math.round(_bsc.bpm / globalBpm * 100);
-                        var _tkey = (_bi === activeTrack) ? "tempo" : "t" + _bi + ":tempo";
-                        host_module_set_param(_tkey, String(_tp));
+                        if (_tp < 30) _tp = 30;
+                        if (_tp > 300) _tp = 300;
+                        var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
+                        var _ss = _bsc.startSample || 0;
+                        var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
+                        host_module_set_param(_stkey, _tp + "," + _ss + "," + _se);
                         if (_bi === activeTrack) tempoPercent = _tp;
                     }
                 }
@@ -6956,8 +6979,12 @@ globalThis.tick = function() {
                     pitchSemitones = _psr.pitchSemitones;
                 }
                 if (_psr.tempoPercent !== undefined) {
-                    setParamBlocking("tempo",     String(_psr.tempoPercent), 500);
                     tempoPercent = _psr.tempoPercent;
+                    if (syncMode) {
+                        setParamBlocking("sync_tempo", tempoPercent + "," + startSample + "," + endSample, 500);
+                    } else {
+                        setParamBlocking("tempo", String(tempoPercent), 500);
+                    }
                 }
                 if (_psr.loopEnabled !== undefined) {
                     setParamBlocking("play_loop", _psr.loopEnabled ? "1" : "0", 500);
