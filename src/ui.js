@@ -70,8 +70,6 @@ import {
     announce
 } from '/data/UserData/move-anything/shared/screen_reader.mjs';
 
-import { log as uniLog } from '/data/UserData/move-anything/shared/logger.mjs';
-function debugLog(msg) { uniLog("WaveEdit", msg); }
 
 /* ============ Constants ============ */
 
@@ -325,20 +323,15 @@ var bpm = 120.0;
 var globalBpm = 120;       /* project BPM from host, default 120 */
 var syncMode = false;      /* true when active scene/file uses BPM sync */
 var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
-var lastClockCount = -1;    /* samplerClockCount from previous tick (-1 = uninitialized) */
-
 /* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
 var injectQueue = [];
 var lastInjectTime = 0;
 var INJECT_INTERVAL_MS = 50;
-var lastClockFrame = 0;     /* tickFrame when clock last advanced */
 var tickFrame = 0;          /* increments each tick() call */
-var CLOCK_STALE_FRAMES = 4; /* ~130ms at 30fps — transport stopped if no clock change */
-var transportPlaying = false;      /* true if Move transport is running (clock-detected) */
-var lastTransportPlaying = false;  /* previous tick value — used to detect transitions */
-var clockTicksFromStart = 0;       /* ticks since transport started (bar tracking) */
-var PPQN = 24;                     /* MIDI clock pulses per quarter note */
-var TICKS_PER_BAR = PPQN * 4;     /* 96 ticks = one 4/4 bar */
+var transportPlaying = false;         /* true if Move transport is running (overlay transportPlaying) */
+var lastTransportPlaying = false;     /* previous tick value — used to detect transitions */
+var transportPlayingTimestamp = 0;    /* Date.now() when transport last started */
+var lastBarCount = 0;                 /* bar count at last tick — for time-based bar crossing detection */
 var beatDivIndex = 5;  /* default: 1/4 (index 5 in expanded array) */
 var beatDivPopupOpen = false;  /* true while Shift+E1/E2 popup is showing in SYNC view */
 var BEAT_DIVISIONS       = [0.125, 0.25, 0.5, 1,     2,     4,     8,     16,     32,     64];
@@ -454,7 +447,7 @@ function makeSceneState(path) {
 /* Quantized scene switching */
 var pendingSceneSwitch      = -1;
 var pendingSceneSwitchTrack = -1;
-var lastBarBoundaryPos      = 0;
+var lastBarCount            = 0;  /* bar count at last tick — for clock-based bar crossing detection */
 
 /* Scene pad flash counter */
 var sceneFlashCounter = 0;
@@ -606,7 +599,7 @@ function restoreSceneToGlobals(scene) {
     beatDivIndex = scene.beatDivIndex;
     syncMode = scene.syncMode || false;
     /* SYNC scenes: recalculate tempoPercent from current globalBpm so it stays accurate */
-    tempoPercent = syncMode ? Math.round(bpm / globalBpm * 100) : scene.tempoPercent;
+    tempoPercent = syncMode ? Math.round(globalBpm / bpm * 100) : scene.tempoPercent;
     loopEnabled = scene.loopEnabled;
     sliceMode = scene.sliceMode;
     sliceCount = scene.sliceCount;
@@ -1672,7 +1665,7 @@ function detectBpmFromFilename() {
     }
     bpm = Math.round(detectedBpm * 10) / 10;
     syncMode = true;
-    tempoPercent = Math.round(bpm / globalBpm * 100);
+    tempoPercent = Math.round(globalBpm / bpm * 100);
     var snapped = snapLengthFloor(endSample - startSample);
     endSample = startSample + Math.max(1, snapped);
     if (endSample > totalFrames) endSample = totalFrames;
@@ -1877,7 +1870,7 @@ function refreshWaveform() {
  * mode the normal set_param is fire-and-forget and rapid writes can overwrite
  * each other in the single shared-memory IPC slot.
  */
-function loadFileIntoEditor(filePath) {
+function loadFileIntoEditor(filePath, loadEditMode) {
     setParamBlocking("file_path", filePath, 2000);
     host_module_set_param("dirty", "1");
     /* Reset pitch/tempo on new file, enable loop by default */
@@ -1887,11 +1880,17 @@ function loadFileIntoEditor(filePath) {
     host_module_set_param("play_loop", "1");
     refreshFileInfo();
     waveformDirty = true;
-    /* In SYNC mode: auto-detect BPM from filename; fall back to globalBpm */
-    if (currentView === VIEW_SYNC && !detectBpmFromFilename()) {
-        bpm = globalBpm;
-        tempoPercent = 100;
-        host_module_set_param("tempo", "100");
+    /* Auto-detect BPM from filename when SYNC editMode is active.
+     * detectBpmFromFilename() sets syncMode=true and tempoPercent on success.
+     * Falls back to globalBpm if no BPM found in filename. */
+    var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
+    if (_targetMode === VIEW_SYNC) {
+        if (!detectBpmFromFilename()) {
+            bpm = globalBpm;
+            tempoPercent = 100;
+            host_module_set_param("tempo", "100");
+        }
+        switchView(VIEW_SYNC);
     }
     refreshWaveform();
     refreshState();
@@ -3245,7 +3244,6 @@ function applySceneLaunch(trackIdx, sceneIdx) {
     saveSceneState(trackIdx);
     updateTrackLEDs();
     showStatus("Scene " + (sceneIdx + 1), 30);
-    lastBarBoundaryPos = playPos;
 }
 
 /**
@@ -3271,15 +3269,14 @@ function launchScene(trackIdx, sceneIdx) {
     for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
         if (trackStates[_lsi].playing) { anyPlaying = true; break; }
     }
-
-    if (syncOn && anyPlaying) {
+    if (syncOn && anyPlaying && transportPlaying) {
         if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
             /* Already cued — force immediate */
             pendingSceneSwitch      = -1;
             pendingSceneSwitchTrack = -1;
             applySceneLaunch(trackIdx, sceneIdx);
         } else {
-            /* Queue for next bar boundary */
+            /* Queue for next bar boundary (MIDI clock) */
             pendingSceneSwitch      = sceneIdx;
             pendingSceneSwitchTrack = trackIdx;
             showStatus("Cue S" + (sceneIdx + 1), 30);
@@ -5429,7 +5426,7 @@ function handleCC(cc, value) {
                 }
                 bpm = estimatedBpm;
                 syncMode = true;
-                tempoPercent = Math.round(bpm / globalBpm * 100);
+                tempoPercent = Math.round(globalBpm / bpm * 100);
                 syncSyncModeToDs();
                 showStatus("BPM: " + bpm.toFixed(1), 90);
             }
@@ -5862,9 +5859,10 @@ function handleCC(cc, value) {
                         saveSceneState(activeTrack);
                         saveProjectJson();
                         openFileBrowserState = null;
+                        var _prevEditMode = editMode;
                         switchView(VIEW_FREE);
                         /* Use blocking load so file_info is valid immediately */
-                        loadFileIntoEditor(result.value);
+                        loadFileIntoEditor(result.value, _prevEditMode);
                         announce("Loaded " + fileName);
                     }
                 }
@@ -6204,9 +6202,9 @@ function handleCC(cc, value) {
             if (bpm < 20) bpm = 20;
             if (bpm > 999) bpm = 999;
             bpm = Math.round(bpm * 10) / 10;
-            tempoPercent = Math.round(bpm / globalBpm * 100);
-            if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm * 0.3 * 10) / 10; }
-            if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm * 3.0 * 10) / 10; }
+            tempoPercent = Math.round(globalBpm / bpm * 100);
+            if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm / 0.3 * 10) / 10; }
+            if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm / 3.0 * 10) / 10; }
             /* Rescale endSample so musical length stays constant:
              * musicalLength (beats) = (endSample - startSample) / sampleRate * oldBpm / 60
              * newEndSample = startSample + musicalLength * 60 / newBpm * sampleRate
@@ -6810,26 +6808,35 @@ globalThis.tick = function() {
 
     /* Read overlay state once per tick: transport detection via clock + BPM push */
     tickFrame++;
+    var _barCrossed = false;
     if (typeof shadow_get_overlay_state === "function") {
         var _ov = shadow_get_overlay_state();
         if (_ov) {
-            /* Transport detection: clock ticking = transport running */
-            var _cc = _ov.samplerClockCount | 0;
-            if (lastClockCount === -1) lastClockCount = _cc;
-            if (_cc !== lastClockCount) {
-                var _delta = (_cc - lastClockCount + 0x100000000) >>> 0;
-                clockTicksFromStart += _delta;
-                lastClockCount = _cc;
-                lastClockFrame = tickFrame;
-                transportPlaying = true;
-            } else if (tickFrame - lastClockFrame > CLOCK_STALE_FRAMES) {
-                transportPlaying = false;
+            /* Transport detection via overlay (set by shim on 0xFA/0xFC) */
+            var _ovTransport = _ov.transportPlaying ? true : false;
+            if (_ovTransport !== transportPlaying) {
+                transportPlaying = _ovTransport;
+                /* Reset bar clock immediately so bar detection uses correct origin */
+                if (transportPlaying) {
+                    transportPlayingTimestamp = Date.now();
+                    lastBarCount = 0;
+                }
+            }
+            /* Bar-crossing detection: time-based using Date.now() + globalBpm */
+            if (transportPlaying) {
+                var _barDurationMs = 4 * 60000 / globalBpm;  /* one 4/4 bar in ms */
+                var _elapsed = Date.now() - transportPlayingTimestamp;
+                var _curBar = (_barDurationMs > 0) ? Math.floor(_elapsed / _barDurationMs) : 0;
+                if (_curBar > lastBarCount) {
+                    _barCrossed = true;
+                    lastBarCount = _curBar;
+                }
             }
             /* React to transport start/stop transitions */
             if (transportPlaying !== lastTransportPlaying) {
                 lastTransportPlaying = transportPlaying;
                 if (transportPlaying) {
-                    clockTicksFromStart = 0;
+                    /* transportPlayingTimestamp and lastBarCount already reset above */
                     host_module_set_param("play_all", "1");
                     for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
                         if (trackStates[_ti].loaded) trackStates[_ti].playing = true;
@@ -6859,7 +6866,7 @@ globalThis.tick = function() {
                     var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
                         ? _bts.scenes[_bts.playingSceneIdx] : null;
                     if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
-                        var _tp = Math.round(_bsc.bpm / globalBpm * 100);
+                        var _tp = Math.round(globalBpm / _bsc.bpm * 100);
                         if (_tp < 30) _tp = 30;
                         if (_tp > 300) _tp = 300;
                         var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
@@ -6931,18 +6938,12 @@ globalThis.tick = function() {
         }
     }
 
-    /* Quantized scene switching — check bar boundary */
-    if (pendingSceneSwitch >= 0) {
-        var _barF = Math.round(44100 * 4 * 60 / bpm);
-        if (_barF > 0) {
-            var _barsPassed = Math.floor((playPos - lastBarBoundaryPos) / _barF);
-            if (_barsPassed >= 1) {
-                lastBarBoundaryPos += _barsPassed * _barF;
-                applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
-                pendingSceneSwitch = -1;
-                pendingSceneSwitchTrack = -1;
-            }
-        }
+    /* Quantized scene switching — fire on MIDI-clock bar boundary.
+     * If transport is not running, fire immediately to avoid infinite hang. */
+    if (pendingSceneSwitch >= 0 && (_barCrossed || !transportPlaying)) {
+        applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
+        pendingSceneSwitch = -1;
+        pendingSceneSwitchTrack = -1;
     }
 
     /* Flush queued play/stop command — issued here in tick() so it's the
