@@ -1,6 +1,6 @@
-# CLAUDE.md — Wave Edit Module
+# CLAUDE.md — Mangle Module
 
-External tool module for Move Everything. 4-track audio editor with jamming, gate/trigger, and clock sync.
+External tool module for Move Everything. 4-track sampler with varispeed, slicing, gate/trigger/oneshot, and quantized scene launch.
 
 ## Module Structure
 

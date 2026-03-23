@@ -1,10 +1,10 @@
 #!/bin/bash
-# Install Wave Edit module to Move
+# Install Mangle module to Move
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-MODULE_ID="waveform-editor"
+MODULE_ID="mangle"
 
 cd "$REPO_ROOT"
 
@@ -13,7 +13,7 @@ if [ ! -d "dist/$MODULE_ID" ]; then
     exit 1
 fi
 
-echo "=== Installing Wave Edit Module ==="
+echo "=== Installing Mangle Module ==="
 
 # Deploy to Move - tools subdirectory
 echo "Copying module to Move..."

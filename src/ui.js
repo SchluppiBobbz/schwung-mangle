@@ -1,5 +1,5 @@
 /*
- * Wave Edit UI
+ * Mangle UI
  *
  * Trim, gain adjust, normalize, and edit audio files on the Move.
  * 128x64 1-bit monochrome display, QuickJS runtime.
@@ -365,7 +365,7 @@ var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Scratch file — all recordings go here, user "Save As" to keep */
 var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Move Everything/Recordings";
-var SCRATCH_PATH = SCRATCH_DIR + "/.wave-edit-scratch.wav";
+var SCRATCH_PATH = SCRATCH_DIR + "/.mangle-scratch.wav";
 var SAVE_DIR = SCRATCH_DIR;  /* default destination for saved files */
 
 /* Record state */
@@ -6764,7 +6764,7 @@ function doReconnectRestore() {
 
         var timeStr = Math.floor(elapsedSec / 60) + ":" +
             (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
-        announce("Wave Edit, recording in progress, " + timeStr);
+        announce("Mangle,recording in progress, " + timeStr);
     } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
         /* DSP is paused — restore paused state */
         recordState = "paused";
@@ -6794,7 +6794,7 @@ function doReconnectRestore() {
         }
         recordWriteHead = recordWaveform.length;
 
-        announce("Wave Edit, recording paused");
+        announce("Mangle,recording paused");
     } else if (openedFilePath && totalFrames === 0) {
         /* File path set but no audio data — restore record-ready state */
         recordBrowserDir = SCRATCH_DIR;
@@ -6810,11 +6810,11 @@ function doReconnectRestore() {
         selectedField = 0;
         selectSlice(selectedSlice);
         syncMarkersToDs();
-        announce("Wave Edit, slice mode, " + sliceCount + " slices");
+        announce("Mangle,slice mode, " + sliceCount + " slices");
     } else {
         currentView = VIEW_FREE;
         selectedField = 0;
-        announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+        announce("Mangle," + (fileName || "no file") + ", " + formatTime(totalFrames));
     }
     /* Seed a default scene if none were restored and a file is loaded */
     if (!stillRecording && totalFrames > 0) {
@@ -6895,7 +6895,7 @@ globalThis.init = function() {
             if (totalFrames === 0) {
                 announce("New Recording, press REC to record");
             } else {
-                announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+                announce("Mangle," + (fileName || "no file") + ", " + formatTime(totalFrames));
             }
         }
     }

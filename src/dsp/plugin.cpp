@@ -193,7 +193,7 @@ static const host_api_v1_t *g_host = NULL;
 static void plugin_log(const char *msg) {
     if (g_host && g_host->log) {
         char buf[512];
-        snprintf(buf, sizeof(buf), "[waveform-editor] %s", msg);
+        snprintf(buf, sizeof(buf), "[mangle] %s", msg);
         g_host->log(buf);
     }
 }

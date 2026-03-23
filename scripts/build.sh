@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Wave Edit module for Move Anything (ARM64)
+# Build Mangle module for Move Anything (ARM64)
 #
 # Cross-compiles Bungee + DSP plugin and packages all files for release.
 # Set CROSS_PREFIX to skip Docker (e.g., for native ARM builds).
@@ -7,12 +7,12 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-MODULE_ID="waveform-editor"
-IMAGE_NAME="move-anything-waveform-editor-builder"
+MODULE_ID="mangle"
+IMAGE_NAME="move-anything-mangle-builder"
 
 # Check if we need Docker
 if [ -z "$CROSS_PREFIX" ] && [ ! -f "/.dockerenv" ]; then
-    echo "=== Wave Edit Module Build (via Docker) ==="
+    echo "=== Mangle Module Build (via Docker) ==="
     echo ""
 
     # Build Docker image if needed
@@ -41,7 +41,7 @@ CROSS_PREFIX="${CROSS_PREFIX:-aarch64-linux-gnu-}"
 
 cd "$REPO_ROOT"
 
-echo "=== Building Wave Edit Module ==="
+echo "=== Building Mangle Module ==="
 echo "Cross prefix: $CROSS_PREFIX"
 
 # Create build directories
