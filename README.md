@@ -143,6 +143,7 @@ Pad mode is saved **per scene**.
 ## Credits
 
 - **Schwung framework**: [Charles Vestal](https://github.com/charlesvestal/schwung)
+- Based on [Wave Edit](https://github.com/charlesvestal/move-anything-waveform-editor) by Charles Vestal
 
 ## License
 
