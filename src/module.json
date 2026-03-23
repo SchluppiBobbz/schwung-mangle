@@ -1,16 +1,15 @@
 {
-    "id": "waveform-editor",
-    "name": "Wave Edit",
+    "id": "mangle",
+    "name": "Mangle",
     "version": "0.5.0",
-    "description": "Trim, gain adjust, and edit audio files on the Move",
+    "description": "4-track sampler with varispeed, slicing, gate/trigger/oneshot, and quantized scene launch",
     "author": "Move Anything",
     "dsp": "dsp.so",
     "api_version": 2,
     "component_type": "tool",
     "tool_config": {
         "interactive": true,
-        "command": null,
-        "input_extensions": [".wav"],
-        "allow_new_file": true
+        "skip_file_browser": true,
+        "command": null
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Wave Edit UI
+ * Mangle UI
  *
  * Trim, gain adjust, normalize, and edit audio files on the Move.
  * 128x64 1-bit monochrome display, QuickJS runtime.
@@ -14,24 +14,28 @@
  * count. decodeDelta() returns the signed count for proportional response.
  *
  * Controls:
- *   Jog wheel    - Move selected marker  |  Menu: navigate
- *   Jog click    - Toggle start/end field |  Menu: select item
- *   E1 (Knob 1)  - Move start marker
- *   E2 (Knob 2)  - Move end marker
- *   E3 (Knob 3)  - Zoom in/out  |  Shift: vertical scale (1x-32x)
- *   E4 (Knob 4)  - Adjust gain  |  Shift: normalize (confirm overlay)
- *   Any pad      - Hold to audition selection, release to stop
- *   Mute         - Mute (zero out) selection
- *   Copy         - Copy selection to clipboard
- *   Shift+Copy   - Paste clipboard at cursor (insert)
- *   Delete       - Cut selection to clipboard (copy + remove)
- *   Shift+Capture- Export selection to new file
- *   Capture      - Save (overwrite confirmation)
- *   Undo         - Undo last destructive operation
- *   Loop         - Toggle loop mode
- *   Left/Right   - Nudge selection by one coarse step
- *   Shift+L/R    - Jump selection by one selection length
- *   Back         - Navigate back / exit
+ *   Jog wheel     - Scroll view (zoomed, clamped to file bounds)  |  Menu: navigate
+ *   Jog click     - Edit menu (Copy/Cut/Truncate/Normalize/BPM Step)  |  Shift: Paste/Export menu  |  other views: select item
+ *   E1 (Knob 1)   - Move start marker
+ *   E2 (Knob 2)   - Move end marker
+ *   E3 (Knob 3)   - Zoom in/out  |  Shift: vertical scale (1x-32x)
+ *   E4 (Knob 4)   - Adjust gain  |  Shift: normalize (confirm overlay)
+ *   Any pad       - Gate: hold to audition, release to stop  |  Trigger: press to toggle play/stop
+ *   Mute          - Mute (zero out) selection (all views)
+ *   Copy          - Copy selection  |  Slice: copy selected slice
+ *   Shift+Copy    - Paste at cursor (insert)  |  Slice: paste insert before selected slice
+ *   Remove        - Cut selection (copy + remove)  |  Slice: cut selected slice
+ *   Shift+L/R     - Jump selection by one length  |  Slice: move selected slice left/right
+ *   Down          - (BPM) Read BPM from filename
+ *   Up            - (BPM) Estimate BPM from selection length
+ *   Step 15       - Set start marker at playback position (Trim/BPM)
+ *   Step 16       - Set end marker at playback position (Trim/BPM)
+ *   Shift+Capture - Finalize scene: truncate to markers, save in project folder
+ *   Capture       - Save (overwrite confirmation)
+ *   Undo          - Undo last destructive operation
+ *   Loop          - Toggle loop mode
+ *   Left/Right    - Nudge selection by one coarse step  |  Slice: select prev/next slice
+ *   Back          - Navigate back / exit
  */
 
 import * as os from 'os';
@@ -39,14 +43,16 @@ import * as os from 'os';
 /* Shared utilities - absolute path for module location independence */
 import {
     MidiNoteOn, MidiCC,
-    MoveShift, MoveMainKnob, MoveMainButton, MoveBack,
+    MoveShift, MoveMainKnob, MoveMainButton, MoveBack, MoveMenu,
     MoveCapture, MoveRec, MoveSample, MoveUndo, MoveLoop, MoveCopy, MoveMute, MoveDelete,
     MoveLeft, MoveRight, MoveDown, MoveUp,
     MovePads,
-    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob7, MoveKnob8,
-    MoveKnob5Touch, MoveKnob7Touch, MoveKnob8Touch,
-    White, Black, DarkGrey, LightGrey, BrightRed, DeepRed,
-    WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright
+    MoveStep1,
+    MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob6, MoveKnob7, MoveKnob8,
+    MoveKnob5Touch, MoveKnob6Touch, MoveKnob7Touch, MoveKnob8Touch,
+    White, Black, DarkGrey, BrightRed, DeepRed, OrangeRed, BrightGreen, VividYellow, Blue,
+    WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright,
+    PaleGreen, Bright
 } from '/data/UserData/move-anything/shared/constants.mjs';
 
 import {
@@ -64,20 +70,128 @@ import {
     announce
 } from '/data/UserData/move-anything/shared/screen_reader.mjs';
 
-import { log as uniLog } from '/data/UserData/move-anything/shared/logger.mjs';
-function debugLog(msg) { uniLog("WaveEdit", msg); }
 
 /* ============ Constants ============ */
 
 /* Views */
 var VIEW_MODE_MENU = 1;
-var VIEW_TRIM = 2;
+var VIEW_FREE = 2;
 var VIEW_CONFIRM_EXIT = 4;
 var VIEW_CONFIRM_NORMALIZE = 5;
 var VIEW_LOOP = 6;
 var VIEW_CONFIRM_SAVE = 7;
 var VIEW_OPEN_FILE = 8;
 var VIEW_SLICE = 9;
+var VIEW_JOG_MENU = 10;
+var VIEW_JOG_SHIFT_MENU = 11;
+var VIEW_SYNC = 12;
+var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
+var VIEW_MAIN_MENU = 14; /* MoveMenu button — main project menu */
+var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) */
+var VIEW_CONFIRM_RESUME = 16; /* Resume previous session or start new project */
+
+/* ============ Debug Logging ============ */
+/* Set to true to enable debug logging to /tmp/scene_debug.log on device.
+ * IMPORTANT: each dbg() call uses host_module_set_param which consumes a
+ * slot in the host's limited param queue. Keep disabled in production to
+ * avoid starving critical set_param calls (e.g. file_path). */
+var _dbgEnabled = false;
+var _dbgSeq = 0;
+/**
+ * Send a param to the DSP using blocking call if available, otherwise
+ * fire-and-forget. Centralizes the typeof check that is repeated throughout.
+ */
+function setParamBlocking(key, value, timeoutMs) {
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking(key, value, timeoutMs || 2000);
+    } else {
+        host_module_set_param(key, value);
+    }
+}
+
+/**
+ * Send a param to the DSP using blocking call if available, otherwise
+ * fire-and-forget with a get_param("dirty") sync barrier to ensure the DSP
+ * processes the command before continuing.
+ */
+function setParamBlockingWithBarrier(key, value, timeoutMs) {
+    if (typeof host_module_set_param_blocking === "function") {
+        host_module_set_param_blocking(key, value, timeoutMs || 5000);
+    } else {
+        host_module_set_param(key, value);
+        host_module_get_param("dirty"); /* sync barrier */
+    }
+}
+
+/**
+ * Queue a CC inject to Move global transport (press + release as two packets).
+ * drainInjectQueue() must be called each tick().
+ */
+function queuePlayToggle() {
+    injectQueue.push([0x0B, 0xB0, CC_PLAY, 127]);
+    injectQueue.push([0x0B, 0xB0, CC_PLAY, 0]);
+}
+
+function drainInjectQueue() {
+    if (injectQueue.length === 0) return;
+    if (typeof move_midi_inject_to_move !== "function") return;
+    var now = Date.now();
+    if ((now - lastInjectTime) >= INJECT_INTERVAL_MS) {
+        var pkt = injectQueue.shift();
+        move_midi_inject_to_move(pkt);
+        lastInjectTime = now;
+    }
+}
+
+/**
+ * Trigger a file load in the DSP.  For the active track uses blocking
+ * unprefixed "file_path" (same as the file browser — the host ignores
+ * non-blocking set_param for file_path).  For non-active tracks uses
+ * prefixed "tN:file_path".
+ */
+function sceneLoadFile(trackIdx, path) {
+    var key = (trackIdx === activeTrack) ? "file_path" : "t" + trackIdx + ":file_path";
+    setParamBlocking(key, path, 2000);
+}
+
+/**
+ * Scene field names that are copied between scene objects, track states,
+ * and globals. Used to eliminate repetitive field-by-field assignments.
+ * Array fields (sliceBoundaries, slicePitches, sliceTempos) require .slice()
+ * when copying to avoid shared mutation.
+ */
+var SCENE_FIELDS = [
+    "startSample", "endSample", "gainDb", "pitchSemitones", "tempoPercent",
+    "bpm", "beatDivIndex", "syncMode", "loopEnabled", "gateMode",
+    "sliceMode", "sliceCount", "sliceBoundaries", "selectedSlice",
+    "slicePadOffset", "sliceRegionStart", "sliceRegionEnd", "sliceThreshold",
+    "slicePitches", "sliceTempos", "lazySub",
+    "zoomLevel", "zoomCenter", "vScale"
+];
+var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true };
+
+/**
+ * Copy scene-related fields from src object to dst object.
+ * Array fields are copied with .slice() to prevent shared mutation.
+ */
+function copySceneFields(src, dst) {
+    for (var i = 0; i < SCENE_FIELDS.length; i++) {
+        var f = SCENE_FIELDS[i];
+        var val = src[f];
+        dst[f] = SCENE_ARRAY_FIELDS[f] ? (val || []).slice() : val;
+    }
+}
+function dbg(msg) {
+    if (!_dbgEnabled) return;
+    _dbgSeq++;
+    host_module_set_param("debug_log", _dbgSeq + " " + msg);
+}
+
+/* Skipback / scenes constants */
+var MAX_SCENES = 8;
+var SKIPBACK_BARS_OPTIONS = [1, 2, 4, 8];
+var SKIPBACK_SOURCE_ACT = 0;   /* active track ring buffer */
+var SKIPBACK_SOURCE_MIX = 1;   /* master mix ring buffer */
 
 /* MIDI CCs — use shared constants */
 var CC_JOG = MoveMainKnob;
@@ -87,26 +201,31 @@ var CC_E2 = MoveKnob2;
 var CC_E3 = MoveKnob3;
 var CC_E4 = MoveKnob4;
 var CC_E5 = MoveKnob5;
+var CC_E6 = MoveKnob6;
 var CC_E7 = MoveKnob7;
 var CC_E8 = MoveKnob8;
 var CC_SHIFT = MoveShift;
 var CC_BACK = MoveBack;
 var CC_MUTE = MoveMute;
 var CC_DELETE = MoveDelete;
+var CC_CAPTURE = MoveCapture;
 var CC_COPY = MoveCopy;
 var CC_UNDO = MoveUndo;
 var CC_LOOP = MoveLoop;
-var CC_CAPTURE = MoveCapture;
 var CC_LEFT = MoveLeft;
 var CC_RIGHT = MoveRight;
 var CC_DOWN = MoveDown;
 var CC_UP = MoveUp;
 var CC_SAMPLE = MoveSample;
+var CC_MENU = MoveMenu;
 var CC_REC = MoveRec;
 
 /* Pad note range */
 var PAD_NOTE_MIN = MovePads[0];
 var PAD_NOTE_MAX = MovePads[MovePads.length - 1];
+
+/* Step button base note */
+var STEP_BASE = MoveStep1; /* Steps 1–16 = notes 16–31 */
 
 /* Display geometry */
 var SCREEN_W = 128;
@@ -132,11 +251,21 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 
 /* ============ State ============ */
 
-var currentView = VIEW_TRIM;
+var currentView = VIEW_FREE;
+var editMode = VIEW_SYNC;       /* last FREE/SYNC mode selected; default SYNC */
+/* Sub-mode within SYNC: false=stretch (Bungee, pitch-stable), true=varispeed (repitch) */
+var varispeedEnabled = false;
 var shiftHeld = false;
+var deleteHeld = false;
+var deletePendingCut = false;
+var muteHeld = false;
+var mutePendingAction = false;
+var copyHeld = false;
+var copyPendingAction = false;
+var sceneClipboard = null;   /* copied scene data */
+var trackClipboard = null;   /* copied track data */
 
 /* Twist-action knob state (touch + twist right = execute, twist left = cancel) */
-var pendingTwistAction = null; /* { cc, action, prompt } or null */
 
 /* File info */
 var fileName = "";
@@ -169,6 +298,10 @@ var activePadNote = -1; /* Which pad note owns current playback */
 var gainDb = 0.0;
 var peakDb = -100.0;
 
+/* Pitch/tempo state */
+var pitchSemitones = 0.0;   /* -12.0 to +12.0 */
+var tempoPercent = 100;     /* 50 to 200 */
+
 /* Waveform cache — only re-fetch when visible range changes */
 var waveformData = null; /* Array of [min, max] pairs, length 128 */
 var cachedVisStart = -1;
@@ -187,10 +320,30 @@ var cachedSeamHalf = -1;
 /* Loop view selected field: 0=start (loop point), 1=end */
 var loopSelectedField = 0;
 
+/* BPM state */
+var bpm = 120.0;
+var globalBpm = 120;       /* project BPM from host, default 120 */
+var syncMode = false;      /* true when active scene/file uses BPM sync */
+var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
+/* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
+var injectQueue = [];
+var lastInjectTime = 0;
+var INJECT_INTERVAL_MS = 50;
+var tickFrame = 0;          /* increments each tick() call */
+var transportPlaying = false;         /* true if Move transport is running (overlay transportPlaying) */
+var lastTransportPlaying = false;     /* previous tick value — used to detect transitions */
+var transportPlayingTimestamp = 0;    /* Date.now() when transport last started */
+var lastBarCount = 0;                 /* bar count at last tick — for time-based bar crossing detection */
+var beatDivIndex = 5;  /* default: 1/4 (index 5 in expanded array) */
+var beatDivPopupOpen = false;  /* true while Shift+E1/E2 popup is showing in SYNC view */
+var BEAT_DIVISIONS       = [0.125, 0.25, 0.5, 1,     2,     4,     8,     16,     32,     64];
+var BEAT_DIVISION_LABELS = ["8bar","4bar","2bar","1bar","1/2","1/4","1/8","1/16","1/32","1/64"];
+
 /* Slice state */
 var SLICE_MODE_EVEN = 0;
 var SLICE_MODE_AUTO = 1;
 var SLICE_MODE_LAZY = 2;
+var SLICE_MODE_BPM = 3;
 var sliceMode = SLICE_MODE_EVEN;
 
 /* Lazy chop sub-modes */
@@ -204,13 +357,15 @@ var sliceBoundaries = [];
 var selectedSlice = 0;
 var sliceRegionStart = 0;
 var sliceRegionEnd = 0;
+var slicePitches = [];  /* per-slice pitch offset in semitones (index = slice index) */
+var sliceTempos = [];   /* per-slice tempo percent 50-200 (index = slice index) */
 var sliceMenuIndex = 0;
 var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Scratch file — all recordings go here, user "Save As" to keep */
 var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Move Everything/Recordings";
-var SCRATCH_PATH = SCRATCH_DIR + "/.wave-edit-scratch.wav";
+var SCRATCH_PATH = SCRATCH_DIR + "/.mangle-scratch.wav";
 var SAVE_DIR = SCRATCH_DIR;  /* default destination for saved files */
 
 /* Record state */
@@ -231,6 +386,428 @@ var RECORD_SCROLL_X = Math.floor(SCREEN_W * 0.90); /* Write head sticks here onc
 var REX_MODULE_PATH = "/data/UserData/move-anything/modules/sound_generators/rex";
 var REX_ENCODE_BIN = REX_MODULE_PATH + "/rex-encode";
 var REX_LOOPS_DIR = REX_MODULE_PATH + "/loops";
+
+/* ============ Multi-Track State ============ */
+
+var NUM_TRACKS = 4;
+var activeTrack = 0;
+var pendingBrowserTrack = -1; /* Which track the file browser is loading for */
+
+/* MoveRow CCs (Track buttons) — MoveRow1=43, MoveRow2=42, MoveRow3=41, MoveRow4=40 */
+var TRACK_CCS = [43, 42, 41, 40];
+
+/* MovePlay CC */
+var CC_PLAY = 85;
+
+/* ============ Project / Skipback / Scene State ============ */
+
+var projectDir = "";          /* e.g. ".../Recordings/Project_20260315_1430" or "_no_project" */
+var projectBrowserState = null;
+var newProjectFileBrowser = false; /* true when file browser was opened after creating a new project */
+
+/* Skipback settings */
+var skipbackBarsIdx   = 1;    /* index into SKIPBACK_BARS_OPTIONS → 2 bars default */
+var skipbackSourceIdx = 0;    /* SKIPBACK_SOURCE_ACT or SKIPBACK_SOURCE_MIX */
+var skipbackPending   = false;
+var skipbackCaptureSeconds = 0;
+var skipbackTargetSlot = -1;  /* which scene slot the in-flight skipback will write to */
+
+var pendingSceneRestore = null;  /* scene settings to apply after file loads */
+
+/**
+ * Create a default scene state object for a new scene at the given path.
+ */
+function makeSceneState(path) {
+    return {
+        path:            path,
+        startSample:     0,
+        endSample:       0,       /* 0 = use full file length after load */
+        gainDb:          0.0,
+        pitchSemitones:  0.0,
+        tempoPercent:    100,
+        bpm:             bpm,
+        beatDivIndex:    beatDivIndex,
+        syncMode:        (currentView === VIEW_SYNC),
+        loopEnabled:     true,
+        gateMode:        PAD_MODE_TRIGGER,
+        sliceMode:       SLICE_MODE_EVEN,
+        sliceCount:      1,
+        sliceBoundaries: [],
+        selectedSlice:   0,
+        slicePadOffset:  0,
+        sliceRegionStart: 0,
+        sliceRegionEnd:  0,
+        sliceThreshold:  25.0,
+        slicePitches:    [],
+        sliceTempos:     [],
+        lazySub:         LAZY_SUB_CHOP,
+        zoomLevel:       0,
+        zoomCenter:      0,
+        vScale:          1.0
+    };
+}
+
+/* Quantized scene switching */
+var pendingSceneSwitch      = -1;
+var pendingSceneSwitchTrack = -1;
+var lastBarCount            = 0;  /* bar count at last tick — for clock-based bar crossing detection */
+
+/* Quantize modes for scene launch (S-4 inspired) */
+var PAD_MODE_TRIGGER = 0;  /* toggle play/stop */
+var PAD_MODE_GATE    = 1;  /* play while pad held */
+var PAD_MODE_ONESHOT = 2;  /* always restart from start on press; loop respects scene setting */
+
+var QUANT_FREE       = 0;  /* immediate */
+var QUANT_BEAT       = 1;  /* next 1/4-note beat */
+var QUANT_BAR        = 2;  /* next bar (4 beats) */
+var QUANT_2BAR       = 3;  /* next 2-bar boundary */
+var QUANT_4BAR       = 4;  /* next 4-bar boundary */
+var QUANT_SAMPLE_END = 5;  /* when current clip finishes its loop cycle */
+var QUANT_LABELS     = ["FREE", "BEAT", "1BAR", "2BAR", "4BAR", "S.END"];
+var quantizeMode     = QUANT_BAR;  /* default: quantize to next bar */
+var lastBeatCount    = 0;  /* beat count at last tick — for QUANT_BEAT detection */
+
+/* Scene pad flash counter */
+var sceneFlashCounter = 0;
+
+/* Track state array — each track stores its own copy of per-track UI state */
+var trackStates = [];
+
+function makeTrackState() {
+    return {
+        fileName: "", filePath: "", loaded: false,
+        startSample: 0, endSample: 0, totalFrames: 0,
+        zoomLevel: 0, zoomCenter: 0, vScale: 1.0,
+        playing: false, playPos: 0,
+        gainDb: 0.0, peakDb: -96,
+        gateMode: PAD_MODE_TRIGGER,
+        varispeedMode: false,  /* true = varispeed (repitch), false = stretch (Bungee) */
+        loopEnabled: false,
+        pitchSemitones: 0.0,
+        tempoPercent: 100,
+        fileDuration: 0, sampleRate: 44100,
+        selectedField: 0,
+        /* Slice state */
+        sliceMode: SLICE_MODE_EVEN, sliceCount: 1, sliceBoundaries: [],
+        selectedSlice: 0, slicePadOffset: 0,
+        sliceRegionStart: 0, sliceRegionEnd: 0,
+        sliceThreshold: 25.0, slicePitches: [], sliceTempos: [],
+        lazySub: LAZY_SUB_CHOP, lazyChopping: false,
+        /* Waveform cache */
+        waveformData: null, cachedVisStart: -1, cachedVisEnd: -1,
+        waveformDirty: true,
+        /* Seam waveform */
+        seamWaveformData: null, seamWaveformDirty: true,
+        cachedSeamStart: -1, cachedSeamEnd: -1, cachedSeamHalf: -1,
+        seamZoomLevel: 4,
+        /* Loop */
+        loopSelectedField: 0,
+        /* BPM */
+        bpm: 120.0, beatDivIndex: 5, syncMode: false,
+        /* Flags */
+        dirty: false, hasUndo: false, hasClipboard: false,
+        /* Misc */
+        pendingPlay: "", activePadNote: -1,
+        playLoop: false, playWhole: false,
+        isRecordedFile: false, openedFilePath: "",
+        /* Scenes */
+        scenes: [],           /* array of WAV paths */
+        selectedSceneIdx: 0,  /* armed pad — target for new content */
+        playingSceneIdx:  -1, /* currently playing scene (-1 = none) */
+        muted: false           /* non-destructive track mute */
+    };
+}
+
+for (var _ti = 0; _ti < NUM_TRACKS; _ti++) trackStates.push(makeTrackState());
+
+/**
+ * Save current global UI state into trackStates[idx].
+ */
+function saveTrackUIState(idx) {
+    var ts = trackStates[idx];
+    ts.fileName = fileName;
+    ts.filePath = openedFilePath;
+    ts.loaded = (totalFrames > 0);
+    ts.startSample = startSample;
+    ts.endSample = endSample;
+    ts.totalFrames = totalFrames;
+    ts.zoomLevel = zoomLevel;
+    ts.zoomCenter = zoomCenter;
+    ts.vScale = vScale;
+    ts.playing = playing;
+    ts.playPos = playPos;
+    ts.gainDb = gainDb;
+    ts.peakDb = peakDb;
+    ts.loopEnabled = loopEnabled;
+    ts.varispeedMode = varispeedEnabled;
+    ts.pitchSemitones = pitchSemitones;
+    ts.tempoPercent = tempoPercent;
+    ts.fileDuration = fileDuration;
+    ts.sampleRate = sampleRate;
+    ts.selectedField = selectedField;
+    /* Slice */
+    ts.sliceMode = sliceMode;
+    ts.sliceCount = sliceCount;
+    ts.sliceBoundaries = sliceBoundaries.slice();
+    ts.selectedSlice = selectedSlice;
+    ts.slicePadOffset = slicePadOffset;
+    ts.sliceRegionStart = sliceRegionStart;
+    ts.sliceRegionEnd = sliceRegionEnd;
+    ts.sliceThreshold = sliceThreshold;
+    ts.slicePitches = slicePitches.slice();
+    ts.sliceTempos = sliceTempos.slice();
+    ts.lazySub = lazySub;
+    ts.lazyChopping = lazyChopping;
+    /* Waveform */
+    ts.waveformData = waveformData;
+    ts.cachedVisStart = cachedVisStart;
+    ts.cachedVisEnd = cachedVisEnd;
+    ts.waveformDirty = waveformDirty;
+    /* Seam */
+    ts.seamWaveformData = seamWaveformData;
+    ts.seamWaveformDirty = seamWaveformDirty;
+    ts.cachedSeamStart = cachedSeamStart;
+    ts.cachedSeamEnd = cachedSeamEnd;
+    ts.cachedSeamHalf = cachedSeamHalf;
+    ts.seamZoomLevel = seamZoomLevel;
+    /* Loop */
+    ts.loopSelectedField = loopSelectedField;
+    /* BPM */
+    ts.bpm = bpm;
+    ts.beatDivIndex = beatDivIndex;
+    ts.syncMode = syncMode;
+    /* Flags */
+    ts.dirty = dirty;
+    ts.hasUndo = hasUndo;
+    ts.hasClipboard = hasClipboard;
+    /* Misc */
+    ts.pendingPlay = pendingPlay;
+    ts.activePadNote = activePadNote;
+    ts.isRecordedFile = isRecordedFile;
+    ts.openedFilePath = openedFilePath;
+    /* Scenes — not proxied into globals, stored only in trackStates */
+}
+
+/**
+ * Save current editor globals back into the scene object for trackIdx's
+ * currently playing scene.  Call before switching to a new scene.
+ * For the active track the globals ARE the live state; for an inactive
+ * track we pull from the trackState struct instead.
+ */
+function saveCurrentSceneState(trackIdx) {
+    var ts = trackStates[trackIdx];
+    var idx = ts.playingSceneIdx;
+    if (idx < 0 || idx >= ts.scenes.length) return;
+    var sc = ts.scenes[idx];
+    /* For the active track, globals ARE the live state; for inactive tracks
+     * we pull from the trackState struct instead. */
+    var src = (trackIdx === activeTrack) ? getGlobalsAsSceneSource() : ts;
+    dbg("saveSceneState t" + trackIdx + " s" + idx + " start=" + src.startSample + " end=" + src.endSample + " path=" + sc.path);
+    copySceneFields(src, sc);
+}
+
+/**
+ * Restore scene fields into the corresponding global variables.
+ * Inverse of getGlobalsAsSceneSource — used when loading a scene on the active track.
+ */
+function restoreSceneToGlobals(scene) {
+    startSample = scene.startSample;
+    endSample = scene.endSample;
+    gainDb = scene.gainDb;
+    pitchSemitones = scene.pitchSemitones;
+    bpm = scene.bpm;
+    beatDivIndex = scene.beatDivIndex;
+    syncMode = scene.syncMode || false;
+    /* SYNC scenes: recalculate tempoPercent from current globalBpm so it stays accurate */
+    tempoPercent = syncMode ? Math.round(globalBpm / bpm * 100) : scene.tempoPercent;
+    loopEnabled = scene.loopEnabled;
+    var _sgm = (scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER;
+    trackStates[activeTrack].gateMode = _sgm;
+    host_module_set_param("gate_mode", String(_sgm));
+    sliceMode = scene.sliceMode;
+    sliceCount = scene.sliceCount;
+    sliceBoundaries = (scene.sliceBoundaries || []).slice();
+    selectedSlice = scene.selectedSlice;
+    slicePadOffset = scene.slicePadOffset;
+    sliceRegionStart = scene.sliceRegionStart;
+    sliceRegionEnd = scene.sliceRegionEnd;
+    sliceThreshold = scene.sliceThreshold;
+    slicePitches = (scene.slicePitches || []).slice();
+    sliceTempos = (scene.sliceTempos || []).slice();
+    lazySub = scene.lazySub;
+    zoomLevel = scene.zoomLevel;
+    zoomCenter = scene.zoomCenter;
+    vScale = scene.vScale;
+}
+
+/**
+ * Build a temporary object from current globals for use as a copySceneFields source.
+ * This avoids the active/inactive branch duplication in scene save/restore functions.
+ */
+function getGlobalsAsSceneSource() {
+    return {
+        startSample: startSample, endSample: endSample,
+        gainDb: gainDb, pitchSemitones: pitchSemitones, tempoPercent: tempoPercent,
+        bpm: bpm, beatDivIndex: beatDivIndex, syncMode: syncMode, loopEnabled: loopEnabled,
+        gateMode: trackStates[activeTrack].gateMode,
+        sliceMode: sliceMode, sliceCount: sliceCount, sliceBoundaries: sliceBoundaries,
+        selectedSlice: selectedSlice, slicePadOffset: slicePadOffset,
+        sliceRegionStart: sliceRegionStart, sliceRegionEnd: sliceRegionEnd,
+        sliceThreshold: sliceThreshold, slicePitches: slicePitches, sliceTempos: sliceTempos,
+        lazySub: lazySub, zoomLevel: zoomLevel, zoomCenter: zoomCenter, vScale: vScale
+    };
+}
+
+/**
+ * Restore global UI state from trackStates[idx].
+ */
+function restoreTrackUIState(idx) {
+    var ts = trackStates[idx];
+    fileName = ts.fileName;
+    openedFilePath = ts.filePath;
+    totalFrames = ts.totalFrames;
+    startSample = ts.startSample;
+    endSample = ts.endSample;
+    zoomLevel = ts.zoomLevel;
+    zoomCenter = ts.zoomCenter;
+    vScale = ts.vScale;
+    playing = ts.playing;
+    playPos = ts.playPos;
+    gainDb = ts.gainDb;
+    peakDb = ts.peakDb;
+    loopEnabled = ts.loopEnabled;
+    varispeedEnabled = !!ts.varispeedMode;
+    pitchSemitones = ts.pitchSemitones;
+    tempoPercent = ts.tempoPercent;
+    fileDuration = ts.fileDuration;
+    sampleRate = ts.sampleRate;
+    selectedField = ts.selectedField;
+    /* Slice */
+    sliceMode = ts.sliceMode;
+    sliceCount = ts.sliceCount;
+    sliceBoundaries = ts.sliceBoundaries;
+    selectedSlice = ts.selectedSlice;
+    slicePadOffset = ts.slicePadOffset;
+    sliceRegionStart = ts.sliceRegionStart;
+    sliceRegionEnd = ts.sliceRegionEnd;
+    sliceThreshold = ts.sliceThreshold;
+    slicePitches = ts.slicePitches;
+    sliceTempos = ts.sliceTempos || [];
+    lazySub = ts.lazySub;
+    lazyChopping = ts.lazyChopping;
+    /* Waveform */
+    waveformData = ts.waveformData;
+    cachedVisStart = ts.cachedVisStart;
+    cachedVisEnd = ts.cachedVisEnd;
+    waveformDirty = ts.waveformDirty;
+    /* Seam */
+    seamWaveformData = ts.seamWaveformData;
+    seamWaveformDirty = ts.seamWaveformDirty;
+    cachedSeamStart = ts.cachedSeamStart;
+    cachedSeamEnd = ts.cachedSeamEnd;
+    cachedSeamHalf = ts.cachedSeamHalf;
+    seamZoomLevel = ts.seamZoomLevel;
+    /* Loop */
+    loopSelectedField = ts.loopSelectedField;
+    /* BPM */
+    bpm = ts.bpm;
+    beatDivIndex = ts.beatDivIndex;
+    syncMode = ts.syncMode || false;
+    /* Sync play_mode to DSP for restored track */
+    host_module_set_param("t" + idx + ":play_mode", varispeedEnabled ? "1" : "0");
+    /* Flags — these will be refreshed from DSP in tick() */
+    dirty = ts.dirty;
+    hasUndo = ts.hasUndo;
+    hasClipboard = ts.hasClipboard;
+    /* Misc */
+    pendingPlay = ts.pendingPlay;
+    activePadNote = ts.activePadNote;
+    isRecordedFile = ts.isRecordedFile;
+}
+
+/**
+ * Switch to a different track. If already on this track, toggle play.
+ */
+function switchToTrack(idx) {
+    if (idx === activeTrack) return;
+    /* Save current state */
+    saveTrackUIState(activeTrack);
+    activeTrack = idx;
+    /* Tell DSP which track is active */
+    host_module_set_param("active_track", String(idx));
+    /* Restore UI state for new track */
+    restoreTrackUIState(idx);
+    /* Force waveform refresh */
+    waveformDirty = true;
+    seamWaveformDirty = true;
+    /* Re-fetch file info from DSP (frames, name, duration, rate).
+     * refreshFileInfo also overwrites startSample/endSample with DSP state,
+     * which may be stale if the track had a scene switch while non-active.
+     * Re-apply the saved JS markers afterwards and push them to DSP. */
+    refreshFileInfo();
+    if (totalFrames > 0) {
+        /* Re-apply JS-side markers (refreshFileInfo may have overwritten them
+         * with stale DSP state from before a non-active scene switch). */
+        var _switchTs = trackStates[idx];
+        startSample = _switchTs.startSample || 0;
+        endSample   = (_switchTs.endSample > 0) ? _switchTs.endSample : totalFrames;
+        if (endSample   > totalFrames) endSample   = totalFrames;
+        if (startSample > totalFrames) startSample = totalFrames;
+        if (startSample > endSample)   startSample = 0;
+        /* Push markers + pitch/tempo/gain to DSP for the now-active track.
+         * Must use blocking calls — single shared-memory slot race. */
+        setParamBlocking("markers", startSample + "," + endSample, 500);
+        setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
+        setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
+        if (syncMode) {
+            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
+        } else {
+            setParamBlocking("tempo", String(tempoPercent), 500);
+        }
+        setParamBlocking("play_loop", loopEnabled ? "1" : "0", 500);
+    }
+    /* Refresh pad LEDs for the new active track's scene layout */
+    updateLeds();
+    announce("Track " + (idx + 1));
+}
+
+/**
+ * Update Track LEDs based on current state.
+ */
+function updateTrackLEDs() {
+    for (var i = 0; i < NUM_TRACKS; i++) {
+        var color;
+        if (trackStates[i].muted) {
+            color = OrangeRed;
+        } else if (trackStates[i].playing) {
+            color = BrightGreen;
+        } else if (i === activeTrack) {
+            color = WhiteLedBright;
+        } else if (trackStates[i].loaded) {
+            color = WhiteLedDim;
+        } else {
+            color = Black;
+        }
+        setButtonLED(TRACK_CCS[i], color);
+    }
+}
+
+/**
+ * Update Play LED.
+ */
+function updatePlayLED() {
+    var anyPlaying = false;
+    for (var i = 0; i < NUM_TRACKS; i++) {
+        if (trackStates[i].playing) { anyPlaying = true; break; }
+    }
+    setButtonLED(CC_PLAY, anyPlaying ? BrightGreen : Black);
+}
+
+/* Shared flags used by tick/draw — refreshed from DSP each tick */
+var loopEnabled = false;
+var dirty = false;
+var hasUndo = false;
+var hasClipboard = false;
 
 /* Mode menu */
 var menuItems = ["Edit", "Loop", "Open File", "Close Session"];
@@ -257,11 +834,33 @@ var confirmIndex = 0;
 var normalizeItems = ["Normalize", "Cancel"];
 var normalizeIndex = 0;
 
+/* Jog-click context menus (VIEW_FREE) */
+var jogMenuItems = ["Copy", "Cut", "Mute", "Truncate", "Normalize Sel"];
+var jogMenuIndex = 0;
+var jogMenuScrollOffset = 0;
+var JOG_MENU_VISIBLE = 4;
+var jogShiftMenuItems = ["Paste (insert)", "Paste (overwrite)", "Export"];
+var jogShiftMenuIndex = 0;
+
+/* Main menu (MoveMenu button) */
+var mainMenuItems = ["Save Project", "Switch Project", "Close"];
+var mainMenuIndex = 0;
+var mainMenuReturnView = VIEW_FREE;
+
+/* Close confirmation dialog (Shift+Back) */
+var closeDialogItems = ["Save & Close", "Discard & Close", "Cancel"];
+var closeDialogIndex = 0;
+var closeDialogReturnView = VIEW_FREE;
+
+/* Resume session dialog (shown on reconnect when a project is active) */
+var resumeItems = ["Resume", "New Project"];
+var resumeDialogIndex = 0;
+
 /* Confirm save overlay */
 var saveName = "";               /* Editable filename (without .wav) shown at top */
 var saveActions = [];            /* Action items below the filename */
 var saveIndex = 0;               /* 0 = filename row, 1+ = action items */
-var saveReturnView = VIEW_TRIM;  /* View to return to after save/cancel */
+var saveReturnView = VIEW_FREE;  /* View to return to after save/cancel */
 
 /**
  * Generate a timestamped recording filename.
@@ -360,7 +959,9 @@ function saveSliceState() {
         regionEnd: sliceRegionEnd,
         selected: selectedSlice,
         threshold: sliceThreshold,
-        padOffset: slicePadOffset
+        padOffset: slicePadOffset,
+        pitches: slicePitches,
+        tempos: sliceTempos
     });
     host_module_set_param("slice_state", state);
 }
@@ -383,6 +984,184 @@ function restoreSliceState() {
         selectedSlice = s.selected || 0;
         sliceThreshold = s.threshold || 25.0;
         slicePadOffset = s.padOffset || 0;
+        slicePitches = s.pitches || [];
+        sliceTempos = s.tempos || [];
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+/* ============ Scene / Project persistence helpers ============ */
+
+/**
+ * Persist per-track scene state to the DSP (survives reconnect).
+ */
+function saveSceneState(trackIdx) {
+    var ts = trackStates[trackIdx];
+    var json = JSON.stringify({ scenes: ts.scenes, selectedSceneIdx: ts.selectedSceneIdx, playingSceneIdx: ts.playingSceneIdx });
+    host_module_set_param("t" + trackIdx + ":scene_state", json);
+}
+
+/**
+ * Restore per-track scene state from the DSP on reconnect.
+ * Returns true if there were scenes to restore.
+ */
+function restoreSceneState(trackIdx) {
+    var raw = host_module_get_param("t" + trackIdx + ":scene_state");
+    if (!raw || raw.length < 2) return false;
+    try {
+        var s = JSON.parse(raw);
+        /* Migrate plain-string scenes (legacy format) to scene objects */
+        var rawScenes = s.scenes || [];
+        trackStates[trackIdx].scenes = rawScenes.map(function(sc) {
+            if (typeof sc === "string") return makeSceneState(sc);
+            return sc;
+        });
+        trackStates[trackIdx].selectedSceneIdx = s.selectedSceneIdx || 0;
+        trackStates[trackIdx].playingSceneIdx  = (s.playingSceneIdx !== undefined) ? s.playingSceneIdx : -1;
+        return trackStates[trackIdx].scenes.length > 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * Write project.json to the project folder.
+ */
+function saveProjectJson() {
+    if (!projectDir || projectDir === "_no_project") return;
+    /* Flush active track's current editor state into trackStates and scene */
+    saveTrackUIState(activeTrack);
+    saveCurrentSceneState(activeTrack);
+    var d = { version: 1, activeTrack: activeTrack, tracks: [] };
+    for (var _st = 0; _st < NUM_TRACKS; _st++) {
+        d.tracks.push({
+            scenes:           trackStates[_st].scenes,
+            selectedSceneIdx: trackStates[_st].selectedSceneIdx,
+            playingSceneIdx:  trackStates[_st].playingSceneIdx,
+            muted:            !!trackStates[_st].muted,
+            gateMode:         trackStates[_st].gateMode | 0
+        });
+    }
+    if (typeof host_write_file === "function") {
+        host_write_file(projectDir + "/project.json", JSON.stringify(d));
+    }
+}
+
+/**
+ * Load project.json from the project folder and restore all tracks.
+ * Returns true on success.
+ */
+function loadProjectJson() {
+    if (!projectDir || projectDir === "_no_project") return false;
+    if (typeof host_read_file !== "function") return false;
+    var raw = host_read_file(projectDir + "/project.json");
+    if (!raw || raw.length < 2) return false;
+    try {
+        var d = JSON.parse(raw);
+        var _savedActiveTrack = (d.activeTrack !== undefined && d.activeTrack >= 0 && d.activeTrack < NUM_TRACKS)
+            ? d.activeTrack : 0;
+
+        /* Switch DSP active track first so subsequent unprefixed params land correctly */
+        if (_savedActiveTrack !== activeTrack) {
+            activeTrack = _savedActiveTrack;
+            host_module_set_param("active_track", String(activeTrack));
+        }
+
+        for (var _lt = 0; _lt < NUM_TRACKS; _lt++) {
+            var td = (d.tracks && d.tracks[_lt]) || {};
+            var ts = trackStates[_lt];
+
+            /* Migrate plain-string scenes (legacy format) to scene objects */
+            var _rawScenes = td.scenes || [];
+            ts.scenes = _rawScenes.map(function(sc) {
+                if (typeof sc === "string") return makeSceneState(sc);
+                return sc;
+            });
+            ts.playingSceneIdx = (td.playingSceneIdx !== undefined) ? td.playingSceneIdx : -1;
+            /* Always point selectedSceneIdx at the next free (empty) slot so
+             * that the first skipback doesn't overwrite an existing scene. */
+            ts.selectedSceneIdx = ts.scenes.length;
+            if (ts.selectedSceneIdx >= MAX_SCENES) ts.selectedSceneIdx = MAX_SCENES - 1;
+
+            /* Restore muted / gateMode */
+            ts.muted    = !!td.muted;
+            ts.gateMode = (td.gateMode >= 0 && td.gateMode <= 2) ? td.gateMode : PAD_MODE_TRIGGER;
+            host_module_set_param("t" + _lt + ":muted",     ts.muted ? "1" : "0");
+            host_module_set_param("t" + _lt + ":gate_mode", String(ts.gateMode));
+
+            /* Find the scene to load (playing scene, or first available) */
+            var _ltPlayIdx = ts.playingSceneIdx;
+            var _ltScene = (_ltPlayIdx >= 0 && _ltPlayIdx < ts.scenes.length)
+                ? ts.scenes[_ltPlayIdx]
+                : (ts.scenes.length > 0 ? ts.scenes[0] : null);
+
+            if (!_ltScene) continue;
+
+            /* Copy all scene properties into the flat trackState fields */
+            ts.startSample      = _ltScene.startSample      || 0;
+            ts.endSample        = _ltScene.endSample        || 0;
+            ts.gainDb           = _ltScene.gainDb           !== undefined ? _ltScene.gainDb           : 0;
+            ts.pitchSemitones   = _ltScene.pitchSemitones   !== undefined ? _ltScene.pitchSemitones   : 0;
+            ts.tempoPercent     = _ltScene.tempoPercent     !== undefined ? _ltScene.tempoPercent     : 100;
+            ts.bpm              = _ltScene.bpm              || 120;
+            ts.beatDivIndex     = _ltScene.beatDivIndex     !== undefined ? _ltScene.beatDivIndex     : 5;
+            ts.syncMode         = !!_ltScene.syncMode;
+            ts.loopEnabled      = !!_ltScene.loopEnabled;
+            ts.sliceMode        = _ltScene.sliceMode        || 0;
+            ts.sliceCount       = _ltScene.sliceCount       || 1;
+            ts.sliceBoundaries  = (_ltScene.sliceBoundaries || []).slice();
+            ts.selectedSlice    = _ltScene.selectedSlice    || 0;
+            ts.slicePadOffset   = _ltScene.slicePadOffset   || 0;
+            ts.sliceRegionStart = _ltScene.sliceRegionStart || 0;
+            ts.sliceRegionEnd   = _ltScene.sliceRegionEnd   || 0;
+            ts.sliceThreshold   = _ltScene.sliceThreshold   !== undefined ? _ltScene.sliceThreshold   : 25;
+            ts.slicePitches     = (_ltScene.slicePitches    || []).slice();
+            ts.sliceTempos      = (_ltScene.sliceTempos     || []).slice();
+            ts.lazySub          = _ltScene.lazySub          || 0;
+            ts.zoomLevel        = _ltScene.zoomLevel        || 0;
+            ts.zoomCenter       = _ltScene.zoomCenter       || 0;
+            ts.vScale           = _ltScene.vScale           !== undefined ? _ltScene.vScale           : 1;
+            ts.openedFilePath   = _ltScene.path;
+            ts.loaded           = true;
+
+            sceneLoadFile(_lt, _ltScene.path);
+            if (_lt === activeTrack) {
+                /* Active track: set globals from scene, then use
+                 * pendingSceneRestore to defer remaining DSP params until the
+                 * file is confirmed loaded (direct params after file_path are
+                 * lost in the single shared-memory slot). */
+                restoreSceneToGlobals(ts);
+                openedFilePath = ts.openedFilePath;
+                totalFrames = 0;  /* reset — tick retry loop will refetch and apply pendingSceneRestore */
+                waveformDirty = true;
+
+                pendingSceneRestore = {
+                    startSample:    ts.startSample,
+                    endSample:      ts.endSample,
+                    gainDb:         ts.gainDb,
+                    pitchSemitones: ts.pitchSemitones,
+                    tempoPercent:   tempoPercent,  /* use freshly computed global (set by restoreSceneToGlobals above) */
+                    loopEnabled:    ts.loopEnabled,
+                    hasSlices:      ts.sliceBoundaries.length >= 2,
+                    autoPlay:       false
+                };
+            } else {
+                /* Non-active track: send all DSP params via blocking prefixed calls */
+                var _ltp = "t" + _lt + ":";
+                setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
+                setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
+                if (ts.syncMode) {
+                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(4) + "," + ts.startSample + "," + ts.endSample, 500);
+                } else {
+                    setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
+                }
+                setParamBlocking(_ltp + "play_loop", ts.loopEnabled ? "1" : "0", 500);
+                setParamBlocking(_ltp + "markers",   ts.startSample + "," + ts.endSample, 500);
+            }
+        }
+        waveformDirty = true;
         return true;
     } catch (e) {
         return false;
@@ -390,17 +1169,8 @@ function restoreSliceState() {
 }
 
 /* Loop state */
-var loopEnabled = false;
 var savedLoopState = false;
-
-/* Undo state */
-var hasUndo = false;
-
-/* Clipboard state */
-var hasClipboard = false;
-
-/* Dirty flag */
-var dirty = false;
+var savedTempoPercent = 100;  /* global tempo saved/restored around VIEW_SLICE */
 
 /* Status message — two modes:
  * 1. Knob-held: persists while knob is touched, per-knob messages
@@ -457,19 +1227,42 @@ function initLedsStep() {
 
     var commands = [];
 
-    /* Button LEDs — dim to show they're active */
-    commands.push(function() { setButtonLED(CC_MUTE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_DELETE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_COPY, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_UNDO, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_LOOP, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_CAPTURE, LED_DIM); });
-    commands.push(function() { setButtonLED(CC_BACK, LED_DIM); });
+    /* Button LEDs — init all to OFF, updateLeds() will set per-view state */
+    commands.push(function() { setButtonLED(CC_COPY, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_MUTE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_DELETE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_CAPTURE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_SAMPLE, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_UNDO, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_LOOP, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_BACK, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_LEFT, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_RIGHT, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_UP, LED_OFF, true); });
+    commands.push(function() { setButtonLED(CC_DOWN, LED_OFF, true); });
 
-    /* Pad LEDs — dim grey to show audition is available */
+    /* Step view-selector LEDs (Steps 1–3) — init to Black */
+    for (var s = 0; s < 3; s++) {
+        commands.push((function(n) {
+            return function() { setLED(n, Black, true); };
+        })(STEP_BASE + s));
+    }
+    /* Step 4 (Gate/Trigger) + Step 5 (Clock Sync) — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 3, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 4, Black, true); });
+    /* Step 9/10 (Fade In/Out) + Step 11 (Reverse) — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 8, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 9, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 10, Black, true); });
+    /* Step 14 (Reset) + Step 15/16 marker-set LEDs — init to Black */
+    commands.push(function() { setLED(STEP_BASE + 13, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 14, Black, true); });
+    commands.push(function() { setLED(STEP_BASE + 15, Black, true); });
+
+    /* Pad LEDs — force=true ensures hardware is in sync on reconnect */
     for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
         commands.push((function(note) {
-            return function() { setLED(note, PAD_COLOR_DIM); };
+            return function() { setLED(note, PAD_COLOR_DIM, true); };
         })(p));
     }
 
@@ -491,9 +1284,112 @@ function initLedsStep() {
  */
 function updateLeds() {
     if (ledInitPending) return; /* Don't send until init completes */
-    setButtonLED(CC_LOOP, loopEnabled ? LED_BRIGHT : LED_DIM);
-    setButtonLED(CC_UNDO, hasUndo ? LED_MED : LED_DIM);
-    setButtonLED(CC_COPY, hasClipboard ? LED_MED : LED_DIM);
+
+
+    var isFree  = (currentView === VIEW_FREE);
+    var isSync   = (currentView === VIEW_SYNC);
+    var isSlice = (currentView === VIEW_SLICE);
+    var isLoop  = (currentView === VIEW_LOOP);
+    var isEdit  = isFree || isSync || isSlice || isLoop;
+
+    /* Buttons available in all edit views */
+    setButtonLED(CC_COPY,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_MUTE,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_BACK,    isEdit  ? LED_DIM : LED_OFF);
+    setButtonLED(CC_SAMPLE,  isEdit  ? LED_OFF : LED_OFF);
+
+    /* Remove: Trim, BPM, Slice, Loop */
+    setButtonLED(CC_DELETE,  isEdit  ? LED_DIM : LED_OFF);
+
+    /* Undo: stateful brightness */
+    setButtonLED(CC_UNDO,    isEdit  ? (hasUndo ? LED_MED : LED_DIM) : LED_OFF);
+
+    /* Loop: Trim, BPM, Loop (not Slice) */
+    setButtonLED(CC_LOOP,    (isFree || isSync || isLoop) ? (loopEnabled ? LED_BRIGHT : LED_DIM) : LED_OFF);
+
+    /* Capture: Trim, BPM, Slice (Shift+Capture = export) */
+    setButtonLED(CC_CAPTURE, (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Left/Right: Trim, BPM, Slice */
+    setButtonLED(CC_LEFT,  (isFree || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_RIGHT, (isFree || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Up/Down: BPM, Slice */
+    setButtonLED(CC_UP,   (isSync || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_DOWN, (isSync || isSlice) ? LED_DIM : LED_OFF);
+
+    /* Step view-selector LEDs */
+    /* Step 1 LED: PaleGreen=FREE, VividYellow=VARISPEED, BrightOrange=STRETCH */
+    var _step1Color = (editMode === VIEW_FREE) ? PaleGreen
+                    : varispeedEnabled ? VividYellow : Bright;
+    setLED(STEP_BASE + 0, _step1Color);
+    setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
+    setLED(STEP_BASE + 2, Black);  /* freed */
+
+    /* Step 4: Pad mode LED — DarkGrey=Trigger, BrightRed=Gate, VividYellow=OneShot */
+    var _padModeLed = trackStates[activeTrack].gateMode;
+    setLED(STEP_BASE + 3, isEdit ? (_padModeLed === PAD_MODE_GATE ? BrightRed : _padModeLed === PAD_MODE_ONESHOT ? VividYellow : DarkGrey) : Black);
+
+    /* Step 5: Clock Sync LED; dim dot when quantize != BAR */
+    var syncOn = (host_module_get_param("sync_clock") === "1");
+    var _qColor = syncOn ? BrightGreen : DarkGrey;
+    if (syncOn && quantizeMode !== QUANT_BAR) _qColor = VividYellow; /* yellow = non-default quantize */
+    setLED(STEP_BASE + 4, isEdit ? _qColor : Black);
+
+    /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
+    var _hasScenes = (trackStates[activeTrack].scenes.length > 0);
+    setLED(STEP_BASE + 5, isEdit ? (_hasScenes ? VividYellow : DarkGrey) : Black);
+
+    /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
+    var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
+    setLED(STEP_BASE + 7, (isFree || isSync) && hasPitchTempo ? VividYellow : Black);
+
+    /* Step 9/10: fade in/out LEDs (Trim/BPM/Slice) */
+    var hasFade = isFree || isSync || isSlice;
+    setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
+    setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
+
+    /* Step 11: Reverse LED (Trim/BPM/Slice) */
+    setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
+
+    /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
+    setLED(STEP_BASE + 13, (isFree || isSync || isSlice) ? BrightRed : Black);
+
+    /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
+    setLED(STEP_BASE + 14, (isFree || isSync) ? BrightGreen : Black);
+    setLED(STEP_BASE + 15, (isFree || isSync) ? BrightRed : isSlice ? BrightRed : Black);
+
+    /* Pad LEDs: scene launcher colors in Trim/BPM views */
+    if (isFree || isSync) {
+        var _ts = trackStates[activeTrack];
+        sceneFlashCounter++;
+        var _flashOn = (sceneFlashCounter % 12) < 6;
+        for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
+            var padIdx = p - PAD_NOTE_MIN;
+            if (padIdx >= 0 && padIdx < MAX_SCENES) {
+                var _isPending = (pendingSceneSwitch === padIdx && pendingSceneSwitchTrack === activeTrack);
+                var _isPlaying = (padIdx === _ts.playingSceneIdx && _ts.playing);
+                var _isSelected = (padIdx === _ts.selectedSceneIdx);
+                var _hasContent = (padIdx < _ts.scenes.length && _ts.scenes[padIdx] && _ts.scenes[padIdx].path);
+
+                if (_isPending) {
+                    setLED(p, _flashOn ? VividYellow : Black);
+                } else if (_isPlaying) {
+                    setLED(p, BrightGreen);
+                } else if (_isSelected && _hasContent) {
+                    setLED(p, White);
+                } else if (_isSelected && !_hasContent) {
+                    setLED(p, DarkGrey);
+                } else if (_hasContent) {
+                    setLED(p, WhiteLedDim);
+                } else {
+                    setLED(p, Black);
+                }
+            } else {
+                setLED(p, Black);
+            }
+        }
+    }
 }
 
 /* ============ Helpers ============ */
@@ -526,6 +1422,15 @@ function formatDb(db) {
     return sign + db.toFixed(1) + "dB";
 }
 
+function formatPitch(semi) {
+    if (semi === 0) return "0";
+    var sign = semi > 0 ? "+" : "";
+    var whole = Math.floor(Math.abs(semi));
+    var cents = Math.round((Math.abs(semi) - whole) * 100);
+    if (cents === 0) return sign + (semi > 0 ? whole : -whole) + "st";
+    return sign + (semi > 0 ? whole : -whole) + "." + (cents < 10 ? "0" : "") + cents + "st";
+}
+
 /**
  * Format selection duration for display.
  * Adaptive precision: 3 decimals for <1s, 2 for <10s, 1 for rest.
@@ -553,14 +1458,16 @@ function showStatus(msg, frames) {
  */
 function getKnobLabel(knobIndex) {
     if (knobIndex === 0) {
-        if (currentView === VIEW_TRIM) return shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample);
+        if (currentView === VIEW_SYNC) return shiftHeld ? "Step:" + BEAT_DIVISION_LABELS[beatDivIndex] : "Start:" + formatBarsBeats(startSample);
+        if (currentView === VIEW_FREE) return shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample);
         if (currentView === VIEW_LOOP) return shiftHeld ? "S:" + startSample : "Pt:" + formatTime(startSample);
         if (currentView === VIEW_SLICE) return "Start:" + formatTime(sliceBoundaries[selectedSlice]);
     } else if (knobIndex === 1) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) return shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample);
+        if (currentView === VIEW_SYNC) return shiftHeld ? "Step:" + BEAT_DIVISION_LABELS[beatDivIndex] : "Len:" + formatBarsBeats(endSample - startSample);
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) return shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample);
         if (currentView === VIEW_SLICE) return "End:" + formatTime(sliceBoundaries[selectedSlice + 1]);
     } else if (knobIndex === 2) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_SLICE) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SLICE) {
             if (zoomLevel <= 0) return "Zoom: Full";
             return "Zoom:" + Math.pow(2, zoomLevel).toFixed(1) + "x";
         }
@@ -573,9 +1480,15 @@ function getKnobLabel(knobIndex) {
         if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_AUTO) {
             return "T:" + sliceThreshold.toFixed(1);
         }
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) {
             return shiftHeld ? "Normalize" : "Gain:" + formatDb(gainDb);
         }
+    } else if (knobIndex === 6) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_LOOP) return "Pitch:" + formatPitch(pitchSemitones);
+        if (currentView === VIEW_SLICE) return "Slice Pitch:" + formatPitch(slicePitches[selectedSlice] || 0.0);
+    } else if (knobIndex === 7) {
+        if (currentView === VIEW_SYNC) return "BPM:" + bpm.toFixed(1) + " (" + tempoPercent + "%)";
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) return "Tempo:" + tempoPercent + "%";
     }
     return "";
 }
@@ -601,6 +1514,98 @@ function showJogStatus(msg) {
     jogHeldTimer = JOG_HOLD_FRAMES;
     pushTouchOrder(JOG_ID);
     announce(msg);
+}
+
+/* ============ Parameter Reset Helpers ============ */
+
+function resetPitch() {
+    pitchSemitones = 0.0;
+    host_module_set_param("pitch", "0.00");
+    showKnobStatus(6, "Pitch:0");
+    showStatus("Pitch Reset", 60);
+}
+
+function resetTempo() {
+    tempoPercent = 100;
+    host_module_set_param("tempo", "100");
+    showKnobStatus(7, "Tempo:100%");
+    showStatus("Tempo Reset", 60);
+}
+
+function resetSlicePitch() {
+    slicePitches[selectedSlice] = 0.0;
+    host_module_set_param("pitch", "0.00");
+    showKnobStatus(6, "Slice Pitch:0");
+    showStatus("Slice Pitch Reset", 60);
+}
+
+function resetSliceTempo() {
+    sliceTempos[selectedSlice] = 100;
+    tempoPercent = 100;
+    host_module_set_param("tempo", "100");
+    showKnobStatus(7, "Slice Tempo:100%");
+    showStatus("Slice Tempo Reset", 60);
+}
+
+function resetBpm() {
+    bpm = globalBpm;
+    tempoPercent = 100;
+    syncSyncModeToDs();
+    showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " (100%)");
+    showStatus("BPM Reset", 60);
+}
+
+function resetGain() {
+    gainDb = 0.0;
+    host_module_set_param("gain_db", "0.0");
+    showKnobStatus(4, "Gain:" + formatDb(gainDb));
+    showStatus("Gain Reset", 60);
+}
+
+function resetZoom() {
+    if (currentView === VIEW_LOOP) {
+        seamZoomLevel = 0;
+        seamWaveformDirty = true;
+    } else {
+        zoomLevel = 0;
+        refreshWaveform();
+    }
+    showKnobStatus(2, "Zoom:Full");
+    showStatus("Zoom Reset", 60);
+}
+
+function resetVScale() {
+    vScale = 1.0;
+    showKnobStatus(3, "Scale:1.0x");
+    showStatus("Scale Reset", 60);
+}
+
+/**
+ * Handle Delete+knob rotation/touch combos: reset the parameter assigned to knob CC.
+ * Returns true if handled (caller should cancel deletePendingCut).
+ */
+function handleDeleteKnob(cc) {
+    if (cc === CC_E3) { resetZoom(); return true; }
+    if (cc === CC_E4) { resetVScale(); return true; }
+    if (cc === CC_E5 && (currentView === VIEW_FREE || currentView === VIEW_LOOP)) {
+        resetGain(); return true;
+    }
+    if (cc === CC_E7 && currentView === VIEW_SLICE) {
+        resetSlicePitch(); return true;
+    }
+    if (cc === CC_E7 && (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_LOOP)) {
+        resetPitch(); return true;
+    }
+    if (cc === CC_E8 && currentView === VIEW_SLICE) {
+        resetSliceTempo(); return true;
+    }
+    if (cc === CC_E8 && currentView === VIEW_SYNC) {
+        resetBpm(); return true;
+    }
+    if (cc === CC_E8 && (currentView === VIEW_FREE || currentView === VIEW_LOOP)) {
+        resetTempo(); return true;
+    }
+    return false;
 }
 
 /**
@@ -649,6 +1654,70 @@ function getCoarseStep() {
     var step = Math.floor(visibleRange / SCREEN_W);
     if (step < 1) step = 1;
     return step;
+}
+
+/**
+ * Get step size in samples for the current BPM and beat division.
+ */
+function getBeatStepSamples() {
+    var beatsPerSec = bpm / 60.0;
+    var samplesPerQuarter = sampleRate / beatsPerSec;
+    var div = BEAT_DIVISIONS[beatDivIndex];
+    return Math.max(1, Math.round(samplesPerQuarter * 4 / div));
+}
+
+/**
+ * Snap sample count down to the nearest musical division:
+ * whole bar (≥1 bar), whole beat (≥1 beat), or whole sixteenth note.
+ */
+function snapLengthFloor(samples) {
+    var samplesPerQuarter = sampleRate / (bpm / 60.0);
+    var bar      = Math.round(samplesPerQuarter * 4);
+    var beat     = Math.round(samplesPerQuarter);
+    var sixteenth = Math.max(1, Math.round(samplesPerQuarter / 4));
+    if (samples >= bar)  return Math.floor(samples / bar)  * bar;
+    if (samples >= beat) return Math.floor(samples / beat) * beat;
+    return Math.max(sixteenth, Math.floor(samples / sixteenth) * sixteenth);
+}
+
+/**
+ * Detect BPM from the current filename and snap end marker to the nearest beat step.
+ * Returns true if a valid BPM was found.
+ */
+function detectBpmFromFilename() {
+    var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i) ||
+                   fileName.match(/\[(\d+(?:\.\d+)?)\]/);
+    if (!bpmMatch) return false;
+    var detectedBpm = parseFloat(bpmMatch[1]);
+    if (detectedBpm < 20 || detectedBpm > 999) {
+        showStatus("BPM out of range", 60);
+        return false;
+    }
+    bpm = Math.round(detectedBpm * 10) / 10;
+    syncMode = true;
+    tempoPercent = Math.round(globalBpm / bpm * 100);
+    var snapped = snapLengthFloor(endSample - startSample);
+    endSample = startSample + Math.max(1, snapped);
+    if (endSample > totalFrames) endSample = totalFrames;
+    syncMarkersToDs();
+    syncSyncModeToDs();
+    refreshWaveform();
+    showStatus("BPM: " + bpm.toFixed(1), 90);
+    return true;
+}
+
+/**
+ * Format a sample count as bars:beats:sixteenths using the current BPM.
+ * Assumes 4/4 time. Always non-negative.
+ */
+function formatBarsBeats(samples) {
+    if (bpm <= 0 || sampleRate <= 0 || samples < 0) return "0:0:0";
+    var samplesPerBeat = sampleRate * 60.0 / bpm;
+    var totalSixteenths = Math.round(samples / (samplesPerBeat / 4));
+    var bar        = Math.floor(totalSixteenths / 16);
+    var beat       = Math.floor((totalSixteenths % 16) / 4);
+    var sixteenth  = totalSixteenths % 4;
+    return bar + ":" + beat + ":" + sixteenth;
 }
 
 /**
@@ -750,6 +1819,18 @@ function syncMarkersToDs() {
 }
 
 /**
+ * SYNC mode: atomically update tempo + loop boundary in one DSP call.
+ * Sends "sync_tempo" = "tempoPercent,startSample,logicalEndSample".
+ * DSP computes dspEnd = startSample + (logicalEnd - startSample) * tempoPercent/100
+ * so the output loop duration stays fixed regardless of tempo.
+ * Logical markers in JS are never modified.
+ */
+function syncSyncModeToDs() {
+    var _tp = (globalBpm / bpm * 100).toFixed(4);
+    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample);
+}
+
+/**
  * Sync zoom and refresh waveform.
  * Zoom params are encoded in the waveform GET request to avoid
  * fire-and-forget race (SET is lost when followed by GET).
@@ -768,12 +1849,16 @@ function refreshFileInfo() {
     if (!raw) return;
     try {
         var info = JSON.parse(raw);
+        var _prevStart = startSample, _prevEnd = endSample;
         fileName = info.name || "";
         if (isScratchFile()) fileName = "New Recording";
         fileDuration = info.duration || 0;
         totalFrames = info.frames || 0;
         startSample = info.start || 0;
         endSample = info.end || totalFrames;
+        if (startSample !== _prevStart || endSample !== _prevEnd) {
+            dbg("refreshFileInfo: markers changed! " + _prevStart + "," + _prevEnd + " → " + startSample + "," + endSample + " file=" + fileName + " frames=" + totalFrames);
+        }
         /* Fetch sample rate separately */
         var srRaw = host_module_get_param("sample_rate");
         if (srRaw) sampleRate = parseInt(srRaw, 10) || 44100;
@@ -816,17 +1901,37 @@ function refreshWaveform() {
  * mode the normal set_param is fire-and-forget and rapid writes can overwrite
  * each other in the single shared-memory IPC slot.
  */
-function loadFileIntoEditor(filePath) {
-    if (typeof host_module_set_param_blocking === "function") {
-        host_module_set_param_blocking("file_path", filePath, 2000);
-    } else {
-        host_module_set_param("file_path", filePath);
-    }
+function loadFileIntoEditor(filePath, loadEditMode) {
+    setParamBlocking("file_path", filePath, 2000);
     host_module_set_param("dirty", "1");
+    /* Reset pitch/tempo on new file, enable loop by default */
+    pitchSemitones = 0.0;
+    tempoPercent = 100;
+    loopEnabled = true;
+    host_module_set_param("play_loop", "1");
     refreshFileInfo();
     waveformDirty = true;
+    /* Auto-detect BPM from filename when SYNC editMode is active.
+     * detectBpmFromFilename() sets syncMode=true and tempoPercent on success.
+     * Falls back to globalBpm if no BPM found in filename. */
+    var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
+    if (_targetMode === VIEW_SYNC) {
+        if (!detectBpmFromFilename()) {
+            bpm = globalBpm;
+            tempoPercent = 100;
+            host_module_set_param("tempo", "100");
+        }
+        switchView(VIEW_SYNC);
+    }
     refreshWaveform();
     refreshState();
+    /* Update track state */
+    trackStates[activeTrack].loaded = (totalFrames > 0);
+    trackStates[activeTrack].fileName = fileName;
+    trackStates[activeTrack].filePath = openedFilePath;
+    trackStates[activeTrack].totalFrames = totalFrames;
+    /* Reset pending browser track */
+    pendingBrowserTrack = -1;
 }
 
 /**
@@ -924,6 +2029,22 @@ function recomputeSliceBoundaries() {
         for (var i = 0; i <= sliceCount; i++) {
             sliceBoundaries.push(sliceRegionStart + Math.round((regionLen * i) / sliceCount));
         }
+    } else if (sliceMode === SLICE_MODE_BPM) {
+        var stepSamples = getBeatStepSamples();
+        sliceBoundaries = [sliceRegionStart];
+        var pos = sliceRegionStart + stepSamples;
+        while (pos < sliceRegionEnd) {
+            sliceBoundaries.push(pos);
+            pos += stepSamples;
+        }
+        sliceBoundaries.push(sliceRegionEnd);
+        sliceCount = sliceBoundaries.length - 1;
+        if (sliceCount < 1) sliceCount = 1;
+        if (sliceCount > 32) {
+            sliceCount = 32;
+            sliceBoundaries = sliceBoundaries.slice(0, 33);
+            sliceBoundaries[32] = sliceRegionEnd;
+        }
     } else {
         /* Auto: transient detection */
         var onsets = detectTransients(sliceRegionStart, sliceRegionEnd, sliceThreshold);
@@ -938,6 +2059,8 @@ function recomputeSliceBoundaries() {
     /* Clamp selected slice */
     if (selectedSlice >= sliceCount) selectedSlice = sliceCount - 1;
     if (selectedSlice < 0) selectedSlice = 0;
+    /* Reset per-slice pitches when boundaries change */
+    slicePitches = [];
 }
 
 /**
@@ -986,6 +2109,12 @@ function selectSlice(idx) {
     selectedSlice = idx;
     startSample = sliceBoundaries[idx];
     endSample = sliceBoundaries[idx + 1];
+    /* Apply this slice's individual pitch and tempo to the DSP */
+    var sp = slicePitches[idx] || 0.0;
+    host_module_set_param("pitch", sp.toFixed(2));
+    var st = sliceTempos[idx] || 100;
+    tempoPercent = st;
+    host_module_set_param("tempo", String(st));
 
     /* Auto-scroll: position slice start at 10% from left edge,
      * slice end at 90% — matching trim mode's margin style.
@@ -1110,9 +2239,20 @@ function printCentered(y, text) {
  * Format: "MODE*L" where * = dirty, L = loop enabled.
  */
 function buildModeHeader(modeName) {
-    var s = modeName;
+    var s = "T" + (activeTrack + 1) + " " + modeName;
     if (dirty) s += "*";
     if (loopEnabled) s += " L";
+    var _hpm = trackStates[activeTrack].gateMode;
+    if (_hpm === PAD_MODE_GATE) s += " G"; else if (_hpm === PAD_MODE_ONESHOT) s += " O";
+    if (pitchSemitones !== 0 || tempoPercent !== 100) s += " P";
+    /* Scene indicator: S<armed> or S<armed>>S<playing> */
+    var _sts = trackStates[activeTrack];
+    if (_sts.scenes.length > 0 || _sts.selectedSceneIdx > 0) {
+        s += " S" + (_sts.selectedSceneIdx + 1);
+        if (_sts.playingSceneIdx >= 0 && _sts.playingSceneIdx !== _sts.selectedSceneIdx) {
+            s += ">" + (_sts.playingSceneIdx + 1);
+        }
+    }
     return s;
 }
 
@@ -1223,7 +2363,7 @@ function drawWaveform() {
 
 /* ============ Drawing: Trim View ============ */
 
-function drawTrimView() {
+function drawFreeView() {
     clear_screen();
 
     /* Record-ready state: empty waveform, waiting for REC press */
@@ -1351,7 +2491,7 @@ function drawTrimView() {
     }
 
     /* Header: MODE*L  filename.wav  1.2s */
-    var modeStr = buildModeHeader("TRIM");
+    var modeStr = buildModeHeader("FREE");
     print(0, 0, modeStr, 1);
     var nameX = (modeStr.length + 1) * 6;
     var maxNameChars = Math.floor((SCREEN_W - nameX - 36) / 6);
@@ -1589,30 +2729,35 @@ function drawSliceView() {
         printCentered(54, footerStatus);
     } else {
         /* Build footer items based on slice menu */
-        var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Lazy");
-        var countLabel;
-        if (sliceMode === SLICE_MODE_LAZY) {
-            countLabel = lazySub === LAZY_SUB_CHOP ? "Chop" : "Play";
-        } else if (sliceMode === SLICE_MODE_EVEN) {
-            countLabel = "" + sliceCount;
-        } else {
-            countLabel = "T:" + sliceThreshold.toFixed(1);
-        }
         var selLabel = (selectedSlice + 1) + "/" + sliceCount;
         if (sliceCount > 32) {
             var bankNum = Math.floor(slicePadOffset / 32) + 1;
             selLabel += " P" + bankNum;
         }
         var timeLabel = formatTime(startSample);
+        var labels;
+        if (sliceMode === SLICE_MODE_BPM) {
+            labels = ["BPM", bpm.toFixed(1), BEAT_DIVISION_LABELS[beatDivIndex], selLabel];
+        } else {
+            var modeLabel = sliceMode === SLICE_MODE_EVEN ? "Even" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Lazy");
+            var countLabel;
+            if (sliceMode === SLICE_MODE_LAZY) {
+                countLabel = lazySub === LAZY_SUB_CHOP ? "Chop" : "Play";
+            } else if (sliceMode === SLICE_MODE_EVEN) {
+                countLabel = "" + sliceCount;
+            } else {
+                countLabel = "T:" + sliceThreshold.toFixed(1);
+            }
+            labels = [modeLabel, countLabel, selLabel];
+        }
 
         /* Draw footer items with visual distinction:
          * - Focused (navigating): [brackets]
          * - Editing (active): inverse highlight (filled rect + dark text) */
-        var labels = [modeLabel, countLabel, selLabel];
         var CHAR_W = 6; /* 5px char + 1px gap */
         var footerY = 54;
         var x = 0;
-        for (var fi = 0; fi < 3; fi++) {
+        for (var fi = 0; fi < labels.length; fi++) {
             var label = labels[fi];
             var isFocused = (fi === sliceMenuIndex);
             var isEditing = isFocused && sliceMenuEditing;
@@ -1720,6 +2865,63 @@ function drawConfirmNormalize() {
     }
 }
 
+/* ============ Drawing: Main Menu ============ */
+
+function drawMainMenu() {
+    clear_screen();
+    printCentered(2, "Menu");
+    drawDivider(12);
+    var startY = 16;
+    var itemH = 13;
+    for (var i = 0; i < mainMenuItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === mainMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, mainMenuItems[i], 0);
+        } else {
+            print(8, y + 3, mainMenuItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: Confirm Close ============ */
+
+function drawConfirmClose() {
+    clear_screen();
+    printCentered(2, "Close project?");
+    drawDivider(12);
+    var startY = 18;
+    var itemH = 14;
+    for (var i = 0; i < closeDialogItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === closeDialogIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, closeDialogItems[i], 0);
+        } else {
+            print(8, y + 3, closeDialogItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: Confirm Resume ============ */
+
+function drawConfirmResume() {
+    clear_screen();
+    printCentered(2, "Resume Project?");
+    drawDivider(12);
+    var startY = 22;
+    var itemH = 14;
+    for (var i = 0; i < resumeItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === resumeDialogIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 3, resumeItems[i], 0);
+        } else {
+            print(8, y + 3, resumeItems[i], 1);
+        }
+    }
+}
+
 /* ============ Drawing: Confirm Save ============ */
 
 function drawConfirmSave() {
@@ -1754,14 +2956,106 @@ function drawConfirmSave() {
     }
 }
 
+/* ============ Drawing: Jog Menu ============ */
+
+function drawJogMenu() {
+    clear_screen();
+    printCentered(2, "Edit");
+    drawDivider(12);
+    var startY = 14;
+    var itemH = 12;
+    var end = Math.min(jogMenuScrollOffset + JOG_MENU_VISIBLE, jogMenuItems.length);
+    for (var i = jogMenuScrollOffset; i < end; i++) {
+        var y = startY + (i - jogMenuScrollOffset) * itemH;
+        if (i === jogMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 2, jogMenuItems[i], 0);
+        } else {
+            print(8, y + 2, jogMenuItems[i], 1);
+        }
+    }
+    if (jogMenuScrollOffset > 0) print(SCREEN_W - 6, startY, "^", 1);
+    if (end < jogMenuItems.length) print(SCREEN_W - 6, startY + (JOG_MENU_VISIBLE - 1) * itemH, "v", 1);
+}
+
+/* ============ Drawing: Jog Shift Menu ============ */
+
+function drawJogShiftMenu() {
+    clear_screen();
+    printCentered(2, "Paste / Export");
+    drawDivider(12);
+    var startY = 14;
+    var itemH = 16;
+    for (var i = 0; i < jogShiftMenuItems.length; i++) {
+        var y = startY + i * itemH;
+        if (i === jogShiftMenuIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(8, y + 4, jogShiftMenuItems[i], 0);
+        } else {
+            print(8, y + 4, jogShiftMenuItems[i], 1);
+        }
+    }
+}
+
+/* ============ Drawing: BPM Trim ============ */
+
+function drawBeatDivPopup() {
+    var POP_W = 52, POP_H = 12;
+    var px = (SCREEN_W - POP_W) >> 1;
+    var py = (SCREEN_H - POP_H) >> 1;
+    /* Background + border via fill_rect */
+    fill_rect(px - 1, py - 1, POP_W + 2, POP_H + 2, 0);
+    fill_rect(px - 1, py - 1, POP_W + 2, 1, 1);           /* top */
+    fill_rect(px - 1, py + POP_H, POP_W + 2, 1, 1);       /* bottom */
+    fill_rect(px - 1, py - 1, 1, POP_H + 2, 1);           /* left */
+    fill_rect(px + POP_W, py - 1, 1, POP_H + 2, 1);       /* right */
+    var label = "Step: " + BEAT_DIVISION_LABELS[beatDivIndex];
+    print(px + 2, py + 2, label, 1);
+}
+
+function drawSyncView() {
+    /* Reuse trim view, then overlay BPM label and status bar */
+    drawFreeView();
+
+    /* Rewrite full header: mode label left, globalBpm right */
+    var bpmHeader = buildModeHeader(varispeedEnabled ? "VASP" : "SYNC");
+    fill_rect(0, 0, SCREEN_W, 10, 0);
+    print(0, 0, bpmHeader, 1);
+    var nameX = (bpmHeader.length + 1) * 6;
+    var gbStr = globalBpm.toFixed(0) + "B";
+    var maxNameW = SCREEN_W - nameX - gbStr.length * 6 - 6;
+    var maxNameChars = Math.floor(maxNameW / 6);
+    if (maxNameChars > 0) print(nameX, 0, truncate(fileName, maxNameChars), 1);
+    print(SCREEN_W - gbStr.length * 6, 0, gbStr, 1);
+
+    /* Overwrite the status area at very bottom with BPM info (unless a timed status or knob status is showing) */
+    if (getActiveStatus() === "") {
+        var startBB = formatBarsBeats(startSample);
+        var lenBB   = formatBarsBeats(endSample - startSample);
+        var bpmStatus = "BPM:" + bpm.toFixed(1) + " S" + startBB + " L" + lenBB +
+                        " " + BEAT_DIVISION_LABELS[beatDivIndex];
+        fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
+        print(0, SCREEN_H - 9, bpmStatus, 1);
+    }
+
+    if (beatDivPopupOpen) drawBeatDivPopup();
+}
+
 /* ============ Navigation & Actions ============ */
 
 /**
  * Switch to a given view.
  */
 function switchView(view) {
+    /* Restore global pitch and tempo to DSP when leaving VIEW_SLICE */
+    if (currentView === VIEW_SLICE && view !== VIEW_SLICE) {
+        host_module_set_param("pitch", pitchSemitones.toFixed(2));
+        tempoPercent = savedTempoPercent;
+        host_module_set_param("tempo", String(tempoPercent));
+    }
     currentView = view;
-    if (view === VIEW_TRIM) {
+    if (view === VIEW_FREE || view === VIEW_SYNC) editMode = view;
+    if (view === VIEW_FREE) {
         refreshState();
         refreshWaveform();
         updateLeds();
@@ -1776,9 +3070,17 @@ function switchView(view) {
         invalidateSeamWaveform();
         updateLeds();
         announce("Loop, " + fileName);
+    } else if (view === VIEW_SYNC) {
+        /* Sync play_mode to DSP: varispeed=1 or stretch=0 */
+        host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
+        refreshState();
+        refreshWaveform();
+        updateLeds();
+        announce(varispeedEnabled ? "Varispeed, " + fileName : "Stretch, " + fileName);
     } else if (view === VIEW_SLICE) {
         /* Disable looping for slice audition */
         savedLoopState = loopEnabled;
+        savedTempoPercent = tempoPercent;
         if (loopEnabled) {
             loopEnabled = false;
             host_module_set_param("play_loop", "0");
@@ -1790,15 +3092,32 @@ function switchView(view) {
             sliceRegionEnd = totalFrames;
             sliceRegionStart = 0;
         }
-        sliceCount = 1;
-        selectedSlice = 0;
-        slicePadOffset = 0;
         sliceMenuIndex = 0;
         sliceMenuEditing = false;
         lazyChopping = false;
-        if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
-        recomputeSliceBoundaries();
-        selectSlice(0);
+
+        /* Restore existing slice state if the region is unchanged (boundaries still match).
+         * This preserves manual adjustments and lazy-chop results across view switches
+         * for all modes (Even, Auto, BPM, Lazy). */
+        var hasExistingState = sliceBoundaries.length >= 2 &&
+            sliceRegionStart === sliceBoundaries[0] &&
+            sliceRegionEnd === sliceBoundaries[sliceBoundaries.length - 1];
+
+        if (hasExistingState) {
+            sliceCount = sliceBoundaries.length - 1;
+            if (selectedSlice >= sliceCount) selectedSlice = 0;
+            /* Lazy: set sub-mode based on whether real chops have been done */
+            if (sliceMode === SLICE_MODE_LAZY) {
+                lazySub = (sliceBoundaries.length >= 3) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
+            }
+        } else {
+            sliceCount = 1;
+            selectedSlice = 0;
+            slicePadOffset = 0;
+            if (sliceMode === SLICE_MODE_LAZY) lazySub = LAZY_SUB_CHOP;
+            recomputeSliceBoundaries();
+        }
+        selectSlice(selectedSlice);
         /* Zoom to fit the slice region with 10% margin on each side */
         var regionLen = sliceRegionEnd - sliceRegionStart;
         if (regionLen > 0 && regionLen < totalFrames) {
@@ -1815,6 +3134,7 @@ function switchView(view) {
         syncMarkersToDs();
         refreshState();
         refreshWaveform();
+        updateLeds();
         updateSlicePadLeds();
         var sliceAnnounce = "Slice";
         if (sliceMode === SLICE_MODE_LAZY) sliceAnnounce += " Lazy Chop";
@@ -1829,6 +3149,12 @@ function switchView(view) {
     } else if (view === VIEW_CONFIRM_SAVE) {
         var savePrompt = (saveReturnView === VIEW_SLICE) ? "Export, " : "Save, ";
         announce(savePrompt + saveName);
+    } else if (view === VIEW_MAIN_MENU) {
+        announce("Menu: " + mainMenuItems[mainMenuIndex]);
+    } else if (view === VIEW_CONFIRM_CLOSE) {
+        announce("Close project? " + closeDialogItems[closeDialogIndex]);
+    } else if (view === VIEW_CONFIRM_RESUME) {
+        announce("Resume project? " + resumeItems[resumeDialogIndex]);
     }
 }
 
@@ -1838,7 +3164,7 @@ function switchView(view) {
 function menuSelect() {
     switch (menuIndex) {
         case 0: /* Edit */
-            switchView(VIEW_TRIM);
+            switchView(VIEW_FREE);
             break;
         case 1: /* Loop */
             switchView(VIEW_LOOP);
@@ -1865,6 +3191,556 @@ function enterOpenFileBrowser() {
     var first = (openFileBrowserState.items && openFileBrowserState.items.length > 0)
         ? openFileBrowserState.items[0].label : "empty";
     announce("Open File, " + dirName + ", " + first);
+}
+
+/* ============ Scene helpers ============ */
+
+/**
+ * Find the next free (empty) scene slot after selectedSceneIdx.
+ */
+function findNextFreeSceneSlot(trackIdx) {
+    var ts = trackStates[trackIdx];
+    for (var _nf = 1; _nf <= MAX_SCENES; _nf++) {
+        var c = (ts.selectedSceneIdx + _nf) % MAX_SCENES;
+        if (c >= ts.scenes.length || !ts.scenes[c] || !ts.scenes[c].path) return c;
+    }
+    return ts.selectedSceneIdx; /* All full — stay put */
+}
+
+/**
+ * Apply a scene launch: save current scene state, restore the new scene's
+ * settings, load the WAV, and optionally start playback.
+ *
+ * autoPlay (default true):
+ *   true  — sets playingSceneIdx, sets playing=true, defers play command.
+ *   false — loads the file and restores settings for editing, but does NOT
+ *           start playback and does NOT change playingSceneIdx.
+ */
+function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
+    if (autoPlay === undefined) autoPlay = true;
+    var ts = trackStates[trackIdx];
+
+    /* Save state of the scene we are leaving */
+    if (ts.playingSceneIdx >= 0 && ts.playingSceneIdx < ts.scenes.length) {
+        saveCurrentSceneState(trackIdx);
+    }
+
+    var scene = ts.scenes[sceneIdx];
+    ts.playingSceneIdx  = sceneIdx;
+    ts.selectedSceneIdx = sceneIdx;
+
+    if (trackIdx === activeTrack) {
+        /* Restore scene settings into globals */
+        restoreSceneToGlobals(scene);
+        openedFilePath   = scene.path;
+        totalFrames      = 0;   /* reset — tick retry loop will refetch */
+        waveformDirty    = true;
+
+        /* Defer ALL DSP params until the file is confirmed loaded.
+         * Sending non-blocking params before the blocking file_path
+         * loses them in the single shared-memory slot. */
+        pendingSceneRestore = {
+            startSample:     scene.startSample,
+            endSample:       scene.endSample,
+            gainDb:          scene.gainDb,
+            pitchSemitones:  scene.pitchSemitones,
+            tempoPercent:    tempoPercent,  /* use freshly computed global (set by restoreSceneToGlobals above) */
+            loopEnabled:     scene.loopEnabled,
+            hasSlices:       scene.sliceBoundaries.length >= 2,
+            autoPlay:        autoPlay
+        };
+    } else {
+        /* Non-active track: restore state into trackState struct */
+        copySceneFields(scene, ts);
+        ts.openedFilePath = scene.path;
+    }
+
+    /* Send file_path to DSP.  Use the same blocking call as the file browser
+     * (loadFileIntoEditor) — the non-blocking set_param appears to be ignored
+     * or deduplicated by the host for file_path. */
+    sceneLoadFile(trackIdx, scene.path);
+    if (trackIdx !== activeTrack) {
+        /* Send DSP params for non-active track with track prefix.
+         * Must use blocking calls — single shared-memory slot. */
+        var _tp = "t" + trackIdx + ":";
+        setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
+        setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
+        if (scene.syncMode) {
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
+        } else {
+            setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+        }
+        setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
+        setParamBlocking(_tp + "gate_mode", String((scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER), 500);
+        setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
+    }
+    if (autoPlay) {
+        ts.playing = true;
+        if (trackIdx === activeTrack) playing = true;
+    }
+
+    saveSceneState(trackIdx);
+    updateTrackLEDs();
+    showStatus("Scene " + (sceneIdx + 1), 30);
+}
+
+/**
+ * Launch a scene — single-click model:
+ *   Sync off → switch immediately.
+ *   Sync on  → queue for next bar boundary (press again = force immediate).
+ * Pressing an empty pad just arms it.
+ */
+function launchScene(trackIdx, sceneIdx, autoPlay) {
+    if (autoPlay === undefined) autoPlay = true;
+    var ts = trackStates[trackIdx];
+    dbg("launchScene t" + trackIdx + " s" + sceneIdx + " scenes.len=" + ts.scenes.length + " playingIdx=" + ts.playingSceneIdx + " playing=" + ts.playing);
+    if (sceneIdx >= ts.scenes.length) {
+        /* Empty pad — just arm it */
+        ts.selectedSceneIdx = sceneIdx;
+        dbg("  empty pad — armed");
+        showStatus("Scene " + (sceneIdx + 1) + " armed", 30);
+        updateLeds();
+        return;
+    }
+
+    var syncOn = (host_module_get_param("sync_clock") === "1");
+    var anyPlaying = false;
+    for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
+        if (trackStates[_lsi].playing) { anyPlaying = true; break; }
+    }
+    /* QUANT_FREE or sync off or nothing playing: fire immediately */
+    if (!syncOn || !anyPlaying || !transportPlaying || quantizeMode === QUANT_FREE) {
+        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
+        updateLeds();
+        return;
+    }
+    if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
+        /* Already cued — second press forces immediate */
+        pendingSceneSwitch      = -1;
+        pendingSceneSwitchTrack = -1;
+        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
+    } else {
+        /* Queue for boundary defined by quantizeMode */
+        pendingSceneSwitch      = sceneIdx;
+        pendingSceneSwitchTrack = trackIdx;
+        showStatus("Cue " + QUANT_LABELS[quantizeMode] + " S" + (sceneIdx + 1), 30);
+    }
+    updateLeds();
+}
+
+/**
+ * Remove scene at sceneIdx, shift subsequent scenes left.
+ * If the removed scene was playing, stop playback.
+ */
+function removeScene(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    if (sceneIdx < 0 || sceneIdx >= ts.scenes.length) return;
+
+    /* Stop playback if this scene is currently playing */
+    if (ts.playingSceneIdx === sceneIdx && ts.playing) {
+        host_module_set_param("t" + trackIdx + ":stop", "1");
+        ts.playing = false;
+        if (trackIdx === activeTrack) playing = false;
+    }
+
+    ts.scenes.splice(sceneIdx, 1);
+
+    /* Adjust playingSceneIdx after splice */
+    if (ts.playingSceneIdx === sceneIdx) {
+        ts.playingSceneIdx = -1;
+    } else if (ts.playingSceneIdx > sceneIdx) {
+        ts.playingSceneIdx--;
+    }
+
+    /* Clamp selectedSceneIdx to valid range */
+    if (ts.selectedSceneIdx >= ts.scenes.length) {
+        ts.selectedSceneIdx = Math.max(0, ts.scenes.length - 1);
+    }
+
+    if (ts.scenes.length > 0 && ts.playingSceneIdx >= 0) {
+        /* DSP is already playing the correct file — only update UI state,
+         * do NOT call sceneLoadFile as it would interrupt playback. */
+        if (trackIdx === activeTrack) {
+            var newPath = ts.scenes[ts.playingSceneIdx].path;
+            openedFilePath = newPath;
+            waveformDirty = true;
+            refreshFileInfo();
+        }
+    } else if (ts.scenes.length === 0) {
+        ts.selectedSceneIdx = 0;
+        ts.playingSceneIdx  = -1;
+        ts.loaded = false;
+        if (trackIdx === activeTrack) {
+            openedFilePath = "";
+            totalFrames = 0;
+            waveformData = null;
+        }
+    }
+
+    saveSceneState(trackIdx);
+    saveProjectJson();
+    showStatus("Scene " + (sceneIdx + 1) + " removed", 60);
+}
+
+/* ---- Track reset (Delete+MoveRow) ---- */
+var pendingTrackReset = -1;
+var pendingTrackResetTimer = 0;
+
+function confirmTrackReset(trackIdx) {
+    /* Start confirmation — user must click Jog Dial to confirm */
+    pendingTrackReset = trackIdx;
+    pendingTrackResetTimer = 150;  /* ~2.5 seconds at 60 fps tick */
+    showStatus("Reset T" + (trackIdx + 1) + "? Click JOG", 150);
+}
+
+function resetTrack(trackIdx) {
+    var ts = trackStates[trackIdx];
+    /* Stop playback */
+    ts.playing = false;
+    if (trackIdx === activeTrack) {
+        playing = false;
+        host_module_set_param("play", "stop");
+    } else {
+        host_module_set_param("t" + trackIdx + ":play", "stop");
+    }
+    /* Clear all scenes */
+    ts.scenes = [];
+    ts.selectedSceneIdx = 0;
+    ts.playingSceneIdx = -1;
+    /* Reset track state */
+    ts.loaded = false;
+    ts.fileName = "";
+    ts.filePath = "";
+    ts.openedFilePath = "";
+    ts.totalFrames = 0;
+    ts.startSample = 0;
+    ts.endSample = 0;
+    ts.gainDb = 0.0;
+    ts.pitchSemitones = 0.0;
+    ts.tempoPercent = 100;
+    ts.loopEnabled = true;
+    ts.muted = false;
+    ts.gateMode = PAD_MODE_TRIGGER;
+    ts.zoomLevel = 0;
+    ts.zoomCenter = 0;
+    ts.vScale = 1.0;
+    ts.sliceBoundaries = [];
+    ts.sliceCount = 1;
+    ts.selectedSlice = 0;
+    /* Clear cached waveform so track shows "No waveform data" */
+    ts.waveformData = null;
+    ts.waveformDirty = true;
+    ts.cachedVisStart = -1;
+    ts.cachedVisEnd = -1;
+    ts.seamWaveformData = null;
+    ts.seamWaveformDirty = true;
+    /* Unload file in DSP */
+    host_module_set_param("t" + trackIdx + ":file_path", "");
+    host_module_set_param("t" + trackIdx + ":muted", "0");
+    /* Sync globals if this is the active track */
+    if (trackIdx === activeTrack) {
+        restoreTrackUIState(trackIdx);
+        openedFilePath = "";
+        totalFrames = 0;
+        waveformData = null;
+        waveformDirty = true;
+    }
+    saveSceneState(trackIdx);
+    saveProjectJson();
+    updateTrackLEDs();
+    updatePlayLED();
+    showStatus("T" + (trackIdx + 1) + " Reset", 60);
+}
+
+/* ---- Scene copy/paste ---- */
+
+function copyScene(trackIdx, sceneIdx) {
+    var ts = trackStates[trackIdx];
+    if (sceneIdx < 0 || sceneIdx >= ts.scenes.length) {
+        showStatus("No scene to copy", 40);
+        return;
+    }
+    /* If this is the playing scene on the active track, save current state first */
+    if (trackIdx === activeTrack && ts.playingSceneIdx === sceneIdx) {
+        saveCurrentSceneState(trackIdx);
+    }
+    var src = ts.scenes[sceneIdx];
+    sceneClipboard = { path: src.path };
+    copySceneFields(src, sceneClipboard);
+    showStatus("Scene " + (sceneIdx + 1) + " copied", 40);
+}
+
+function pasteScene(trackIdx, sceneIdx) {
+    if (!sceneClipboard) {
+        showStatus("No scene in clipboard", 40);
+        return;
+    }
+    var ts = trackStates[trackIdx];
+    /* Extend scenes array if needed */
+    while (ts.scenes.length <= sceneIdx) {
+        ts.scenes.push(makeSceneState(""));
+    }
+    var dst = ts.scenes[sceneIdx];
+    dst.path = sceneClipboard.path;
+    copySceneFields(sceneClipboard, dst);
+    saveSceneState(trackIdx);
+    showStatus("Pasted to P" + (sceneIdx + 1), 40);
+}
+
+/* ---- Track copy/paste ---- */
+
+function copyTrack(trackIdx) {
+    var ts = trackStates[trackIdx];
+    /* Save current UI state if this is the active track */
+    if (trackIdx === activeTrack) saveTrackUIState(trackIdx);
+    /* Save current scene state */
+    if (ts.playingSceneIdx >= 0 && ts.playingSceneIdx < ts.scenes.length) {
+        if (trackIdx === activeTrack) saveCurrentSceneState(trackIdx);
+    }
+    trackClipboard = {
+        scenes: [],
+        playingSceneIdx: ts.playingSceneIdx,
+        selectedSceneIdx: ts.selectedSceneIdx,
+        gainDb: ts.gainDb,
+        pitchSemitones: ts.pitchSemitones,
+        tempoPercent: ts.tempoPercent,
+        loopEnabled: ts.loopEnabled,
+        gateMode: ts.gateMode
+    };
+    for (var i = 0; i < ts.scenes.length; i++) {
+        var copy = { path: ts.scenes[i].path };
+        copySceneFields(ts.scenes[i], copy);
+        trackClipboard.scenes.push(copy);
+    }
+    showStatus("T" + (trackIdx + 1) + " copied", 40);
+}
+
+function pasteTrack(trackIdx) {
+    if (!trackClipboard) {
+        showStatus("No track in clipboard", 40);
+        return;
+    }
+    var ts = trackStates[trackIdx];
+    /* Stop playback on target track */
+    ts.playing = false;
+    if (trackIdx === activeTrack) {
+        playing = false;
+        host_module_set_param("play", "stop");
+    } else {
+        host_module_set_param("t" + trackIdx + ":play", "stop");
+    }
+    /* Copy scenes */
+    ts.scenes = [];
+    for (var i = 0; i < trackClipboard.scenes.length; i++) {
+        var copy = { path: trackClipboard.scenes[i].path };
+        copySceneFields(trackClipboard.scenes[i], copy);
+        ts.scenes.push(copy);
+    }
+    ts.playingSceneIdx = trackClipboard.playingSceneIdx;
+    ts.selectedSceneIdx = trackClipboard.selectedSceneIdx;
+    ts.gainDb = trackClipboard.gainDb;
+    ts.pitchSemitones = trackClipboard.pitchSemitones;
+    ts.tempoPercent = trackClipboard.tempoPercent;
+    ts.loopEnabled = trackClipboard.loopEnabled;
+    ts.gateMode = trackClipboard.gateMode;
+    ts.muted = false;
+    /* Load the playing scene's file into DSP */
+    if (ts.playingSceneIdx >= 0 && ts.playingSceneIdx < ts.scenes.length) {
+        var scene = ts.scenes[ts.playingSceneIdx];
+        ts.loaded = true;
+        ts.fileName = scene.path.split("/").pop();
+        ts.filePath = scene.path;
+        ts.openedFilePath = scene.path;
+        var _tp = "t" + trackIdx + ":";
+        setParamBlocking(_tp + "file_path", scene.path, 2000);
+        setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
+        setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
+        if (scene.syncMode) {
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
+        } else {
+            setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+        }
+        setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
+        setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
+        host_module_set_param(_tp + "muted", "0");
+    }
+    /* Sync globals if this is the active track */
+    if (trackIdx === activeTrack) {
+        restoreTrackUIState(trackIdx);
+        waveformDirty = true;
+        refreshFileInfo();
+        refreshWaveform();
+    }
+    saveSceneState(trackIdx);
+    updateTrackLEDs();
+    showStatus("Pasted to T" + (trackIdx + 1), 40);
+}
+
+/**
+ * Finalize the current scene: truncate the WAV to the trim markers,
+ * save it in the project folder, update the scene path, and reset markers.
+ */
+function doFinalize() {
+    var ts = trackStates[activeTrack];
+    var sceneIdx = ts.playingSceneIdx;
+    if (sceneIdx < 0 || sceneIdx >= ts.scenes.length) {
+        showStatus("No scene loaded", 60);
+        return;
+    }
+    if (totalFrames <= 0) {
+        showStatus("No file loaded", 60);
+        return;
+    }
+    var dir = (projectDir && projectDir !== "_no_project") ? projectDir : SCRATCH_DIR;
+    if (typeof host_ensure_dir === "function") host_ensure_dir(dir);
+
+    /* Auto-apply pitch/tempo before export if modified */
+    if (pitchSemitones !== 0.0 || tempoPercent !== 100) {
+        syncMarkersToDs();
+        host_module_set_param("apply_pitch_tempo", "1");
+        pitchSemitones = 0.0;
+        tempoPercent = 100;
+        refreshState();
+    }
+
+    /* Truncate to current trim markers via DSP export mechanism */
+    syncMarkersToDs();
+    host_module_get_param("dirty");  /* sync barrier */
+    setParamBlockingWithBarrier("export", "1", 10000);
+    var exportedBasename = host_module_get_param("copy_result");
+    if (!exportedBasename || exportedBasename === "ERROR") {
+        showStatus("Finalize failed", 60);
+        return;
+    }
+
+    /* Move exported file into project folder as t{n}_scene{i}_final.wav */
+    /* DSP writes the export into the same directory as the source file,
+     * so derive sampleDir from the currently open file path, not SCRATCH_DIR. */
+    var srcDir = openedFilePath.lastIndexOf("/") >= 0
+        ? openedFilePath.substring(0, openedFilePath.lastIndexOf("/"))
+        : SCRATCH_DIR;
+    var srcPath = srcDir + "/" + exportedBasename;
+    var finalName = "t" + activeTrack + "_scene" + sceneIdx + "_final.wav";
+    var destPath = dir + "/" + finalName;
+    var mvResult = host_system_cmd('mv "' + srcPath + '" "' + destPath + '"');
+    if (mvResult !== 0) {
+        /* mv failed — try cp fallback */
+        host_system_cmd('cp "' + srcPath + '" "' + destPath + '"');
+    }
+
+    /* Update scene path + reset markers to full file */
+    ts.scenes[sceneIdx].path = destPath;
+    ts.scenes[sceneIdx].startSample = 0;
+    ts.scenes[sceneIdx].endSample   = 0;  /* will be set to totalFrames after reload */
+    openedFilePath = destPath;
+
+    /* Reload the finalized file */
+    sceneLoadFile(activeTrack, destPath);
+    totalFrames = 0;
+    waveformDirty = true;
+    pendingSceneRestore = {
+        startSample: 0, endSample: 0,
+        gainDb: gainDb, pitchSemitones: 0.0, tempoPercent: 100,
+        loopEnabled: loopEnabled, hasSlices: false,
+        autoPlay: playing
+    };
+
+    saveSceneState(activeTrack);
+    saveProjectJson();
+    showStatus("Finalized S" + (sceneIdx + 1), 90);
+}
+
+/**
+ * Trigger skipback: extract last N bars from ring buffer and save as new scene.
+ */
+function doSkipback() {
+    var ts = trackStates[activeTrack];
+    /* Target the armed (selectedSceneIdx) slot.
+     * If the armed slot already has content (e.g. user played a scene which
+     * set selectedSceneIdx to that occupied slot), skip to the next free one
+     * so we never overwrite an existing file-backed scene. */
+    var slot = ts.selectedSceneIdx;
+    if (slot < ts.scenes.length && ts.scenes[slot] && ts.scenes[slot].path) {
+        slot = findNextFreeSceneSlot(activeTrack);
+    }
+    if (slot > ts.scenes.length) slot = ts.scenes.length;
+    if (slot >= MAX_SCENES) {
+        showStatus("Max " + MAX_SCENES + " scenes", 60);
+        return;
+    }
+    var bars = SKIPBACK_BARS_OPTIONS[skipbackBarsIdx];
+    var barFrames = Math.round(44100 * 4 * 60 / bpm);
+    var extractFrames = bars * barFrames;
+    var source = (skipbackSourceIdx === SKIPBACK_SOURCE_ACT) ? String(activeTrack) : "master";
+    var dir = (projectDir && projectDir !== "_no_project") ? projectDir : SCRATCH_DIR;
+    if (typeof host_ensure_dir === "function") host_ensure_dir(dir);
+    var path = dir + "/t" + activeTrack + "_scene" + slot + ".wav";
+    host_module_set_param("skipback", source + "," + extractFrames + "," + path);
+    skipbackTargetSlot = slot;
+    skipbackPending = true;
+    skipbackCaptureSeconds = extractFrames / 44100;  /* informational */
+    showStatus("Skipback " + bars + "b...", 90);
+}
+
+/* ============ Project folder browser ============ */
+
+/**
+ * Open the project browser overlay (VIEW_PROJECT).
+ * Called at startup (fresh session and reconnect) when no project is set.
+ */
+function initProjectBrowser() {
+    /* Save current project state before switching projects */
+    saveProjectJson();
+    projectBrowserState = buildFilepathBrowserState(
+        { root: SCRATCH_DIR, name: "Project Folder" },
+        ""
+    );
+    refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
+    /* Remove file entries (only show dirs), then prepend action items */
+    if (projectBrowserState && projectBrowserState.items) {
+        projectBrowserState.items = projectBrowserState.items.filter(function(it) {
+            return it.kind !== "file";
+        });
+        projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
+        projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
+        projectBrowserState.selectedIndex = 0;
+    }
+    currentView = VIEW_PROJECT;
+    announce("Select or create project folder");
+}
+
+/**
+ * Draw VIEW_PROJECT — project folder selection at startup.
+ */
+function drawProjectView() {
+    clear_screen();
+    print(0, 0, "SELECT PROJECT", 1);
+    fill_rect(0, 8, 128, 1, 1);
+
+    var state = projectBrowserState;
+    if (!state) {
+        print(4, 20, "Loading...", 1);
+        return;
+    }
+
+    /* Reuse filepath browser draw logic */
+    var items = state.items || [];
+    var sel = state.selectedIndex || 0;
+    var maxVisible = 4;
+    var startIdx = Math.max(0, sel - maxVisible + 1);
+    for (var _pi = 0; _pi < maxVisible; _pi++) {
+        var _idx = startIdx + _pi;
+        if (_idx >= items.length) break;
+        var _item = items[_idx];
+        var _y = 12 + _pi * 13;
+        if (_idx === sel) {
+            fill_rect(0, _y - 1, 128, 11, 1);
+            print(2, _y, _item.label, 0);
+        } else {
+            print(2, _y, _item.label, 1);
+        }
+    }
+    print(0, 57, "JOG=navigate  CLICK=select", 1);
 }
 
 function drawOpenFileBrowser() {
@@ -1963,10 +3839,10 @@ function normalizeSelect() {
     switch (normalizeIndex) {
         case 0: /* Normalize */
             doNormalize();
-            switchView(VIEW_TRIM);
+            switchView(VIEW_FREE);
             break;
         case 1: /* Cancel */
-            switchView(VIEW_TRIM);
+            switchView(VIEW_FREE);
             break;
     }
 }
@@ -1984,26 +3860,16 @@ function ensureSourceSaved() {
         : openedFilePath.substring(0, openedFilePath.lastIndexOf("/"));
     var destPath = destDir + "/" + targetName;
     /* In trim/loop view, apply trim if markers don't span the full file */
-    if ((saveReturnView === VIEW_TRIM || saveReturnView === VIEW_LOOP) &&
+    if ((saveReturnView === VIEW_FREE || saveReturnView === VIEW_LOOP) &&
         (startSample > 0 || endSample < totalFrames)) {
-        if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("trim", "1", 5000);
-        } else {
-            host_module_set_param("trim", "1");
-            host_module_get_param("dirty"); /* sync barrier */
-        }
+        setParamBlockingWithBarrier("trim", "1", 5000);
         refreshFileInfo();
         invalidateWaveform();
     }
     /* Apply pending edits (gain etc) — use blocking call so gain is applied
      * before the save that follows */
     if (gainDb !== 0.0) {
-        if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("apply_gain", "1", 5000);
-        } else {
-            host_module_set_param("apply_gain", "1");
-            host_module_get_param("dirty"); /* sync barrier */
-        }
+        setParamBlockingWithBarrier("apply_gain", "1", 5000);
     }
     if (isScratchFile() || openedFilePath !== destPath) {
         /* Name changed or scratch — use save_as to write directly to dest.
@@ -2012,12 +3878,7 @@ function ensureSourceSaved() {
         if (typeof host_ensure_dir === "function") {
             host_ensure_dir(destDir);
         }
-        if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("save_as", destPath, 10000);
-        } else {
-            host_module_set_param("save_as", destPath);
-            host_module_get_param("dirty"); /* sync barrier */
-        }
+        setParamBlockingWithBarrier("save_as", destPath, 10000);
         /* Verify the file was written */
         if (typeof host_file_exists === "function" && !host_file_exists(destPath)) {
             showStatus("Save failed: write error", 60);
@@ -2030,12 +3891,7 @@ function ensureSourceSaved() {
         return destPath;
     }
     /* Same name, same path — save in place with sync barrier */
-    if (typeof host_module_set_param_blocking === "function") {
-        host_module_set_param_blocking("save", "1", 10000);
-    } else {
-        host_module_set_param("save", "1");
-        host_module_get_param("dirty"); /* sync barrier */
-    }
+    setParamBlockingWithBarrier("save", "1", 10000);
     isRecordedFile = false;
     refreshState();
     refreshFileInfo();
@@ -2149,19 +4005,9 @@ function returnToSaveView() {
  */
 function doSave() {
     if (gainDb !== 0.0) {
-        if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("apply_gain", "1", 5000);
-        } else {
-            host_module_set_param("apply_gain", "1");
-            host_module_get_param("dirty"); /* sync barrier */
-        }
+        setParamBlockingWithBarrier("apply_gain", "1", 5000);
     }
-    if (typeof host_module_set_param_blocking === "function") {
-        host_module_set_param_blocking("save", "1", 10000);
-    } else {
-        host_module_set_param("save", "1");
-        host_module_get_param("dirty"); /* sync barrier */
-    }
+    setParamBlockingWithBarrier("save", "1", 10000);
     isRecordedFile = false;
     var folder = leafFolder(openedFilePath);
     showStatus("Saved to " + folder, 90);
@@ -2296,6 +4142,52 @@ function doMute() {
     updateLeds();
 }
 
+function doFadeIn() {
+    syncMarkersToDs();
+    host_module_set_param("fade_in", "1");
+    showStatus("Fade in", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
+function doFadeOut() {
+    syncMarkersToDs();
+    host_module_set_param("fade_out", "1");
+    showStatus("Fade out", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
+function doReverse() {
+    syncMarkersToDs();
+    host_module_set_param("reverse", "1");
+    showStatus("Reverse", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+}
+
+function doResetFile() {
+    if (!openedFilePath || totalFrames <= 0) {
+        showStatus("No file", 60);
+        return;
+    }
+    setParamBlocking("file_path", openedFilePath, 2000);
+    pitchSemitones = 0.0;
+    tempoPercent = 100;
+    gainDb = 0.0;
+    zoomLevel = 0;
+    vScale = 1.0;
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    showStatus("Reset", 60);
+    announce("File Reset");
+    updateLeds();
+}
+
 /**
  * Cut selection to clipboard (copy + remove).
  */
@@ -2327,6 +4219,226 @@ function doPaste() {
 }
 
 /**
+ * Paste clipboard at cursor (overwrite at start_sample, file length unchanged).
+ */
+function doPasteOverwrite() {
+    refreshState();
+    if (!hasClipboard) {
+        showStatus("Nothing to paste", 45);
+        return;
+    }
+    host_module_set_param("paste_overwrite", "1");
+    showStatus("Pasted (overwrite)", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Copy selected slice audio to clipboard.
+ */
+function doSliceCopy() {
+    startSample = sliceBoundaries[selectedSlice];
+    endSample = sliceBoundaries[selectedSlice + 1];
+    syncMarkersToDs();
+    host_module_set_param("copy", "1");
+    hasClipboard = true;
+    showStatus("Copied Slice " + (selectedSlice + 1), 60);
+    updateLeds();
+}
+
+/**
+ * Paste clipboard overwrite into selected slice (file length unchanged).
+ */
+function doSlicePasteOverwrite() {
+    if (!hasClipboard) { showStatus("Nothing to paste", 45); return; }
+    startSample = sliceBoundaries[selectedSlice];
+    endSample = sliceBoundaries[selectedSlice + 1];
+    syncMarkersToDs();
+    host_module_set_param("paste_overwrite", "1");
+    showStatus("Pasted \u2192 Slice " + (selectedSlice + 1), 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+/**
+ * Cut selected slice audio out of file, update boundaries.
+ * Requires at least 2 slices (can't cut the last one).
+ */
+function doSliceCut() {
+    if (sliceCount <= 1) { showStatus("Last slice", 45); return; }
+    var sliceStart = sliceBoundaries[selectedSlice];
+    var sliceEnd   = sliceBoundaries[selectedSlice + 1];
+    var sliceLen   = sliceEnd - sliceStart;
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    setParamBlockingWithBarrier("cut", "1", 5000);
+    hasClipboard = true;
+    refreshFileInfo();
+    refreshState();
+    hasClipboard = true; /* re-assert: refreshState() may have read stale DSP state */
+    /* Remove end boundary of cut slice; shift all following boundaries left */
+    sliceBoundaries.splice(selectedSlice + 1, 1);
+    for (var i = selectedSlice + 1; i < sliceBoundaries.length; i++) {
+        sliceBoundaries[i] -= sliceLen;
+    }
+    sliceCount    = sliceBoundaries.length - 1;
+    sliceRegionEnd -= sliceLen;
+    if (selectedSlice >= sliceCount) selectedSlice = sliceCount - 1;
+    if (selectedSlice < 0) selectedSlice = 0;
+    selectSlice(selectedSlice);
+    syncMarkersToDs();
+    saveSliceState();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Cut Slice", 60);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Paste clipboard insert before selected slice, creating a new slice.
+ */
+function doSlicePasteInsert() {
+    if (!hasClipboard) { showStatus("Nothing to paste", 45); return; }
+    var oldTotal  = totalFrames;
+    var insertAt  = sliceBoundaries[selectedSlice];
+    startSample = insertAt;
+    endSample   = insertAt;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    setParamBlockingWithBarrier("paste", "1", 5000);
+    refreshFileInfo();
+    refreshState();
+    var insertedFrames = totalFrames - oldTotal;
+    if (insertedFrames <= 0) { showStatus("Paste failed", 45); return; }
+    /* Shift existing boundaries from selectedSlice+1 onward, then insert new boundary */
+    for (var i = selectedSlice + 1; i < sliceBoundaries.length; i++) {
+        sliceBoundaries[i] += insertedFrames;
+    }
+    sliceBoundaries.splice(selectedSlice + 1, 0, insertAt + insertedFrames);
+    sliceCount     = sliceBoundaries.length - 1;
+    sliceRegionEnd += insertedFrames;
+    /* selectedSlice now points to the newly inserted slice */
+    selectSlice(selectedSlice);
+    syncMarkersToDs();
+    saveSliceState();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Inserted Slice " + (selectedSlice + 1), 60);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Move selected slice one position to the right (swap with next slice).
+ * Physically cuts slice i and re-inserts it after slice i+1.
+ * Net effect on boundaries: none. Only audio content is reordered.
+ */
+function doSliceMoveRight() {
+    if (selectedSlice >= sliceCount - 1) { showStatus("Last slice", 30); return; }
+    var sliceStart   = sliceBoundaries[selectedSlice];
+    var sliceEnd     = sliceBoundaries[selectedSlice + 1];
+    var nextEnd      = sliceBoundaries[selectedSlice + 2];
+    var insertPoint  = sliceStart + (nextEnd - sliceEnd); /* start + len of next slice */
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    setParamBlockingWithBarrier("cut", "1", 5000);
+    hasClipboard = true;
+    refreshFileInfo();
+    startSample = insertPoint;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    setParamBlockingWithBarrier("paste", "1", 5000);
+    refreshFileInfo();
+    refreshState();
+    selectedSlice++;
+    selectSlice(selectedSlice);
+    /* Adjust pad bank if needed */
+    if (selectedSlice >= slicePadOffset + 32) slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Slice \u2192 " + (selectedSlice + 1), 30);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Move selected slice one position to the left (swap with previous slice).
+ * Physically cuts slice i and re-inserts it before slice i-1.
+ * Net effect on boundaries: none. Only audio content is reordered.
+ */
+function doSliceMoveLeft() {
+    if (selectedSlice <= 0) { showStatus("First slice", 30); return; }
+    var sliceStart   = sliceBoundaries[selectedSlice];
+    var sliceEnd     = sliceBoundaries[selectedSlice + 1];
+    var insertPoint  = sliceBoundaries[selectedSlice - 1]; /* before previous slice */
+    startSample = sliceStart;
+    endSample   = sliceEnd;
+    syncMarkersToDs();
+    setParamBlockingWithBarrier("cut", "1", 5000);
+    hasClipboard = true;
+    refreshFileInfo();
+    startSample = insertPoint;
+    syncMarkersToDs();
+    host_module_get_param("dirty"); /* sync barrier: ensure markers are set before paste */
+    setParamBlockingWithBarrier("paste", "1", 5000);
+    refreshFileInfo();
+    refreshState();
+    selectedSlice--;
+    selectSlice(selectedSlice);
+    /* Adjust pad bank if needed */
+    if (selectedSlice < slicePadOffset) slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("\u2190 Slice " + (selectedSlice + 1), 30);
+    announce("Slice " + (selectedSlice + 1) + " of " + sliceCount);
+}
+
+/**
+ * Shuffle all slices into a random order (Fisher-Yates).
+ * For each position i, picks a random source j >= i and moves it
+ * into place using repeated cut+paste (same mechanism as doSliceMoveLeft).
+ */
+function doSliceShuffle() {
+    if (sliceCount < 2) { showStatus("Need 2+ slices", 30); return; }
+    for (var i = 0; i < sliceCount - 1; i++) {
+        var j = i + Math.floor(Math.random() * (sliceCount - i));
+        /* Move slice j leftward to position i */
+        for (var k = j; k > i; k--) {
+            /* Cut slice at position k */
+            var sliceStart  = sliceBoundaries[k];
+            var sliceEnd    = sliceBoundaries[k + 1];
+            var insertPoint = sliceBoundaries[k - 1];
+            startSample = sliceStart;
+            endSample   = sliceEnd;
+            syncMarkersToDs();
+            setParamBlockingWithBarrier("cut", "1", 5000);
+            hasClipboard = true;
+            refreshFileInfo();
+            startSample = insertPoint;
+            syncMarkersToDs();
+            host_module_get_param("dirty");
+            setParamBlockingWithBarrier("paste", "1", 5000);
+            refreshFileInfo();
+        }
+    }
+    refreshState();
+    selectedSlice = 0;
+    selectSlice(0);
+    slicePadOffset = 0;
+    syncMarkersToDs();
+    invalidateWaveform();
+    updateSlicePadLeds();
+    showStatus("Shuffled " + sliceCount + " slices", 60);
+    announce("Shuffled " + sliceCount + " slices");
+}
+
+/**
  * Save As — prompt for filename, copy file to permanent location.
  * Opens the text entry keyboard with a pre-filled timestamp name.
  */
@@ -2353,24 +4465,14 @@ function doSaveAs(onDone) {
             var destPath = destDir + "/" + destName;
             /* Apply pending edits before saving */
             if (gainDb !== 0.0) {
-                if (typeof host_module_set_param_blocking === "function") {
-                    host_module_set_param_blocking("apply_gain", "1", 5000);
-                } else {
-                    host_module_set_param("apply_gain", "1");
-                    host_module_get_param("dirty"); /* sync barrier */
-                }
+                setParamBlockingWithBarrier("apply_gain", "1", 5000);
             }
             /* Use save_as to write directly to dest (DSP runs as root + chowns).
              * Avoids race condition of save + cp. */
             if (typeof host_ensure_dir === "function") {
                 host_ensure_dir(destDir);
             }
-            if (typeof host_module_set_param_blocking === "function") {
-                host_module_set_param_blocking("save_as", destPath, 10000);
-            } else {
-                host_module_set_param("save_as", destPath);
-                host_module_get_param("dirty"); /* sync barrier */
-            }
+            setParamBlockingWithBarrier("save_as", destPath, 10000);
             if (typeof host_file_exists === "function" && !host_file_exists(destPath)) {
                 showStatus("Save failed", 60);
             } else {
@@ -2451,12 +4553,7 @@ function exportSlicedWavs(overrideName) {
 
         /* Trigger export — DSP writes timestamped file, returns name in copy_result.
          * Use blocking call to ensure export completes before reading result. */
-        if (typeof host_module_set_param_blocking === "function") {
-            host_module_set_param_blocking("export", "1", 10000);
-        } else {
-            host_module_set_param("export", "1");
-            host_module_get_param("dirty"); /* sync barrier */
-        }
+        setParamBlockingWithBarrier("export", "1", 10000);
         var result = host_module_get_param("copy_result");
 
         if (!result || result === "ERROR") continue;
@@ -2520,12 +4617,7 @@ function exportRexLoop(overrideName) {
     syncMarkersToDs();
     host_module_get_param("dirty"); /* sync barrier */
     /* Use blocking call to ensure export completes before reading result */
-    if (typeof host_module_set_param_blocking === "function") {
-        host_module_set_param_blocking("export", "1", 10000);
-    } else {
-        host_module_set_param("export", "1");
-        host_module_get_param("dirty"); /* sync barrier */
-    }
+    setParamBlockingWithBarrier("export", "1", 10000);
     var exportResult = host_module_get_param("copy_result");
 
     /* Restore markers */
@@ -2839,6 +4931,19 @@ function doNormalize() {
     updateLeds();
 }
 
+/**
+ * Normalize selected region to -0.3dBFS.
+ */
+function doNormalizeSelection() {
+    host_module_set_param("normalize_selection", "1");
+    showStatus("Norm. Selection", 60);
+    refreshFileInfo();
+    refreshState();
+    invalidateWaveform();
+    updateLeds();
+}
+
+
 /* ============ MIDI Input Handling ============ */
 
 /**
@@ -2848,6 +4953,73 @@ function handleCC(cc, value) {
     /* Shift tracking */
     if (cc === CC_SHIFT) {
         shiftHeld = (value === 127);
+        if (!shiftHeld && beatDivPopupOpen) {
+            beatDivPopupOpen = false;
+            refreshWaveform();
+        }
+        return;
+    }
+
+    /* --- MoveRow1-4: Track selection / file browser / combos --- */
+    for (var _t = 0; _t < NUM_TRACKS; _t++) {
+        if (cc === TRACK_CCS[_t] && value > 0) {
+            if (muteHeld) {
+                /* Mute+MoveRow: toggle track mute */
+                var _mts = trackStates[_t];
+                _mts.muted = !_mts.muted;
+                host_module_set_param("t" + _t + ":muted", _mts.muted ? "1" : "0");
+                updateTrackLEDs();
+                showStatus("T" + (_t + 1) + (_mts.muted ? " Muted" : " Unmuted"), 40);
+                mutePendingAction = false;
+                return;
+            }
+            if (deleteHeld) {
+                /* Delete+MoveRow: reset entire track (with confirmation) */
+                deleteHeld = false;
+                deletePendingCut = false;
+                confirmTrackReset(_t);
+                return;
+            }
+            if (copyHeld) {
+                if (shiftHeld) {
+                    /* Shift+Copy+MoveRow: paste/overwrite track */
+                    pasteTrack(_t);
+                    copyPendingAction = false;
+                } else {
+                    /* Copy+MoveRow: copy track */
+                    copyTrack(_t);
+                    copyPendingAction = false;
+                }
+                return;
+            }
+            if (shiftHeld) {
+                /* Shift+MoveRow: open file browser for this track */
+                pendingBrowserTrack = _t;
+                if (_t !== activeTrack) {
+                    saveTrackUIState(activeTrack);
+                    activeTrack = _t;
+                    host_module_set_param("active_track", String(_t));
+                    restoreTrackUIState(_t);
+                }
+                /* Enter file browser — open in last used folder for this track */
+                openFileBrowserState = buildFilepathBrowserState(
+                    { root: "/data/UserData/UserLibrary", filter: ".wav" },
+                    trackStates[_t].filePath || ""
+                );
+                refreshBrowserWithRecording();
+                switchView(VIEW_OPEN_FILE);
+                announce("Open file for Track " + (_t + 1));
+            } else {
+                /* Normal press: select track (or toggle play if already active) */
+                switchToTrack(_t);
+            }
+            return;
+        }
+    }
+
+    /* --- MovePlay: toggle Move global transport; tracks follow via transportPlaying in tick() --- */
+    if (cc === CC_PLAY && value > 0) {
+        queuePlayToggle();
         return;
     }
 
@@ -2857,13 +5029,15 @@ function handleCC(cc, value) {
     }
 
     /* Only handle presses (value > 0) for remaining CCs, except jog/encoders */
-    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4 || cc === CC_E5 || cc === CC_E7 || cc === CC_E8);
+    var isEncoder = (cc === CC_JOG || cc === CC_E1 || cc === CC_E2 || cc === CC_E3 || cc === CC_E4 || cc === CC_E5 || cc === CC_E6 || cc === CC_E7 || cc === CC_E8);
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
-        /* Shift+Back: full exit (unload DSP) for quick iteration */
+        /* Shift+Back: show Save/Discard/Cancel dialog before closing */
         if (shiftHeld) {
-            fullExit();
+            closeDialogIndex = 0;
+            closeDialogReturnView = currentView;
+            switchView(VIEW_CONFIRM_CLOSE);
             return;
         }
         /* During recording/paused/record-ready, just hide — DSP keeps recording */
@@ -2872,7 +5046,7 @@ function handleCC(cc, value) {
             return;
         }
         switch (currentView) {
-            case VIEW_TRIM:
+            case VIEW_FREE:
             case VIEW_LOOP:
                 exitEditor();
                 break;
@@ -2900,10 +5074,37 @@ function handleCC(cc, value) {
                 exitEditor();
                 break;
             case VIEW_CONFIRM_EXIT:
-                switchView(VIEW_TRIM);
+                switchView(VIEW_FREE);
                 break;
             case VIEW_CONFIRM_NORMALIZE:
-                switchView(VIEW_TRIM);
+                switchView(VIEW_FREE);
+                break;
+            case VIEW_JOG_MENU:
+            case VIEW_JOG_SHIFT_MENU:
+            case VIEW_SYNC:
+                switchView(VIEW_FREE);
+                break;
+            case VIEW_MAIN_MENU:
+                switchView(mainMenuReturnView);
+                break;
+            case VIEW_CONFIRM_CLOSE:
+                switchView(closeDialogReturnView);
+                break;
+            case VIEW_CONFIRM_RESUME:
+                /* Back = treat as Resume */
+                doReconnectRestore();
+                break;
+            case VIEW_PROJECT:
+                /* Back on project browser = skip without selecting a project */
+                projectDir = "_no_project";
+                host_module_set_param("project_dir", projectDir);
+                projectBrowserState = null;
+                newProjectFileBrowser = false;
+                recordState = "ready";
+                recordLedCounter = 0;
+                currentView = VIEW_FREE;
+                updateLeds();
+                announce("New Recording, press REC to record");
                 break;
             case VIEW_CONFIRM_SAVE:
                 switchView(saveReturnView);
@@ -2931,50 +5132,104 @@ function handleCC(cc, value) {
                     announce(bDirName + ", " + bFirst);
                 } else {
                     openFileBrowserState = null;
-                    currentView = VIEW_MODE_MENU;
-                    announce("Menu, " + menuItems[menuIndex]);
+                    if (newProjectFileBrowser) {
+                        /* Back from file browser after new project — go to
+                         * record-ready so the user can start recording. */
+                        newProjectFileBrowser = false;
+                        recordState = "ready";
+                        recordLedCounter = 0;
+                        currentView = VIEW_FREE;
+                        updateLeds();
+                        announce("New Recording, press REC to record");
+                    } else {
+                        currentView = VIEW_MODE_MENU;
+                        announce("Menu, " + menuItems[menuIndex]);
+                    }
                 }
                 break;
         }
         return;
     }
 
-    /* Mute button — zero out selection */
-    if (cc === CC_MUTE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            doMute();
-            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
-        }
-        return;
-    }
-
-    /* Delete button — cut selection to clipboard */
-    if (cc === CC_DELETE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            doCut();
-            if (currentView === VIEW_LOOP) invalidateSeamWaveform();
-        }
-        return;
-    }
-
-    /* Copy button: normal = copy to clipboard, shift = paste */
-    if (cc === CC_COPY && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            if (shiftHeld) {
-                doPaste();
-                if (currentView === VIEW_LOOP) invalidateSeamWaveform();
-            } else {
-                doCopy();
+    /* Mute button — press/release pattern for combos */
+    if (cc === CC_MUTE) {
+        if (value > 0) {
+            muteHeld = true;
+            mutePendingAction = true;
+        } else {
+            /* Release: execute destructive mute only if no combo was used */
+            if (mutePendingAction) {
+                if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+                    doMute();
+                } else if (currentView === VIEW_LOOP) {
+                    doMute();
+                    invalidateSeamWaveform();
+                }
             }
+            muteHeld = false;
+            mutePendingAction = false;
         }
         return;
     }
+
 
     /* Undo button */
     if (cc === CC_UNDO && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) {
             doUndo();
             if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+        }
+        return;
+    }
+
+    /* Copy button: press/release for combos (Copy+Pad, Copy+MoveRow) */
+    if (cc === CC_COPY) {
+        if (value > 0) {
+            copyHeld = true;
+            copyPendingAction = true;
+        } else {
+            /* Release: execute audio copy/paste only if no combo was used */
+            if (copyPendingAction) {
+                if (shiftHeld) {
+                    if (currentView === VIEW_SLICE) {
+                        doSlicePasteInsert();
+                    } else {
+                        doPaste();
+                        if (currentView === VIEW_LOOP) invalidateSeamWaveform();
+                    }
+                } else {
+                    if (currentView === VIEW_SLICE) {
+                        doSliceCopy();
+                    } else {
+                        doCopy();
+                    }
+                }
+            }
+            copyHeld = false;
+            copyPendingAction = false;
+        }
+        return;
+    }
+
+    /* Remove (Delete) button: cut (all views), or hold as modifier for combos */
+    if (cc === CC_DELETE) {
+        if (value > 0) {
+            deleteHeld = true;
+            deletePendingCut = true;
+        } else {
+            /* Release: execute cut only if no combo was used */
+            if (deletePendingCut) {
+                if (currentView === VIEW_SLICE) {
+                    doSliceCut();
+                } else if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
+                    doCut();
+                } else if (currentView === VIEW_LOOP) {
+                    doCut();
+                    invalidateSeamWaveform();
+                }
+            }
+            deleteHeld = false;
+            deletePendingCut = false;
         }
         return;
     }
@@ -2992,9 +5247,15 @@ function handleCC(cc, value) {
                 showStatus("Zero-X found", 60);
             } else {
                 /* Loop button in loop view: return to trim */
-                switchView(VIEW_TRIM);
+                switchView(VIEW_FREE);
             }
-        } else if (currentView === VIEW_TRIM) {
+        } else if (currentView === VIEW_SYNC) {
+            if (shiftHeld) {
+                /* Shift+Loop in BPM view: toggle loop on/off */
+                toggleLoop();
+            }
+            /* Plain Loop press does nothing in BPM view */
+        } else if (currentView === VIEW_FREE) {
             if (shiftHeld) {
                 /* Shift+Loop in trim view: toggle loop on/off */
                 toggleLoop();
@@ -3004,6 +5265,19 @@ function handleCC(cc, value) {
             }
         }
         return;
+    }
+
+    /* REC button — skipback when in scene mode with audio loaded,
+     * otherwise fall through to live recording handler below */
+    if (cc === CC_REC && value > 0) {
+        var _inSceneMode = ((projectDir && projectDir !== "_no_project") ||
+                            trackStates[activeTrack].scenes.length > 0) &&
+                           recordState === "idle";
+        if (_inSceneMode && !skipbackPending) {
+            doSkipback();
+            updateLeds();
+            return;
+        }
     }
 
     /* REC button — start/stop/resume recording; Shift+REC = pause/start */
@@ -3056,34 +5330,22 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Capture button — toggle between Trim and Slice mode.
-     * Shift+Capture: export selection to new file. */
+    /* Capture button: Shift+Capture = Finalize current scene */
     if (cc === CC_CAPTURE && value > 0) {
-        if (shiftHeld) {
-            if (currentView === VIEW_TRIM || currentView === VIEW_LOOP || currentView === VIEW_SLICE) {
-                doExport();
-            }
+        if (shiftHeld && (currentView === VIEW_FREE || currentView === VIEW_SYNC)) {
+            doFinalize();
+        }
+        return;
+    }
+
+    /* Menu button — open main project menu */
+    if (cc === CC_MENU && value > 0) {
+        if (currentView === VIEW_MAIN_MENU) {
+            switchView(mainMenuReturnView);
         } else {
-            if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-                switchView(VIEW_SLICE);
-            } else if (currentView === VIEW_SLICE) {
-                if (lazyChopping) {
-                    stopPlayback();
-                    lazyChopping = false;
-                    announce("Chop stopped");
-                }
-                /* Restore loop state and selection spanning all slices */
-                if (savedLoopState) {
-                    loopEnabled = true;
-                    host_module_set_param("play_loop", "1");
-                }
-                startSample = sliceBoundaries[0];
-                endSample = sliceBoundaries[sliceCount];
-                syncMarkersToDs();
-                /* Clear persisted slice state — user explicitly left slice mode */
-                host_module_set_param("slice_state", "");
-                switchView(VIEW_TRIM);
-            }
+            mainMenuIndex = 0;
+            mainMenuReturnView = currentView;
+            switchView(VIEW_MAIN_MENU);
         }
         return;
     }
@@ -3092,7 +5354,7 @@ function handleCC(cc, value) {
      * Shows editable filename at top + action items below.
      * Trim/Loop: Save + Cancel.  Slice: Slices + Drum Preset + REX + Cancel. */
     if (cc === CC_SAMPLE && value > 0) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) {
             saveName = isScratchFile()
                 ? generateDefaultSaveName()
                 : fileName.replace(/\.wav$/i, "");
@@ -3114,7 +5376,7 @@ function handleCC(cc, value) {
 
     /* Left/Right arrows — nudge selection or jump by selection length */
     if ((cc === CC_LEFT || cc === CC_RIGHT) && value > 0) {
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_FREE) {
             var selLen = endSample - startSample;
             var dir = (cc === CC_LEFT) ? -1 : 1;
 
@@ -3160,27 +5422,58 @@ function handleCC(cc, value) {
             refreshWaveform();
             announce("Start:" + formatTime(startSample));
         } else if (currentView === VIEW_SLICE) {
-            /* Left/Right: select prev/next slice (wraps) */
-            var sliceDir = (cc === CC_LEFT) ? -1 : 1;
-            var newIdx = selectedSlice + sliceDir;
-            if (newIdx < 0) newIdx = sliceCount - 1;
-            if (newIdx >= sliceCount) newIdx = 0;
-            selectSlice(newIdx);
-            /* Auto-scroll pad bank if selected slice is outside visible range */
-            if (selectedSlice < slicePadOffset) {
-                slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-            } else if (selectedSlice >= slicePadOffset + 32) {
-                slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+            if (shiftHeld) {
+                /* Shift+Left/Right: move selected slice one position (swap with neighbour) */
+                if (cc === CC_LEFT) {
+                    doSliceMoveLeft();
+                } else {
+                    doSliceMoveRight();
+                }
+            } else {
+                /* Left/Right: select prev/next slice (wraps) */
+                var sliceDir = (cc === CC_LEFT) ? -1 : 1;
+                var newIdx = selectedSlice + sliceDir;
+                if (newIdx < 0) newIdx = sliceCount - 1;
+                if (newIdx >= sliceCount) newIdx = 0;
+                selectSlice(newIdx);
+                /* Auto-scroll pad bank if selected slice is outside visible range */
+                if (selectedSlice < slicePadOffset) {
+                    slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+                } else if (selectedSlice >= slicePadOffset + 32) {
+                    slicePadOffset = Math.floor(selectedSlice / 32) * 32;
+                }
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
             }
-            syncMarkersToDs();
-            updateSlicePadLeds();
-            announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
         }
         return;
     }
 
-    /* Up/Down arrows in slice mode */
+    /* Up/Down arrows */
     if ((cc === CC_UP || cc === CC_DOWN) && value > 0) {
+        if (currentView === VIEW_SYNC) {
+            if (cc === CC_DOWN) {
+                /* Down: read BPM from filename and snap end marker */
+                if (!detectBpmFromFilename()) showStatus("No BPM in filename", 60);
+            } else {
+                /* Up: estimate BPM from selection length */
+                var selLen = endSample - startSample;
+                if (selLen <= 0) { showStatus("Empty selection", 60); return; }
+                var div = BEAT_DIVISIONS[beatDivIndex];
+                var estimatedBpm = 960.0 / (selLen / sampleRate * div);
+                estimatedBpm = Math.round(estimatedBpm * 10) / 10;
+                if (estimatedBpm < 20 || estimatedBpm > 999) {
+                    showStatus("BPM out of range", 60); return;
+                }
+                bpm = estimatedBpm;
+                syncMode = true;
+                tempoPercent = Math.round(globalBpm / bpm * 100);
+                syncSyncModeToDs();
+                showStatus("BPM: " + bpm.toFixed(1), 90);
+            }
+            return;
+        }
         if (currentView === VIEW_SLICE) {
             if (shiftHeld && sliceCount > 32) {
                 /* Shift+Up/Down: pad bank scrolling (>32 slices) */
@@ -3237,6 +5530,14 @@ function handleCC(cc, value) {
                 announce(menuItems[menuIndex]);
                 break;
 
+            case VIEW_PROJECT:
+                if (projectBrowserState) {
+                    moveFilepathBrowserSelection(projectBrowserState, delta);
+                    var psel = projectBrowserState.items[projectBrowserState.selectedIndex];
+                    if (psel) announce(psel.label);
+                }
+                break;
+
             case VIEW_OPEN_FILE:
                 if (openFileBrowserState) {
                     moveFilepathBrowserSelection(openFileBrowserState, delta);
@@ -3267,11 +5568,22 @@ function handleCC(cc, value) {
                 announce(saveIndex === 0 ? saveName : saveActions[saveIndex - 1]);
                 break;
 
-            case VIEW_TRIM:
-                /* Adjust selected marker: shift = 1 sample, normal = coarse */
-                adjustMarker(selectedField, shiftHeld ? delta : delta * getCoarseStep());
-                showJogStatus((selectedField === 0 ? "Start:" : "End:") + formatTime(selectedField === 0 ? startSample : endSample));
-                refreshWaveform();
+            case VIEW_FREE:
+                if (zoomLevel > 0) {
+                    /* Zoomed in: scroll viewport. Shift = fine (1px), normal = 1/8 view */
+                    var scrollStep = shiftHeld
+                        ? Math.max(1, Math.floor(getVisibleSamples() / SCREEN_W))
+                        : Math.max(1, Math.floor(getVisibleSamples() / 8));
+                    zoomCenter += delta * scrollStep;
+                    /* Clamp so the visible window stays within file boundaries */
+                    var visHalf = Math.floor(getVisibleSamples() / 2);
+                    if (zoomCenter < visHalf) zoomCenter = visHalf;
+                    if (zoomCenter > totalFrames - visHalf) zoomCenter = totalFrames - visHalf;
+                    refreshWaveform();
+                    showJogStatus("Pos:" + formatTime(getVisibleStart()));
+                } else {
+                    showStatus("Nothing to pan", 30);
+                }
                 break;
 
             case VIEW_LOOP:
@@ -3281,91 +5593,82 @@ function handleCC(cc, value) {
                 showJogStatus(loopSelectedField === 0 ? "Pt:" + formatTime(startSample) : "End:" + formatTime(endSample));
                 break;
 
-            case VIEW_SLICE:
-                if (lazyChopping) break; /* No jog edits while chopping */
-                if (sliceMenuEditing) {
-                    /* Editing the focused parameter */
-                    if (sliceMenuIndex === 0) {
-                        /* Toggle mode */
-                        /* Cycle: Even -> Auto -> Lazy -> Even */
-                        if (delta > 0) {
-                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_AUTO;
-                            else if (sliceMode === SLICE_MODE_AUTO) sliceMode = SLICE_MODE_LAZY;
-                            else sliceMode = SLICE_MODE_EVEN;
-                        } else {
-                            if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_LAZY;
-                            else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_AUTO;
-                            else sliceMode = SLICE_MODE_EVEN;
-                        }
-                        if (sliceMode === SLICE_MODE_LAZY) {
-                            lazySub = LAZY_SUB_CHOP;
-                            lazyChopping = false;
-                        }
-                        /* Reset to full region when switching modes */
-                        sliceCount = 1;
-                        selectedSlice = 0;
-                        sliceBoundaries = [];
-                        slicePadOffset = 0;
-                        recomputeSliceBoundaries();
-                        selectSlice(0);
-                        syncMarkersToDs();
-                        updateSlicePadLeds();
-                        var modeAnnounce = sliceMode === SLICE_MODE_LAZY ? "Lazy, press Pad 1" : (sliceMode === SLICE_MODE_AUTO ? "Auto" : "Even");
-                        announce(modeAnnounce);
-                    } else if (sliceMenuIndex === 1) {
-                        if (sliceMode === SLICE_MODE_LAZY) {
-                            /* Toggle Chop / Play sub-mode */
-                            lazySub = (lazySub === LAZY_SUB_CHOP) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
-                            lazyChopping = false;
-                            updateSlicePadLeds();
-                            announce(lazySub === LAZY_SUB_CHOP ? "Chop, press Pad 1" : "Play");
-                        } else if (sliceMode === SLICE_MODE_EVEN) {
-                            /* Adjust slice count */
-                            sliceCount += (delta > 0 ? 1 : -1);
-                            if (sliceCount < 1) sliceCount = 1;
-                            if (sliceCount > 128) sliceCount = 128;
-                            recomputeSliceBoundaries();
-                            selectSlice(selectedSlice);
-                            syncMarkersToDs();
-                            updateSlicePadLeds();
-                            announce("Slices:" + sliceCount);
-                        } else {
-                            /* Adjust auto threshold (jog = fine 0.1 steps) */
-                            sliceThreshold += delta * 0.1;
-                            sliceThreshold = Math.round(sliceThreshold * 10) / 10;
-                            if (sliceThreshold < 0.1) sliceThreshold = 0.1;
-                            if (sliceThreshold > 100) sliceThreshold = 100;
-                            recomputeSliceBoundaries();
-                            selectSlice(selectedSlice);
-                            syncMarkersToDs();
-                            updateSlicePadLeds();
-                            announce("Thresh:" + sliceThreshold.toFixed(1));
-                        }
-                    } else if (sliceMenuIndex === 2) {
-                        /* Cycle selected slice */
-                        var newIdx = selectedSlice + (delta > 0 ? 1 : -1);
-                        if (newIdx < 0) newIdx = sliceCount - 1;
-                        if (newIdx >= sliceCount) newIdx = 0;
-                        selectSlice(newIdx);
-                        /* Auto-scroll pad bank */
-                        if (selectedSlice < slicePadOffset) {
-                            slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-                        } else if (selectedSlice >= slicePadOffset + 32) {
-                            slicePadOffset = Math.floor(selectedSlice / 32) * 32;
-                        }
-                        syncMarkersToDs();
-                        updateSlicePadLeds();
-                        announce("Slice " + (selectedSlice + 1) + "/" + sliceCount);
-                    }
+            case VIEW_JOG_MENU:
+                jogMenuIndex += delta;
+                if (jogMenuIndex < 0) jogMenuIndex = 0;
+                if (jogMenuIndex >= jogMenuItems.length) jogMenuIndex = jogMenuItems.length - 1;
+                if (jogMenuIndex < jogMenuScrollOffset) jogMenuScrollOffset = jogMenuIndex;
+                if (jogMenuIndex >= jogMenuScrollOffset + JOG_MENU_VISIBLE) jogMenuScrollOffset = jogMenuIndex - JOG_MENU_VISIBLE + 1;
+                announce(jogMenuItems[jogMenuIndex]);
+                break;
+
+            case VIEW_JOG_SHIFT_MENU:
+                jogShiftMenuIndex += delta;
+                if (jogShiftMenuIndex < 0) jogShiftMenuIndex = 0;
+                if (jogShiftMenuIndex >= jogShiftMenuItems.length) jogShiftMenuIndex = jogShiftMenuItems.length - 1;
+                announce(jogShiftMenuItems[jogShiftMenuIndex]);
+                break;
+
+            case VIEW_MAIN_MENU:
+                mainMenuIndex += delta;
+                if (mainMenuIndex < 0) mainMenuIndex = 0;
+                if (mainMenuIndex >= mainMenuItems.length) mainMenuIndex = mainMenuItems.length - 1;
+                announce(mainMenuItems[mainMenuIndex]);
+                break;
+
+            case VIEW_CONFIRM_CLOSE:
+                closeDialogIndex += delta;
+                if (closeDialogIndex < 0) closeDialogIndex = 0;
+                if (closeDialogIndex >= closeDialogItems.length) closeDialogIndex = closeDialogItems.length - 1;
+                announce(closeDialogItems[closeDialogIndex]);
+                break;
+
+            case VIEW_CONFIRM_RESUME:
+                resumeDialogIndex += delta;
+                if (resumeDialogIndex < 0) resumeDialogIndex = 0;
+                if (resumeDialogIndex >= resumeItems.length) resumeDialogIndex = resumeItems.length - 1;
+                announce(resumeItems[resumeDialogIndex]);
+                break;
+
+            case VIEW_SYNC:
+                /* Jog scrolls viewport (same as VIEW_FREE when zoomed) */
+                if (zoomLevel > 0) {
+                    var scrollStep = shiftHeld
+                        ? Math.max(1, Math.floor(getVisibleSamples() / SCREEN_W))
+                        : Math.max(1, Math.floor(getVisibleSamples() / 8));
+                    zoomCenter += delta * scrollStep;
+                    var visHalf2 = Math.floor(getVisibleSamples() / 2);
+                    if (zoomCenter < visHalf2) zoomCenter = visHalf2;
+                    if (zoomCenter > totalFrames - visHalf2) zoomCenter = totalFrames - visHalf2;
+                    refreshWaveform();
+                    showJogStatus("Pos:" + formatTime(getVisibleStart()));
                 } else {
-                    /* Navigate between menu items */
-                    sliceMenuIndex += (delta > 0 ? 1 : -1);
-                    if (sliceMenuIndex < 0) sliceMenuIndex = 0;
-                    if (sliceMenuIndex > 2) sliceMenuIndex = 2;
-                    var param2Name = sliceMode === SLICE_MODE_LAZY ? "Sub-mode" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Thresh");
-                    var itemNames = ["Mode", param2Name, "Select"];
-                    announce(itemNames[sliceMenuIndex]);
+                    showStatus("Nothing to pan", 30);
                 }
+                break;
+
+            case VIEW_SLICE:
+                if (lazyChopping) break; /* No jog while chopping */
+                /* Jog cycles through modes: Even -> Auto -> Lazy -> BPM -> Even */
+                if (delta > 0) {
+                    if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_AUTO;
+                    else if (sliceMode === SLICE_MODE_AUTO) sliceMode = SLICE_MODE_LAZY;
+                    else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_BPM;
+                    else sliceMode = SLICE_MODE_EVEN;
+                } else {
+                    if (sliceMode === SLICE_MODE_EVEN) sliceMode = SLICE_MODE_BPM;
+                    else if (sliceMode === SLICE_MODE_BPM) sliceMode = SLICE_MODE_LAZY;
+                    else if (sliceMode === SLICE_MODE_LAZY) sliceMode = SLICE_MODE_AUTO;
+                    else sliceMode = SLICE_MODE_EVEN;
+                }
+                if (sliceMode === SLICE_MODE_LAZY) { lazySub = LAZY_SUB_CHOP; lazyChopping = false; }
+                sliceCount = 1; selectedSlice = 0; sliceBoundaries = []; slicePadOffset = 0;
+                recomputeSliceBoundaries();
+                selectSlice(0);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                var modeNames = ["Even", "Auto", "Lazy", "BPM"];
+                announce(modeNames[sliceMode] || "Even");
                 break;
         }
         return;
@@ -3373,6 +5676,13 @@ function handleCC(cc, value) {
 
     /* Jog click */
     if (cc === CC_JOG_CLICK && value > 0) {
+        /* Jog click confirms pending track reset from any view */
+        if (pendingTrackReset >= 0 && pendingTrackResetTimer > 0) {
+            resetTrack(pendingTrackReset);
+            pendingTrackReset = -1;
+            pendingTrackResetTimer = 0;
+            return;
+        }
         switch (currentView) {
             case VIEW_MODE_MENU:
                 menuSelect();
@@ -3390,10 +5700,86 @@ function handleCC(cc, value) {
                 saveSelect();
                 break;
 
-            case VIEW_TRIM:
-                /* Toggle selected field */
+            case VIEW_FREE:
+                if (shiftHeld) {
+                    jogShiftMenuIndex = 0;
+                    switchView(VIEW_JOG_SHIFT_MENU);
+                } else {
+                    jogMenuIndex = 0;
+                    jogMenuScrollOffset = 0;
+                    switchView(VIEW_JOG_MENU);
+                }
+                break;
+
+            case VIEW_JOG_MENU:
+                switch (jogMenuIndex) {
+                    case 0: doCopy(); break;
+                    case 1: doCut(); break;
+                    case 2: doMute(); break;
+                    case 3: doTrim(); break;
+                    case 4: doNormalizeSelection(); break;
+                }
+                switchView(VIEW_FREE);
+                break;
+
+            case VIEW_SYNC:
+                /* Jog click: toggle start/end marker */
                 selectedField = selectedField === 0 ? 1 : 0;
                 showStatus(selectedField === 0 ? "Start" : "End", 30);
+                break;
+
+            case VIEW_JOG_SHIFT_MENU:
+                switch (jogShiftMenuIndex) {
+                    case 0: doPaste(); break;
+                    case 1: doPasteOverwrite(); break;
+                    case 2: doExport(); break;
+                }
+                switchView(VIEW_FREE);
+                break;
+
+            case VIEW_MAIN_MENU:
+                switch (mainMenuIndex) {
+                    case 0: /* Save Project */
+                        saveProjectJson();
+                        showStatus("Project saved", 60);
+                        switchView(mainMenuReturnView);
+                        break;
+                    case 1: /* Switch Project */
+                        saveProjectJson();
+                        initProjectBrowser();
+                        break;
+                    case 2: /* Close */
+                        closeDialogIndex = 0;
+                        closeDialogReturnView = mainMenuReturnView;
+                        switchView(VIEW_CONFIRM_CLOSE);
+                        break;
+                }
+                break;
+
+            case VIEW_CONFIRM_CLOSE:
+                switch (closeDialogIndex) {
+                    case 0: /* Save & Close */
+                        saveProjectJson();
+                        fullExit();
+                        break;
+                    case 1: /* Discard & Close */
+                        fullExit();
+                        break;
+                    case 2: /* Cancel */
+                        switchView(closeDialogReturnView);
+                        break;
+                }
+                break;
+
+            case VIEW_CONFIRM_RESUME:
+                switch (resumeDialogIndex) {
+                    case 0: /* Resume */
+                        doReconnectRestore();
+                        break;
+                    case 1: /* New Project */
+                        initProjectBrowser();
+                        break;
+                }
                 break;
 
             case VIEW_LOOP:
@@ -3402,15 +5788,70 @@ function handleCC(cc, value) {
                 showStatus(loopSelectedField === 0 ? "Loop Point" : "Loop End", 30);
                 break;
 
-            case VIEW_SLICE:
-                /* Toggle editing of current menu item */
-                sliceMenuEditing = !sliceMenuEditing;
-                if (sliceMenuEditing) {
-                    var edit2Name = sliceMode === SLICE_MODE_LAZY ? "Sub-mode" : (sliceMode === SLICE_MODE_EVEN ? "Count" : "Threshold");
-                    var editNames = ["Editing Mode", "Editing " + edit2Name, "Editing Slice"];
-                    announce(editNames[sliceMenuIndex]);
-                } else {
-                    announce("Navigate");
+
+            case VIEW_PROJECT:
+                if (projectBrowserState) {
+                    var pItem = projectBrowserState.items[projectBrowserState.selectedIndex];
+                    if (pItem && pItem.kind === "new_project") {
+                        /* Create a new timestamped project folder, then open
+                         * the file browser so the user can load a WAV or start
+                         * a new recording into Track 1 / Scene 1. */
+                        var now = new Date();
+                        var pad2 = function(n) { return n < 10 ? "0" + n : String(n); };
+                        var ts = String(now.getFullYear()) + pad2(now.getMonth() + 1) + pad2(now.getDate()) +
+                                 "_" + pad2(now.getHours()) + pad2(now.getMinutes());
+                        projectDir = SCRATCH_DIR + "/Project_" + ts;
+                        host_module_set_param("project_dir", projectDir);
+                        if (typeof host_ensure_dir === "function") host_ensure_dir(projectDir);
+                        projectBrowserState = null;
+                        /* Pre-set recording dir to project folder */
+                        recordBrowserDir = projectDir;
+                        newProjectFileBrowser = true;
+                        enterOpenFileBrowser();
+                        announce("Project " + projectDir.replace(/.*\//, "") + ", select file or record");
+                    } else if (pItem && pItem.kind === "skip") {
+                        projectDir = "_no_project";
+                        host_module_set_param("project_dir", projectDir);
+                        projectBrowserState = null;
+                        newProjectFileBrowser = false;
+                        recordState = "ready";
+                        recordLedCounter = 0;
+                        currentView = VIEW_FREE;
+                        updateLeds();
+                        announce("New Recording, press REC to record");
+                    } else if (pItem) {
+                        if (pItem.kind === "up") {
+                            /* Navigate up */
+                            activateFilepathBrowserItem(projectBrowserState);
+                            refreshFilepathBrowser(projectBrowserState, OPEN_FILE_FS);
+                            /* Re-prepend action items after refresh */
+                            projectBrowserState.items.unshift({ kind: "skip",        label: "-- Skip (no project)" });
+                            projectBrowserState.items.unshift({ kind: "new_project", label: "+ New Project" });
+                            projectBrowserState.selectedIndex = 0;
+                        } else if (pItem.kind === "dir") {
+                            /* Select existing project folder — load it directly */
+                            projectDir = pItem.path;
+                            host_module_set_param("project_dir", projectDir);
+                            projectBrowserState = null;
+                            newProjectFileBrowser = false;
+                            loadProjectJson();
+                            /* Check if any track has scenes (files haven't loaded
+                             * into DSP yet so totalFrames is still 0 here) */
+                            var _projEmpty = true;
+                            for (var _pe = 0; _pe < NUM_TRACKS; _pe++) {
+                                if (trackStates[_pe].scenes.length > 0) { _projEmpty = false; break; }
+                            }
+                            if (_projEmpty) {
+                                recordState = "ready";
+                                recordLedCounter = 0;
+                                announce("Project " + pItem.label + ", press REC to record");
+                            } else {
+                                announce("Project " + pItem.label);
+                            }
+                            currentView = VIEW_FREE;
+                            updateLeds();
+                        }
+                    }
                 }
                 break;
 
@@ -3419,12 +5860,17 @@ function handleCC(cc, value) {
                     /* Check for "New Recording" action item */
                     var selItem = openFileBrowserState.items[openFileBrowserState.selectedIndex];
                     if (selItem && selItem.kind === "action") {
-                        recordBrowserDir = openFileBrowserState.currentDir;
+                        /* If opened from new-project flow, record into project
+                         * folder; otherwise use the browser's current dir. */
+                        if (!newProjectFileBrowser) {
+                            recordBrowserDir = openFileBrowserState.currentDir;
+                        }
+                        newProjectFileBrowser = false;
                         recordFilePath = generateRecordingPath();
                         recordState = "ready";
                         recordLedCounter = 0;
                         openFileBrowserState = null;
-                        switchView(VIEW_TRIM);
+                        switchView(VIEW_FREE);
                         announce("New Recording, press REC to record");
                         break;
                     }
@@ -3437,15 +5883,39 @@ function handleCC(cc, value) {
                             ? openFileBrowserState.items[0].label : "empty";
                         announce(oDirName + ", " + oFirst);
                     } else if (result.action === "select") {
+                        newProjectFileBrowser = false;
                         openedFilePath = result.value;
-                        loadFileIntoEditor(result.value);
+                        /* Load file into the armed (selectedSceneIdx) scene slot */
+                        var _bts = trackStates[activeTrack];
+                        var _bslot = _bts.selectedSceneIdx;
+                        if (_bslot < _bts.scenes.length) {
+                            /* Keep existing scene settings, just update the path */
+                            _bts.scenes[_bslot].path = result.value;
+                        } else {
+                            /* Slot beyond current length — append up to that slot */
+                            while (_bts.scenes.length < _bslot) _bts.scenes.push(makeSceneState(""));
+                            _bts.scenes.push(makeSceneState(result.value));
+                        }
+                        _bts.playingSceneIdx  = _bslot;
+                        _bts.selectedSceneIdx = _bslot;
+                        saveSceneState(activeTrack);
+                        saveProjectJson();
                         openFileBrowserState = null;
+                        var _prevEditMode = editMode;
+                        switchView(VIEW_FREE);
+                        /* Use blocking load so file_info is valid immediately */
+                        loadFileIntoEditor(result.value, _prevEditMode);
                         announce("Loaded " + fileName);
-                        switchView(VIEW_TRIM);
                     }
                 }
                 break;
         }
+        return;
+    }
+
+    /* Delete+Knob rotation: reset the parameter assigned to this knob */
+    if (deleteHeld) {
+        if (handleDeleteKnob(cc)) deletePendingCut = false;
         return;
     }
 
@@ -3454,7 +5924,28 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_SYNC) {
+            if (shiftHeld) {
+                /* Shift+E1 in SYNC: open popup and cycle beat division */
+                beatDivPopupOpen = true;
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                refreshWaveform();
+                return;
+            }
+            /* Move whole selection: start + end shift together, length stays fixed */
+            var _selLen = endSample - startSample;
+            var _newStart = startSample + delta * getBeatStepSamples();
+            if (_newStart < 0) _newStart = 0;
+            if (_newStart + _selLen > totalFrames) _newStart = totalFrames - _selLen;
+            if (_newStart < 0) _newStart = 0;
+            startSample = _newStart;
+            endSample   = _newStart + _selLen;
+            syncMarkersToDs();
+            showKnobStatus(0, "Start:" + formatBarsBeats(startSample));
+            refreshWaveform();
+        } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
             adjustMarker(0, delta * step);
             showKnobStatus(0, shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample));
@@ -3502,7 +5993,20 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM) {
+        if (currentView === VIEW_SYNC) {
+            if (shiftHeld) {
+                /* Shift+E2 in SYNC: open popup and cycle beat division */
+                beatDivPopupOpen = true;
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                refreshWaveform();
+                return;
+            }
+            adjustMarker(1, delta * getBeatStepSamples());
+            showKnobStatus(1, "Len:" + formatBarsBeats(endSample - startSample));
+            refreshWaveform();
+        } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
             adjustMarker(1, delta * step);
             showKnobStatus(1, shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample));
@@ -3550,7 +6054,7 @@ function handleCC(cc, value) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
 
-        if (currentView === VIEW_TRIM || currentView === VIEW_SLICE) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
             var wasZero = (zoomLevel <= 0);
             zoomLevel += delta * ZOOM_STEP;
             if (zoomLevel < 0) zoomLevel = 0;
@@ -3592,22 +6096,48 @@ function handleCC(cc, value) {
 
     /* E5 turn: gain (trim/loop) | threshold (slice auto) | Shift+E5: normalize */
     if (cc === CC_E5) {
-        if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_AUTO) {
+        if (currentView === VIEW_SLICE && !lazyChopping) {
             var delta = decodeDelta(value);
             if (delta === 0) return;
-            var step = shiftHeld ? 0.1 : 1.0;
-            sliceThreshold += delta * step;
-            sliceThreshold = Math.round(sliceThreshold * 10) / 10;
-            if (sliceThreshold < 0.1) sliceThreshold = 0.1;
-            if (sliceThreshold > 100) sliceThreshold = 100;
-            recomputeSliceBoundaries();
-            selectSlice(selectedSlice);
-            syncMarkersToDs();
-            updateSlicePadLeds();
-            showKnobStatus(4, "T:" + sliceThreshold.toFixed(1));
+            if (sliceMode === SLICE_MODE_BPM) {
+                bpm += delta * (shiftHeld ? 0.1 : 1.0);
+                if (bpm < 20) bpm = 20;
+                if (bpm > 999) bpm = 999;
+                bpm = Math.round(bpm * 10) / 10;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "BPM:" + bpm.toFixed(1));
+            } else if (sliceMode === SLICE_MODE_EVEN) {
+                sliceCount += (delta > 0 ? 1 : -1);
+                if (sliceCount < 1) sliceCount = 1;
+                if (sliceCount > 128) sliceCount = 128;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "Count:" + sliceCount);
+            } else if (sliceMode === SLICE_MODE_AUTO) {
+                var step = shiftHeld ? 0.1 : 1.0;
+                sliceThreshold += delta * step;
+                sliceThreshold = Math.round(sliceThreshold * 10) / 10;
+                if (sliceThreshold < 0.1) sliceThreshold = 0.1;
+                if (sliceThreshold > 100) sliceThreshold = 100;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(4, "T:" + sliceThreshold.toFixed(1));
+            } else if (sliceMode === SLICE_MODE_LAZY) {
+                lazySub = (lazySub === LAZY_SUB_CHOP) ? LAZY_SUB_PLAY : LAZY_SUB_CHOP;
+                lazyChopping = false;
+                updateSlicePadLeds();
+                showKnobStatus(4, lazySub === LAZY_SUB_CHOP ? "Chop" : "Play");
+            }
             return;
         }
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
+        if (currentView === VIEW_FREE || currentView === VIEW_LOOP) {
             if (shiftHeld) {
                 /* Shift+E5: show normalize confirm overlay */
                 normalizeIndex = 0;
@@ -3626,24 +6156,123 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* E7/E8 twist actions: turn confirms/cancels pending action */
-    if (cc === CC_E7 || cc === CC_E8) {
+    /* E6 (Knob 6): Division in VIEW_SLICE (BPM mode) */
+    if (cc === CC_E6) {
         var delta = decodeDelta(value);
-        if (delta > 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-            /* Twist right = execute */
-            if (pendingTwistAction.action === "toggle_loop") {
-                toggleLoop();
-            } else if (pendingTwistAction.action === "zero_cross") {
-                snapToZeroCrossing();
+        if (delta !== 0) {
+            if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_BPM && !lazyChopping) {
+                beatDivIndex += (delta > 0 ? 1 : -1);
+                if (beatDivIndex < 0) beatDivIndex = 0;
+                if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                recomputeSliceBoundaries();
+                selectSlice(selectedSlice);
+                syncMarkersToDs();
+                updateSlicePadLeds();
+                showKnobStatus(5, "Div:" + BEAT_DIVISION_LABELS[beatDivIndex]);
+                return;
             }
-            pendingTwistAction = null;
-        } else if (delta < 0 && pendingTwistAction && pendingTwistAction.cc === cc) {
-            /* Twist left = cancel */
-            pendingTwistAction = null;
-            showStatus("Cancelled", 20);
+        }
+        return; /* E6 has no function in other views */
+    }
+
+    /* E7 (Knob 7): Pitch adjust */
+    if (cc === CC_E7) {
+        var delta = decodeDelta(value);
+        if (delta !== 0 && currentView === VIEW_SLICE) {
+            /* Per-slice pitch — does not affect global pitchSemitones */
+            var sp = slicePitches[selectedSlice] || 0.0;
+            if (shiftHeld) {
+                var cents = Math.round(sp * 100);
+                cents += delta;
+                if (cents < -1200) cents = -1200;
+                if (cents > 1200) cents = 1200;
+                sp = cents / 100.0;
+            } else {
+                var semi = Math.round(sp);
+                semi += delta;
+                if (semi < -12) semi = -12;
+                if (semi > 12) semi = 12;
+                sp = semi;
+            }
+            slicePitches[selectedSlice] = sp;
+            host_module_set_param("pitch", sp.toFixed(2));
+            showKnobStatus(6, "Slice Pitch:" + formatPitch(sp));
+            return;
+        }
+        if (delta !== 0 && (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_LOOP)) {
+            if (shiftHeld) {
+                /* Fine: cents, +-1 cent per click */
+                var cents = Math.round(pitchSemitones * 100);
+                cents += delta;
+                if (cents < -3600) cents = -3600;
+                if (cents > 3600) cents = 3600;
+                pitchSemitones = cents / 100.0;
+            } else {
+                /* Coarse: semitones, +-1 per click */
+                var semi = Math.round(pitchSemitones);
+                semi += delta;
+                if (semi < -36) semi = -36;
+                if (semi > 36) semi = 36;
+                pitchSemitones = semi;
+            }
+            host_module_set_param("pitch", pitchSemitones.toFixed(2));
+            showKnobStatus(6, "Pitch:" + formatPitch(pitchSemitones));
         }
         return;
     }
+
+    /* E8 (Knob 8): Per-slice tempo in VIEW_SLICE, BPM in VIEW_SYNC, tempo in VIEW_FREE/LOOP */
+    if (cc === CC_E8) {
+        var delta = decodeDelta(value);
+        if (delta !== 0 && currentView === VIEW_SLICE && !lazyChopping) {
+            var step = shiftHeld ? 1 : 5;
+            var st = sliceTempos[selectedSlice] || 100;
+            st -= delta * step;
+            if (st < 30) st = 30;
+            if (st > 300) st = 300;
+            sliceTempos[selectedSlice] = st;
+            tempoPercent = st;
+            host_module_set_param("tempo", String(st));
+            showKnobStatus(7, "Slice Tempo:" + st + "%");
+            return;
+        }
+        /* BPM direct adjust in VIEW_SYNC — right = faster (higher BPM) */
+        if (delta !== 0 && currentView === VIEW_SYNC) {
+            var step = shiftHeld ? 0.1 : 1.0;
+            var oldBpm = bpm;
+            bpm += delta * step;
+            if (bpm < 20) bpm = 20;
+            if (bpm > 999) bpm = 999;
+            bpm = Math.round(bpm * 10) / 10;
+            tempoPercent = Math.round(globalBpm / bpm * 100);
+            if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm / 0.3 * 10) / 10; }
+            if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm / 3.0 * 10) / 10; }
+            /* Rescale endSample so musical length stays constant:
+             * musicalLength (beats) = (endSample - startSample) / sampleRate * oldBpm / 60
+             * newEndSample = startSample + musicalLength * 60 / newBpm * sampleRate
+             *              = startSample + (endSample - startSample) * oldBpm / newBpm */
+            var oldLen = endSample - startSample;
+            endSample = startSample + Math.round(oldLen * oldBpm / bpm);
+            if (endSample > totalFrames) endSample = totalFrames;
+            if (endSample < startSample + 1) endSample = startSample + 1;
+            syncMarkersToDs();
+            syncSyncModeToDs();
+            showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " L:" + formatBarsBeats(endSample - startSample));
+            return;
+        }
+        /* Tempo adjust in VIEW_FREE/VIEW_LOOP — right = faster */
+        if (delta !== 0 && (currentView === VIEW_FREE || currentView === VIEW_LOOP)) {
+            var step = shiftHeld ? 1 : 5;
+            tempoPercent -= delta * step;
+            if (tempoPercent < 30) tempoPercent = 30;
+            if (tempoPercent > 300) tempoPercent = 300;
+            host_module_set_param("tempo", String(tempoPercent));
+            bpm = Math.round(globalBpm * tempoPercent / 100 * 10) / 10;
+            showKnobStatus(7, "Tempo:" + tempoPercent + "% BPM:" + bpm.toFixed(1));
+            return;
+        }
+    }
+
 }
 
 /**
@@ -3653,54 +6282,296 @@ function handleNote(note, velocity) {
     /* Ignore pads during record states */
     if (recordState !== "idle") return;
 
-    /* Knob touch: twist actions for E7 (loop) and E8 (zero crossing) */
-    if (velocity > 0) {
-        if (note === MoveKnob7Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
-            pendingTwistAction = { cc: CC_E7, action: "toggle_loop" };
-            showStatus("Twist: Loop " + (loopEnabled ? "Off" : "On"), 9999);
+    /* Delete/Shift+Knob touch: reset the parameter assigned to this knob.
+     * Only intercept knob-touch notes; let pad notes fall through so that
+     * Remove+Pad can remove scenes in Trim/BPM view. */
+    if (velocity > 0 && deleteHeld) {
+        var knobCc = null;
+        if      (note === MoveKnob5Touch) knobCc = CC_E5;
+        else if (note === MoveKnob6Touch) knobCc = CC_E6;
+        else if (note === MoveKnob7Touch) knobCc = CC_E7;
+        else if (note === MoveKnob8Touch) knobCc = CC_E8;
+        if (knobCc !== null) {
+            if (handleDeleteKnob(knobCc)) deletePendingCut = false;
             return;
         }
-        if (note === MoveKnob8Touch && (currentView === VIEW_TRIM || currentView === VIEW_LOOP)) {
-            pendingTwistAction = { cc: CC_E8, action: "zero_cross" };
-            showStatus("Twist: Zero Cross Snap", 9999);
-            return;
+        /* Not a knob touch — fall through to pad/step handling below */
+    }
+    /* Step 4: Cycle pad mode — Trigger → Gate → OneShot → Trigger */
+    if (velocity > 0 && note === STEP_BASE + 3) {
+        trackStates[activeTrack].gateMode = (trackStates[activeTrack].gateMode + 1) % 3;
+        var _newPadMode = trackStates[activeTrack].gateMode;
+        host_module_set_param("t" + activeTrack + ":gate_mode", String(_newPadMode));
+        /* Persist into the active scene so it's saved with the scene */
+        var _ts4 = trackStates[activeTrack];
+        if (_ts4.playingSceneIdx >= 0 && _ts4.playingSceneIdx < _ts4.scenes.length) {
+            _ts4.scenes[_ts4.playingSceneIdx].gateMode = _newPadMode;
         }
-    } else {
-        /* Touch release: cancel pending and clear prompt */
-        if ((note === MoveKnob7Touch || note === MoveKnob8Touch) && pendingTwistAction) {
-            pendingTwistAction = null;
-            statusTimer = 0;
-            statusMsg = "";
+        var _pmLabel = _newPadMode === PAD_MODE_GATE ? "Gate Mode" : _newPadMode === PAD_MODE_ONESHOT ? "One Shot" : "Trigger";
+        announce(_pmLabel);
+        showStatus(_newPadMode === PAD_MODE_GATE ? "Gate" : _newPadMode === PAD_MODE_ONESHOT ? "1Shot" : "Trig", 60);
+        updateLeds();
+        return;
+    }
+
+    /* Step 6: Cycle skipback bar length (replaces old VIEW_SCENE toggle) */
+    if (velocity > 0 && note === STEP_BASE + 5) {
+        var editViews2 = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        if (editViews2.indexOf(currentView) >= 0) {
+            skipbackBarsIdx = (skipbackBarsIdx + 1) % SKIPBACK_BARS_OPTIONS.length;
+            showStatus("SB:" + SKIPBACK_BARS_OPTIONS[skipbackBarsIdx] + "b", 60);
+            updateLeds();
+        }
+        return;
+    }
+
+    /* Step 5: Toggle Clock Sync; Shift+Step5 = cycle quantize mode */
+    if (velocity > 0 && note === STEP_BASE + 4) {
+        if (shiftHeld) {
+            quantizeMode = (quantizeMode + 1) % QUANT_LABELS.length;
+            showStatus("Q:" + QUANT_LABELS[quantizeMode], 90);
+            announce("Quantize " + QUANT_LABELS[quantizeMode]);
+            updateLeds();
+        } else {
+            var syncState = host_module_get_param("sync_clock");
+            var newSync = (syncState === "1") ? "0" : "1";
+            host_module_set_param("sync_clock", newSync);
+            announce(newSync === "1" ? "Sync On" : "Sync Off");
+            showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
+            updateLeds();
+        }
+        return;
+    }
+
+    /* Step 8: Apply Pitch/Tempo to selection (Trim/BPM view) */
+    if (velocity > 0 && note === STEP_BASE + 7) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) &&
+            (pitchSemitones !== 0.0 || tempoPercent !== 100)) {
+            host_module_set_param("apply_pitch_tempo", "1");
+            pitchSemitones = 0.0;
+            tempoPercent = 100;
+            showStatus("Applied P/T", 90);
+            updateLeds();
+        }
+        return;
+    }
+
+    /* Step 9/10: fade in/out (Trim/BPM/Slice) */
+    if (velocity > 0 && (note === STEP_BASE + 8 || note === STEP_BASE + 9)) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+            if (note === STEP_BASE + 8) {
+                doFadeIn();
+            } else {
+                doFadeOut();
+            }
+            return;
         }
     }
 
-    /* Pad press/release: audition (hold to play, release to stop).
-     * Only the most recently pressed pad owns playback — releasing
-     * an earlier pad while a newer one is held does nothing. */
-    if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
-        if (currentView === VIEW_TRIM || currentView === VIEW_LOOP) {
-            if (velocity > 0) {
-                setLED(note, PAD_COLOR_PLAY);
-                activePadNote = note;
-                if (shiftHeld) {
-                    /* Shift+pad: preview from 3% before end marker */
-                    var selLen = endSample - startSample;
-                    var previewLen = Math.min(Math.max(Math.floor(selLen * 0.05), Math.floor(sampleRate / 4)), sampleRate * 5);
-                    var from = endSample - previewLen;
-                    if (from < startSample) from = startSample;
-                    startPlaybackFrom(from);
-                    showStatus("Preview End", 20);
-                } else {
-                    startPlayback();
-                    showStatus("Play Sel", 20);
-                }
+    /* Step 11: reverse selection (Trim/BPM/Slice) */
+    if (velocity > 0 && note === STEP_BASE + 10) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+            doReverse();
+            return;
+        }
+    }
+
+    /* Step 16: shuffle slices (Slice view only) */
+    if (velocity > 0 && note === STEP_BASE + 15 && currentView === VIEW_SLICE) {
+        doSliceShuffle();
+        return;
+    }
+
+    /* Step 14: reset/reload file (Trim/BPM/Slice) */
+    if (velocity > 0 && note === STEP_BASE + 13) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+            doResetFile();
+            return;
+        }
+    }
+
+    /* Step 15/16: set start/end marker at playback position */
+    if (velocity > 0 && (note === STEP_BASE + 14 || note === STEP_BASE + 15)) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) && playing) {
+            if (note === STEP_BASE + 14) {
+                /* Step 15: set start marker at play position */
+                startSample = playPos;
+                if (startSample >= endSample) endSample = startSample + 1;
+                if (endSample > totalFrames) { endSample = totalFrames; startSample = endSample - 1; }
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("Start \u2192 " + formatTime(startSample), 60);
             } else {
-                setLED(note, PAD_COLOR_DIM);
-                if (note === activePadNote) {
-                    activePadNote = -1;
-                    stopPlayback();
+                /* Step 16: set end marker at play position */
+                endSample = playPos;
+                if (endSample <= startSample) endSample = startSample + 1;
+                if (endSample > totalFrames) endSample = totalFrames;
+                syncMarkersToDs();
+                refreshWaveform();
+                showStatus("End \u2192 " + formatTime(endSample), 60);
+            }
+        }
+        return;
+    }
+
+    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 cycles FREE→VARISPEED→STRETCH→FREE */
+    if (velocity > 0 && note === STEP_BASE) {
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        if (editViews.indexOf(currentView) >= 0) {
+            if (shiftHeld) {
+                if (editMode === VIEW_FREE) {
+                    /* FREE → VARISPEED (SYNC sub-mode) */
+                    editMode = VIEW_SYNC;
+                    varispeedEnabled = true;
+                } else if (editMode === VIEW_SYNC && varispeedEnabled) {
+                    /* VARISPEED → STRETCH */
+                    varispeedEnabled = false;
+                } else {
+                    /* STRETCH → FREE */
+                    editMode = VIEW_FREE;
                 }
             }
+            if (currentView !== editMode) {
+                /* Leaving slice mode: restore loop state and clear persisted slice state.
+                 * Do NOT stop playback — jam workflow requires continuous playback across view switches. */
+                if (currentView === VIEW_SLICE) {
+                    if (savedLoopState) {
+                        loopEnabled = true;
+                        host_module_set_param("play_loop", "1");
+                    }
+                    startSample = sliceBoundaries[0];
+                    endSample = sliceBoundaries[sliceCount];
+                    playPos = startSample;
+                    host_module_set_param("slice_state", "");
+                    syncMarkersToDs();
+                }
+                switchView(editMode);
+            } else if (shiftHeld) {
+                /* Already in editMode (VIEW_SYNC) but varispeedEnabled toggled —
+                 * view isn't switching so send play_mode manually. */
+                if (editMode === VIEW_SYNC) {
+                    host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
+                    announce(varispeedEnabled ? "Varispeed" : "Stretch");
+                }
+                updateLeds();
+            }
+        }
+        return;
+    }
+
+    /* Step 2: enter SLICE mode */
+    if (velocity > 0 && note === STEP_BASE + 1) {
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        if (editViews.indexOf(currentView) >= 0 && currentView !== VIEW_SLICE) {
+            switchView(VIEW_SLICE);
+        }
+        return;
+    }
+
+    /* Pad press/release: scene launcher in Trim/BPM, audition in Loop/Slice. */
+    if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
+            var padIdx = note - PAD_NOTE_MIN;
+
+            if (velocity > 0) {
+                /* Pads 1-8: scene launch / arm / delete / copy / paste */
+                if (padIdx >= 0 && padIdx < MAX_SCENES) {
+                    if (deleteHeld) {
+                        removeScene(activeTrack, padIdx);
+                        deletePendingCut = false;
+                    } else if (copyHeld) {
+                        if (shiftHeld) {
+                            /* Shift+Copy+Pad: paste/overwrite scene */
+                            pasteScene(activeTrack, padIdx);
+                        } else {
+                            /* Copy+Pad: copy scene */
+                            copyScene(activeTrack, padIdx);
+                        }
+                        copyPendingAction = false;
+                    } else {
+                        var _ts2 = trackStates[activeTrack];
+                        var _isSameScene = (_ts2.playingSceneIdx === padIdx && _ts2.playing);
+                        /* For a different scene, use the TARGET scene's gateMode so the
+                         * correct behaviour applies immediately on first press. */
+                        var _targetSc = (_ts2.scenes && _ts2.scenes[padIdx]) ? _ts2.scenes[padIdx] : null;
+                        var _padMode2 = _isSameScene ? _ts2.gateMode
+                                      : (_targetSc && _targetSc.gateMode !== undefined) ? _targetSc.gateMode
+                                      : _ts2.gateMode;
+                        if (_padMode2 === PAD_MODE_TRIGGER) {
+                            if (_isSameScene) {
+                                /* Trigger: pressing playing scene stops it */
+                                stopPlayback();
+                                _ts2.playingSceneIdx = -1;
+                                showStatus("Stop", 20);
+                            } else {
+                                launchScene(activeTrack, padIdx, transportPlaying);
+                            }
+                        } else if (_padMode2 === PAD_MODE_ONESHOT) {
+                            if (_isSameScene) {
+                                /* OneShot: re-press restarts from start */
+                                stopPlayback();
+                                startPlaybackFrom(startSample);
+                            } else {
+                                launchScene(activeTrack, padIdx, true);
+                            }
+                        } else {
+                            /* Gate: play while held */
+                            launchScene(activeTrack, padIdx, true);
+                            activePadNote = note;
+                            host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                        }
+                    }
+                    updateLeds();
+                }
+            } else {
+                /* Pad release — gate mode: stop when released */
+                if (padIdx >= 0 && padIdx < MAX_SCENES && note === activePadNote) {
+                    var _tsR = trackStates[activeTrack];
+                    if (_tsR.gateMode === PAD_MODE_GATE) {
+                        activePadNote = -1;
+                        host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                        stopPlayback();
+                        updateLeds();
+                    }
+                }
+            }
+            return;
+        } else if (currentView === VIEW_LOOP) {
+            /* Loop view keeps audition on Pad 1 */
+            var padIdx = note - PAD_NOTE_MIN;
+            if (padIdx === 0) {
+                var _loopPadMode = trackStates[activeTrack].gateMode;
+                if (velocity > 0) {
+                    if (_loopPadMode === PAD_MODE_GATE) {
+                        activePadNote = note;
+                        host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                        startPlayback();
+                    } else if (_loopPadMode === PAD_MODE_ONESHOT) {
+                        /* OneShot: always restart from start */
+                        activePadNote = note;
+                        if (playing) stopPlayback();
+                        startPlaybackFrom(startSample);
+                    } else {
+                        /* Trigger: toggle */
+                        if (playing) {
+                            stopPlayback();
+                            activePadNote = -1;
+                        } else {
+                            activePadNote = note;
+                            startPlayback();
+                        }
+                    }
+                } else {
+                    if (note === activePadNote) {
+                        activePadNote = -1;
+                        if (_loopPadMode === PAD_MODE_GATE) {
+                            host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                            stopPlayback();
+                        }
+                    }
+                }
+            }
+            return;
         } else if (currentView === VIEW_SLICE) {
             var padIdx = note - PAD_NOTE_MIN;
             if (sliceMode === SLICE_MODE_LAZY && lazySub === LAZY_SUB_CHOP) {
@@ -3733,18 +6604,38 @@ function handleNote(note, velocity) {
                 /* Normal slice or lazy play mode: audition slices */
                 var sliceIdx = slicePadOffset + padIdx;
                 if (sliceIdx < sliceCount) {
+                    var _slicePadMode = trackStates[activeTrack].gateMode;
                     if (velocity > 0) {
                         selectSlice(sliceIdx);
                         updateSlicePadLeds();
                         setLED(note, PAD_COLOR_PLAY);
                         activePadNote = note;
-                        startPlayback();
-                        showStatus("Slice " + (sliceIdx + 1), 20);
+                        if (shiftHeld) {
+                            /* Shift+Pad: play sequentially from this slice to end */
+                            endSample = sliceBoundaries[sliceCount];
+                            syncMarkersToDs();
+                            startPlayback();
+                            showStatus("Play " + (sliceIdx + 1) + "-" + sliceCount, 20);
+                        } else if (_slicePadMode === PAD_MODE_GATE) {
+                            /* Gate: play slice while held */
+                            host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                            startPlayback();
+                            showStatus("Gate " + (sliceIdx + 1), 20);
+                        } else {
+                            /* Trigger / OneShot: play slice once to end */
+                            startPlayback();
+                            showStatus("Slice " + (sliceIdx + 1), 20);
+                        }
                     } else {
                         updateSlicePadLeds();
                         if (note === activePadNote) {
                             activePadNote = -1;
-                            stopPlayback();
+                            if (_slicePadMode === PAD_MODE_GATE) {
+                                /* Gate: stop on release */
+                                host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                                stopPlayback();
+                            }
+                            /* Trigger / OneShot: do NOT stop — let slice play to end */
                         }
                     }
                 }
@@ -3780,6 +6671,164 @@ function handleNote(note, velocity) {
     }
 }
 
+/* ============ Reconnect Restore ============ */
+
+/**
+ * Restore UI state from DSP on reconnect (called after user confirms Resume,
+ * or immediately when reconnecting without a saved project).
+ */
+function doReconnectRestore() {
+    /* Restore per-track state from DSP without reloading files.
+     * We only READ from DSP here — no file_path is sent, so playback
+     * continues uninterrupted in the DSP. */
+    for (var _rci = 0; _rci < NUM_TRACKS; _rci++) {
+        var _rcts = trackStates[_rci];
+        var _rcp = "t" + _rci + ":";
+
+        var _rcfi = host_module_get_param(_rcp + "file_info");
+        if (_rcfi) {
+            try {
+                var _rcinfo = JSON.parse(_rcfi);
+                _rcts.totalFrames = _rcinfo.frames || 0;
+                _rcts.startSample = _rcinfo.start || 0;
+                _rcts.endSample = (_rcinfo.end > 0) ? _rcinfo.end : _rcts.totalFrames;
+                _rcts.fileName = _rcinfo.name || "";
+                _rcts.loaded = (_rcts.totalFrames > 0);
+            } catch (e) {}
+        }
+
+        var _rcPlay = host_module_get_param(_rcp + "playing");
+        _rcts.playing = (_rcPlay === "1");
+
+        var _rcGain = host_module_get_param(_rcp + "gain_db");
+        if (_rcGain) { var _rcg = parseFloat(_rcGain); if (!isNaN(_rcg)) _rcts.gainDb = _rcg; }
+
+        var _rcLoop = host_module_get_param(_rcp + "play_loop");
+        _rcts.loopEnabled = (_rcLoop === "1");
+
+        var _rcGate = host_module_get_param(_rcp + "gate_mode");
+        _rcts.gateMode = (_rcGate ? parseInt(_rcGate, 10) : 0) || PAD_MODE_TRIGGER;
+
+        var _rcMuted = host_module_get_param(_rcp + "muted");
+        _rcts.muted = (_rcMuted === "1");
+    }
+
+    /* Restore scene state (bpm, syncMode, tempoPercent, beatDivIndex) from the
+     * playing scene — these aren't surfaced as individual DSP params so we pull
+     * them from the scene_state JSON that was saved the last time saveSceneState
+     * was called. Must run BEFORE restoreTrackUIState so the flat fields are
+     * correct when they get promoted to globals. */
+    for (var _rsi = 0; _rsi < NUM_TRACKS; _rsi++) {
+        restoreSceneState(_rsi);
+        var _rsts = trackStates[_rsi];
+        var _rsPlayIdx = _rsts.playingSceneIdx;
+        if (_rsPlayIdx >= 0 && _rsPlayIdx < _rsts.scenes.length) {
+            var _rsSc = _rsts.scenes[_rsPlayIdx];
+            if (_rsSc.bpm !== undefined) _rsts.bpm = _rsSc.bpm;
+            if (_rsSc.beatDivIndex !== undefined) _rsts.beatDivIndex = _rsSc.beatDivIndex;
+            if (_rsSc.syncMode !== undefined) _rsts.syncMode = !!_rsSc.syncMode;
+            if (_rsSc.tempoPercent !== undefined) _rsts.tempoPercent = _rsSc.tempoPercent;
+        }
+    }
+
+    /* Promote active track state into globals */
+    restoreTrackUIState(activeTrack);
+
+    /* Check if DSP is still recording */
+    var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
+    if (stillRecording) {
+        recordState = "recording";
+        recordFilePath = SCRATCH_PATH;
+        openedFilePath = SCRATCH_PATH;
+        recordLedCounter = 0;
+        currentView = VIEW_FREE;
+        selectedField = 0;
+
+        /* Recover actual elapsed time from sampler's sample counter */
+        var samplesWritten = 0;
+        if (typeof host_sampler_get_samples_written === "function") {
+            samplesWritten = host_sampler_get_samples_written();
+        }
+        var elapsedSec = samplesWritten / 44100;
+        recordStartTime = Date.now() - (elapsedSec * 1000);
+
+        /* Reconstruct waveform array with placeholder entries so the
+         * write head position reflects actual recording progress.
+         * Each tick adds one entry, ticks are ~16ms apart. */
+        var estimatedTicks = Math.round(elapsedSec * 1000 / 16);
+        recordWaveform = [];
+        for (var i = 0; i < estimatedTicks; i++) {
+            recordWaveform.push(0.05);  /* dim baseline so it's visible */
+        }
+        recordWriteHead = recordWaveform.length;
+
+        var timeStr = Math.floor(elapsedSec / 60) + ":" +
+            (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
+        announce("Mangle,recording in progress, " + timeStr);
+    } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
+        /* DSP is paused — restore paused state */
+        recordState = "paused";
+        recordFilePath = SCRATCH_PATH;
+        openedFilePath = SCRATCH_PATH;
+        recordLedCounter = 0;
+        currentView = VIEW_FREE;
+        selectedField = 0;
+
+        /* Recover elapsed time from sampler's sample counter */
+        var pausedSamples = 0;
+        if (typeof host_sampler_get_samples_written === "function") {
+            pausedSamples = host_sampler_get_samples_written();
+        }
+        var pausedElapsed = pausedSamples / 44100;
+        recordStartTime = Date.now() - (pausedElapsed * 1000);
+        recordPauseStart = Date.now();
+        /* pausedTotal covers the gap between reconstructed start and now,
+           minus actual recorded time, so elapsed stays correct after resume */
+        recordPausedTotal = Date.now() - recordStartTime - (pausedElapsed * 1000);
+
+        /* Reconstruct waveform with placeholder entries */
+        var pausedTicks = Math.round(pausedElapsed * 1000 / 16);
+        recordWaveform = [];
+        for (var j = 0; j < pausedTicks; j++) {
+            recordWaveform.push(0.05);
+        }
+        recordWriteHead = recordWaveform.length;
+
+        announce("Mangle,recording paused");
+    } else if (openedFilePath && totalFrames === 0) {
+        /* File path set but no audio data — restore record-ready state */
+        recordBrowserDir = SCRATCH_DIR;
+        recordFilePath = SCRATCH_PATH;
+        recordState = "ready";
+        recordLedCounter = 0;
+        currentView = VIEW_FREE;
+        selectedField = 0;
+        announce("New Recording, press REC to record");
+    } else if (restoreSliceState()) {
+        /* Restored slice state from DSP — resume slice mode */
+        currentView = VIEW_SLICE;
+        selectedField = 0;
+        selectSlice(selectedSlice);
+        syncMarkersToDs();
+        announce("Mangle,slice mode, " + sliceCount + " slices");
+    } else {
+        currentView = VIEW_FREE;
+        selectedField = 0;
+        announce("Mangle," + (fileName || "no file") + ", " + formatTime(totalFrames));
+    }
+    /* Seed a default scene if none were restored and a file is loaded */
+    if (!stillRecording && totalFrames > 0) {
+        if (trackStates[0].scenes.length === 0 && openedFilePath) {
+            trackStates[0].scenes.push(makeSceneState(openedFilePath));
+            trackStates[0].selectedSceneIdx = 0;
+            trackStates[0].playingSceneIdx  = 0;
+        }
+    }
+    /* Force full LED repaint */
+    ledInitPending = true;
+    ledInitIndex = 0;
+}
+
 /* ============ Exported Entry Points ============ */
 
 globalThis.init = function() {
@@ -3791,110 +6840,63 @@ globalThis.init = function() {
     refreshState();
 
     if (isReconnect) {
-        /* Reconnecting to existing session — restore view based on DSP state */
-        /* Check if DSP is still recording */
-        var stillRecording = (typeof host_sampler_is_recording === "function") && host_sampler_is_recording();
-        if (stillRecording) {
-            recordState = "recording";
-            recordFilePath = SCRATCH_PATH;
-            openedFilePath = SCRATCH_PATH;
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
+        /* Reconnecting to existing session — read minimal DSP state first */
 
-            /* Recover actual elapsed time from sampler's sample counter */
-            var samplesWritten = 0;
-            if (typeof host_sampler_get_samples_written === "function") {
-                samplesWritten = host_sampler_get_samples_written();
-            }
-            var elapsedSec = samplesWritten / 44100;
-            recordStartTime = Date.now() - (elapsedSec * 1000);
+        /* Restore projectDir from DSP */
+        var _savedProjectDir = host_module_get_param("project_dir");
+        if (_savedProjectDir) projectDir = _savedProjectDir;
 
-            /* Reconstruct waveform array with placeholder entries so the
-             * write head position reflects actual recording progress.
-             * Each tick adds one entry, ticks are ~16ms apart. */
-            var estimatedTicks = Math.round(elapsedSec * 1000 / 16);
-            recordWaveform = [];
-            for (var i = 0; i < estimatedTicks; i++) {
-                recordWaveform.push(0.05);  /* dim baseline so it's visible */
-            }
-            recordWriteHead = recordWaveform.length;
-
-            var timeStr = Math.floor(elapsedSec / 60) + ":" +
-                (elapsedSec % 60 < 10 ? "0" : "") + Math.floor(elapsedSec % 60);
-            announce("Wave Edit, recording in progress, " + timeStr);
-        } else if ((typeof host_sampler_is_paused === "function") && host_sampler_is_paused()) {
-            /* DSP is paused — restore paused state */
-            recordState = "paused";
-            recordFilePath = SCRATCH_PATH;
-            openedFilePath = SCRATCH_PATH;
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-
-            /* Recover elapsed time from sampler's sample counter */
-            var pausedSamples = 0;
-            if (typeof host_sampler_get_samples_written === "function") {
-                pausedSamples = host_sampler_get_samples_written();
-            }
-            var pausedElapsed = pausedSamples / 44100;
-            recordStartTime = Date.now() - (pausedElapsed * 1000);
-            recordPauseStart = Date.now();
-            /* pausedTotal covers the gap between reconstructed start and now,
-               minus actual recorded time, so elapsed stays correct after resume */
-            recordPausedTotal = Date.now() - recordStartTime - (pausedElapsed * 1000);
-
-            /* Reconstruct waveform with placeholder entries */
-            var pausedTicks = Math.round(pausedElapsed * 1000 / 16);
-            recordWaveform = [];
-            for (var j = 0; j < pausedTicks; j++) {
-                recordWaveform.push(0.05);
-            }
-            recordWriteHead = recordWaveform.length;
-
-            announce("Wave Edit, recording paused");
-        } else if (openedFilePath && totalFrames === 0) {
-            /* File path set but no audio data — restore record-ready state */
-            recordBrowserDir = SCRATCH_DIR;
-            recordFilePath = SCRATCH_PATH;
-            recordState = "ready";
-            recordLedCounter = 0;
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-            announce("New Recording, press REC to record");
-        } else if (restoreSliceState()) {
-            /* Restored slice state from DSP — resume slice mode */
-            currentView = VIEW_SLICE;
-            selectedField = 0;
-            selectSlice(selectedSlice);
-            syncMarkersToDs();
-            announce("Wave Edit, slice mode, " + sliceCount + " slices");
-        } else {
-            currentView = VIEW_TRIM;
-            selectedField = 0;
-            announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+        /* Restore active track from DSP */
+        var _atRaw = host_module_get_param("active_track");
+        if (_atRaw) {
+            var _at = parseInt(_atRaw, 10);
+            if (!isNaN(_at) && _at >= 0 && _at < NUM_TRACKS) activeTrack = _at;
         }
-        /* Force full LED repaint */
+
+        /* Always ask — DSP state is alive so playback may be running */
+        resumeDialogIndex = 0;
+        currentView = VIEW_CONFIRM_RESUME;
         ledInitPending = true;
         ledInitIndex = 0;
+        announce("Resume project? Resume");
     } else {
         /* Fresh session */
-        currentView = VIEW_TRIM;
+        currentView = VIEW_FREE;
         selectedField = 0;
         host_module_set_param("mode", "0");
 
-        if (openedFilePath && totalFrames === 0) {
-            /* New file — use scratch path for recording */
+        if (totalFrames === 0) {
+            /* No audio data — prepare scratch path but stay "idle" until
+             * the project browser is dismissed (so input isn't blocked). */
             if (typeof host_ensure_dir === "function") {
                 host_ensure_dir(SCRATCH_DIR);
             }
             recordFilePath = SCRATCH_PATH;
             recordBrowserDir = SCRATCH_DIR;
-            recordState = "ready";
+            recordState = "idle";
             recordLedCounter = 0;
-            announce("New Recording, press REC to record");
         } else {
-            announce("Wave Edit, " + (fileName || "no file") + ", " + formatTime(totalFrames));
+            /* Restore scene state for all tracks on open-with-file */
+            for (var _ri = 0; _ri < NUM_TRACKS; _ri++) {
+                restoreSceneState(_ri);
+            }
+            /* If no scene state was restored but a file is loaded, seed track 0 scene 0 */
+            if (trackStates[0].scenes.length === 0 && openedFilePath) {
+                trackStates[0].scenes.push(makeSceneState(openedFilePath));
+                trackStates[0].selectedSceneIdx = 0;
+                trackStates[0].playingSceneIdx  = 0;
+            }
+        }
+
+        /* Always show project browser at startup if no project is set yet */
+        if (!projectDir) {
+            initProjectBrowser();
+        } else {
+            if (totalFrames === 0) {
+                announce("New Recording, press REC to record");
+            } else {
+                announce("Mangle," + (fileName || "no file") + ", " + formatTime(totalFrames));
+            }
         }
     }
 };
@@ -3906,7 +6908,101 @@ globalThis.tick = function() {
         if (!ledInitPending) {
             /* Init just finished — sync LEDs to current state */
             updateLeds();
+            if (currentView === VIEW_SLICE) updateSlicePadLeds();
         }
+    }
+
+    drainInjectQueue();
+
+    /* Read overlay state once per tick: transport detection via clock + BPM push */
+    tickFrame++;
+    var _barCrossed = false;
+    if (typeof shadow_get_overlay_state === "function") {
+        var _ov = shadow_get_overlay_state();
+        if (_ov) {
+            /* Transport detection via overlay (set by shim on 0xFA/0xFC) */
+            var _ovTransport = _ov.transportPlaying ? true : false;
+            if (_ovTransport !== transportPlaying) {
+                transportPlaying = _ovTransport;
+                /* Reset bar clock immediately so bar detection uses correct origin */
+                if (transportPlaying) {
+                    transportPlayingTimestamp = Date.now();
+                    lastBarCount = 0;
+                }
+            }
+            /* Bar/beat-crossing detection: time-based using Date.now() + globalBpm */
+            if (transportPlaying) {
+                var _beatDurationMs = 60000 / globalBpm;     /* one 1/4-note beat in ms */
+                var _barDurationMs  = 4 * _beatDurationMs;   /* one 4/4 bar in ms */
+                var _elapsed = Date.now() - transportPlayingTimestamp;
+                var _curBar  = (_barDurationMs  > 0) ? Math.floor(_elapsed / _barDurationMs)  : 0;
+                var _curBeat = (_beatDurationMs > 0) ? Math.floor(_elapsed / _beatDurationMs) : 0;
+                if (_curBar > lastBarCount) {
+                    _barCrossed = true;
+                    lastBarCount = _curBar;
+                }
+                if (_curBeat > lastBeatCount) {
+                    lastBeatCount = _curBeat;
+                }
+            }
+            /* React to transport start/stop transitions */
+            if (transportPlaying !== lastTransportPlaying) {
+                lastTransportPlaying = transportPlaying;
+                if (transportPlaying) {
+                    /* transportPlayingTimestamp and lastBarCount already reset above */
+                    /* Only start tracks that have an active scene — not all loaded tracks */
+                    for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
+                        var _tts = trackStates[_ti];
+                        if (_tts.loaded && _tts.playingSceneIdx >= 0) {
+                            host_module_set_param("t" + _ti + ":play", "selection");
+                            _tts.playing = true;
+                        }
+                    }
+                    if (trackStates[activeTrack].loaded && trackStates[activeTrack].playingSceneIdx >= 0) playing = true;
+                } else {
+                    for (var _ti2 = 0; _ti2 < NUM_TRACKS; _ti2++) {
+                        if (trackStates[_ti2].playing) {
+                            host_module_set_param("t" + _ti2 + ":play", "stop");
+                        }
+                        trackStates[_ti2].playing = false;
+                    }
+                    playing = false;
+                    /* Flush current state to project.json on transport stop so that
+                     * unsaved edits (markers, loopEnabled, tempo) survive a module reload. */
+                    saveTrackUIState(activeTrack);
+                    saveCurrentSceneState(activeTrack);
+                    saveSceneState(activeTrack);
+                    saveProjectJson();
+                }
+            }
+            /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes */
+            if (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0 && _ov.samplerBpm !== lastProjectBpm) {
+                host_module_set_param("project_bpm", String(_ov.samplerBpm));
+                lastProjectBpm = _ov.samplerBpm;
+                globalBpm = lastProjectBpm;
+                for (var _bi = 0; _bi < NUM_TRACKS; _bi++) {
+                    var _bts = trackStates[_bi];
+                    var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
+                        ? _bts.scenes[_bts.playingSceneIdx] : null;
+                    if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
+                        var _tp = Math.round(globalBpm / _bsc.bpm * 100);
+                        if (_tp < 30) _tp = 30;
+                        if (_tp > 300) _tp = 300;
+                        var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
+                        var _ss = _bsc.startSample || 0;
+                        var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
+                        host_module_set_param(_stkey, _tp + "," + _ss + "," + _se);
+                        if (_bi === activeTrack) tempoPercent = _tp;
+                    }
+                }
+            }
+        }
+    }
+
+    /* Countdown for track reset confirmation */
+    if (pendingTrackResetTimer > 0) {
+        pendingTrackResetTimer--;
+        if (pendingTrackResetTimer === 0) pendingTrackReset = -1;
     }
 
     /* Poll for sampler finalization after recording stop */
@@ -3934,6 +7030,58 @@ globalThis.tick = function() {
         }
     }
 
+    /* Poll skipback result from DSP */
+    if (skipbackPending) {
+        var _sbResult = host_module_get_param("skipback_result");
+        if (_sbResult && _sbResult.length > 0) {
+            skipbackPending = false;
+            var _sbSlot = skipbackTargetSlot >= 0 ? skipbackTargetSlot : trackStates[activeTrack].scenes.length;
+            var _sbScene = makeSceneState(_sbResult);
+            if (_sbSlot < trackStates[activeTrack].scenes.length) {
+                /* Preserve existing scene settings (path only changes) if slot had content */
+                if (!trackStates[activeTrack].scenes[_sbSlot].path) {
+                    trackStates[activeTrack].scenes[_sbSlot] = _sbScene;
+                } else {
+                    trackStates[activeTrack].scenes[_sbSlot].path = _sbResult;
+                }
+            } else {
+                trackStates[activeTrack].scenes.push(_sbScene);
+            }
+            /* Advance selectedSceneIdx to next free slot */
+            trackStates[activeTrack].selectedSceneIdx = findNextFreeSceneSlot(activeTrack);
+            skipbackTargetSlot = -1;
+            saveSceneState(activeTrack);
+            saveProjectJson();
+            showStatus("Scene " + (_sbSlot + 1) + " \u2192 Pad " + (_sbSlot + 1), 90);
+            updateLeds();
+        }
+    }
+
+    /* Quantized scene switching — fire when the selected boundary is crossed.
+     * Falls back to immediate if transport is not running. */
+    if (pendingSceneSwitch >= 0) {
+        var _fire = !transportPlaying; /* always fire if transport stopped */
+        if (!_fire) {
+            var _elapsed2 = Date.now() - transportPlayingTimestamp;
+            var _beatMs   = 60000 / globalBpm;
+            var _curBeat2 = (_beatMs > 0) ? Math.floor(_elapsed2 / _beatMs) : 0;
+            var _curBar2  = Math.floor(_curBeat2 / 4);
+            switch (quantizeMode) {
+                case QUANT_BEAT:       _fire = (_curBeat2 > lastBeatCount); break;
+                case QUANT_BAR:        _fire = _barCrossed; break;
+                case QUANT_2BAR:       _fire = _barCrossed && (_curBar2 % 2 === 0); break;
+                case QUANT_4BAR:       _fire = _barCrossed && (_curBar2 % 4 === 0); break;
+                case QUANT_SAMPLE_END: _fire = !trackStates[pendingSceneSwitchTrack].playing; break;
+                default:               _fire = _barCrossed; break;
+            }
+        }
+        if (_fire) {
+            applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
+            pendingSceneSwitch = -1;
+            pendingSceneSwitchTrack = -1;
+        }
+    }
+
     /* Flush queued play/stop command — issued here in tick() so it's the
      * last set_param in the frame, after encoder flush has completed.
      * This prevents knob params from overwriting the play command.
@@ -3954,14 +7102,88 @@ globalThis.tick = function() {
         pendingPlay = "";
     }
 
-    /* Poll playback state if playing */
+    /* If waveform is dirty but the file hasn't loaded yet, retry file info
+     * each tick until DSP delivers valid data (blocking set_param race). */
+    if (waveformDirty && totalFrames === 0) {
+        refreshFileInfo();
+        if (totalFrames > 0) {
+            /* Apply deferred scene marker + slice state now that file is loaded */
+            if (pendingSceneRestore) {
+                var _psr = pendingSceneRestore;
+                pendingSceneRestore = null;
+                dbg("tick: pendingSceneRestore APPLY — file=" + fileName + " frames=" + totalFrames + " psr.start=" + _psr.startSample + " psr.end=" + _psr.endSample);
+                /* Use saved endSample; fall back to totalFrames for new/unedited scenes.
+                 * Clamp both markers to the new file's length to avoid startSample >
+                 * endSample when the source scene was longer than the target scene. */
+                startSample = _psr.startSample || 0;
+                endSample   = (_psr.endSample > 0) ? _psr.endSample : totalFrames;
+                if (endSample   > totalFrames) endSample   = totalFrames;
+                if (startSample > totalFrames) startSample = totalFrames;
+                if (startSample > endSample)   startSample = 0;
+                dbg("tick: after clamp — start=" + startSample + " end=" + endSample + " totalFrames=" + totalFrames);
+                /* Save the resolved endSample back into the scene object */
+                var _psrTs = trackStates[activeTrack];
+                if (_psrTs.playingSceneIdx >= 0 && _psrTs.playingSceneIdx < _psrTs.scenes.length) {
+                    _psrTs.scenes[_psrTs.playingSceneIdx].endSample = endSample;
+                }
+                /* Push deferred DSP settings now that file is loaded.
+                 * These were NOT sent during applySceneLaunch to avoid
+                 * host_module_set_param queue overflow.
+                 * MUST use blocking calls — rapid non-blocking calls
+                 * overwrite each other in the single shared-memory slot. */
+                if (_psr.gainDb !== undefined) {
+                    setParamBlocking("gain_db",   _psr.gainDb.toFixed(1), 500);
+                    gainDb = _psr.gainDb;
+                }
+                if (_psr.pitchSemitones !== undefined) {
+                    setParamBlocking("pitch",     _psr.pitchSemitones.toFixed(2), 500);
+                    pitchSemitones = _psr.pitchSemitones;
+                }
+                if (_psr.tempoPercent !== undefined) {
+                    tempoPercent = _psr.tempoPercent;
+                    if (syncMode) {
+                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
+                    } else {
+                        setParamBlocking("tempo", String(tempoPercent), 500);
+                    }
+                }
+                if (_psr.loopEnabled !== undefined) {
+                    setParamBlocking("play_loop", _psr.loopEnabled ? "1" : "0", 500);
+                    loopEnabled = _psr.loopEnabled;
+                }
+                /* Use blocking markers call to guarantee the DSP has the
+                 * correct start/end before the play command fires next tick.
+                 * Non-blocking syncMarkersToDs() can be lost in the single
+                 * shared-memory slot race with other params. */
+                setParamBlocking("markers", startSample + "," + endSample, 500);
+                if (_psr.hasSlices) saveSliceState();
+                /* Now that the file is confirmed loaded, trigger playback.
+                 * Use "selection" so play_whole=0 and marker boundaries are
+                 * respected immediately during playback (not ignored). */
+                if (_psr.autoPlay) pendingPlay = "selection";
+            }
+            refreshWaveform();
+        }
+    }
+
+    /* Poll playback state for active track — skip play-state check until
+     * the file is confirmed loaded to avoid premature playing=false reset. */
     if (playing) {
         var posRaw = host_module_get_param("play_pos");
         if (posRaw) playPos = parseInt(posRaw, 10) || 0;
 
         var playingRaw = host_module_get_param("playing");
-        if (playingRaw === "0" || playingRaw === "false") {
+        /* Guard: don't reset playing while a scene file is still loading
+         * (pendingSceneRestore != null) or a play command is pending.
+         * The DSP reports playing=0 between unloading the old file and
+         * starting the new one, which would cause the PLAY LED / track
+         * LED to go dark prematurely. pendingPlay guards the tick where
+         * pendingSceneRestore was just processed (nulled) but the play
+         * command hasn't been sent yet (next tick). */
+        if (totalFrames > 0 && !pendingSceneRestore && !pendingPlay && (playingRaw === "0" || playingRaw === "false")) {
+            dbg("tick: playing→false (DSP says stopped) frames=" + totalFrames + " pendingRestore=" + (pendingSceneRestore ? "yes" : "no"));
             playing = false;
+            trackStates[activeTrack].playing = false;
             if (lazyChopping) {
                 /* Sample reached end — finalize chop session */
                 lazyChopping = false;
@@ -3973,6 +7195,24 @@ globalThis.tick = function() {
             }
         }
     }
+
+    /* Poll playback state for non-active tracks */
+    for (var _pt = 0; _pt < NUM_TRACKS; _pt++) {
+        if (_pt === activeTrack) continue;
+        if (trackStates[_pt].playing) {
+            var _pRaw = host_module_get_param("t" + _pt + ":playing");
+            if (_pRaw === "0" || _pRaw === "false") {
+                trackStates[_pt].playing = false;
+            } else {
+                var _posRaw = host_module_get_param("t" + _pt + ":play_pos");
+                if (_posRaw) trackStates[_pt].playPos = parseInt(_posRaw, 10) || 0;
+            }
+        }
+    }
+
+    /* Update track and play LEDs */
+    updateTrackLEDs();
+    updatePlayLED();
 
     /* Decay status message timer */
     if (statusTimer > 0) {
@@ -4016,8 +7256,8 @@ globalThis.tick = function() {
         case VIEW_MODE_MENU:
             drawModeMenu();
             break;
-        case VIEW_TRIM:
-            drawTrimView();
+        case VIEW_FREE:
+            drawFreeView();
             break;
         case VIEW_LOOP:
             drawLoopView();
@@ -4036,6 +7276,27 @@ globalThis.tick = function() {
             break;
         case VIEW_SLICE:
             drawSliceView();
+            break;
+        case VIEW_JOG_MENU:
+            drawJogMenu();
+            break;
+        case VIEW_JOG_SHIFT_MENU:
+            drawJogShiftMenu();
+            break;
+        case VIEW_SYNC:
+            drawSyncView();
+            break;
+        case VIEW_PROJECT:
+            drawProjectView();
+            break;
+        case VIEW_MAIN_MENU:
+            drawMainMenu();
+            break;
+        case VIEW_CONFIRM_CLOSE:
+            drawConfirmClose();
+            break;
+        case VIEW_CONFIRM_RESUME:
+            drawConfirmResume();
             break;
     }
 };
