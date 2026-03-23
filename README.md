@@ -1,155 +1,153 @@
-# Wave Edit for Move Everything
+# Mangle for Schwung
 
-A full-featured audio waveform editor for your Ableton Move. Trim, gain adjust, normalize, copy/paste, and mute sections of WAV files directly on the device.
+A 4-track sampler for your Ableton Move. Load samples, edit markers, slice, stretch, and perform with scenes — all on the device.
 
 ## Features
 
+- 4 independent tracks, mixed in a single DSP instance
 - Waveform display with zoom and minimap overview
 - Start/end marker selection with knobs
-- Jog wheel scrolls waveform view when zoomed in
 - Real-time gain adjustment and normalization
 - Cut, copy, paste, and mute operations
-- Hold-to-audition playback with loop mode
 - Loop view: seam editor for seamless loops with zero-crossing snap
+- BPM-grid slicing and beat-aligned marker snapping
+- Record audio directly into the sampler
 - Undo support for all destructive edits
 - Export selection to new file
-- BPM-grid slicing and beat-aligned marker snapping
-- Record audio directly into the editor (New Recording in file browser)
+- **Three edit/playback modes:** FREE (by time), STRETCH (time-stretch, pitch preserved), VARISPEED (tape-style: pitch+speed together)
+- **Three pad modes per scene:** Trigger (toggle), Gate (hold), One Shot (always restarts)
+- **Quantized scene launch:** FREE, BEAT, 1BAR, 2BAR, 4BAR, SAMPLE END
 
 ## Prerequisites
 
-- [Move Everything](https://github.com/charlesvestal/move-everything) installed on your Ableton Move
+- [Schwung](https://github.com/charlesvestal/schwung) installed on your Ableton Move
 - SSH access enabled: http://move.local/development/ssh
 
 ## Install
 
-### Via Module Store (Recommended)
-
-1. Launch Move Everything on your Move
-2. Select **Module Store** from the main menu
-3. Navigate to **Tools** > **Wave Edit**
-4. Select **Install**
-
-### Build from Source
-
 ```bash
-git clone https://github.com/charlesvestal/move-everything-waveform-editor
-cd move-anything-waveform-editor
+git clone https://github.com/SchluppiBobbz/schwung-mangle
+cd schwung-mangle
 ./scripts/build.sh
 ./scripts/install.sh
 ```
 
 ## Controls
 
+### Track Selection (MoveRow Buttons)
+
+| Button | Action |
+|--------|--------|
+| MoveRow 1–4 | Select active track (press again to toggle play/stop) |
+| Shift+MoveRow | Open file browser for that track |
+| Play | Start/stop ALL loaded tracks |
+
 ### View Selection (Step Buttons)
 
 | Step | Action |
 |------|--------|
-| Step 1 | Enter edit mode (FREE or SYNC — whichever was last used). LED: Orange = SYNC, PaleGreen = FREE |
-| Shift+Step 1 | Toggle between FREE and SYNC edit mode |
+| Step 1 | Enter last-used edit mode (FREE or SYNC). LED: PaleGreen=FREE, BrightOrange=STRETCH, VividYellow=VARISPEED |
+| Shift+Step 1 | Cycle edit mode: FREE → VARISPEED → STRETCH → FREE |
 | Step 2 | Enter Slice mode |
-| Step 4 | Toggle Gate / Trigger mode for active track |
+| Step 4 | Cycle pad mode: Trigger → Gate → One Shot (per active track) |
 | Step 5 | Toggle Clock Sync on/off |
+| Shift+Step 5 | Cycle quantize mode: FREE → BEAT → 1BAR → 2BAR → 4BAR → SAMPLE END |
 
-### FREE View (Step 1, FREE mode)
+### FREE View
 
 | Control | Function |
 |---------|----------|
 | Jog wheel | Scroll view when zoomed in |
 | Jog click | Edit menu: Copy, Cut, Truncate, Normalize Sel, BPM Step, Mute |
-| Shift+Jog click | Paste/Export menu: Paste (insert), Paste (overwrite), Export |
-| Knob 1 | Move start marker (Shift: fine movement) |
-| Knob 2 | Move end marker (Shift: fine movement) |
+| Shift+Jog click | Paste/Export menu |
+| Knob 1 | Move start marker (Shift: fine) |
+| Knob 2 | Move end marker (Shift: fine) |
 | Knob 3 | Zoom |
 | Knob 4 | Vertical scale |
 | Knob 5 | Gain (Shift: normalize) |
-| Knob 7 (touch+twist) | Toggle loop mode on/off |
+| Knob 7 (touch+twist) | Toggle loop mode |
 | Knob 8 (touch+twist) | Snap markers to zero crossing |
-| Any pad | Hold to audition (Shift: preview near end) |
-| Mute | Mute (zero out) selection |
-| Step 9 | Fade in selection |
-| Step 10 | Fade out selection |
+| Left/Right | Nudge selection |
+| Shift+L/R | Jump selection by one length |
+| Step 9 / 10 | Fade in / Fade out selection |
+| Step 15 / 16 | Set start / end marker at playback position |
 | Copy | Copy selection |
-| Shift+Copy | Paste at cursor (insert) |
-| Remove | Cut selection (copy + remove) |
-| Left/Right | Nudge selection by coarse step |
-| Shift+L/R | Jump selection by one selection length |
-| Step 15 | Set start marker at playback position (while playing) |
-| Step 16 | Set end marker at playback position (while playing) |
-| Loop | Enter loop view (seam editor) |
-| Shift+Loop | Toggle loop mode on/off |
-| Sample | Open save menu (editable filename) |
-| Shift+Capture | Export selection to new file |
+| Remove | Cut selection |
 | Undo | Undo last edit |
-| Back | Hide (keeps DSP alive) |
-| Shift+Back | Full exit (unload DSP) |
 
-### SYNC View (Shift+Step 1 to activate)
+### STRETCH / VARISPEED View (Shift+Step 1)
 
-Tempo-synchronous playback with time-stretching and constant pitch. The clip has a **scene BPM** and a **musical length** (bars:beats). The audio is time-stretched to fit the project tempo — pitch is always preserved.
+**STRETCH:** tempo changes via time-stretching — pitch stays constant.
+**VARISPEED:** tempo changes affect pitch too (tape-style). No stretcher, lower CPU.
 
 | Control | Function |
 |---------|----------|
-| Jog wheel | Scroll view when zoomed in |
-| Jog click | Toggle active marker (Start/End) |
-| Knob 1 | Move start marker (in beat steps, Shift: cycle beat division) |
-| Knob 2 | Adjust musical length (in beat steps, Shift: cycle beat division) |
+| Knob 1 | Move start marker (bars:beats, Shift: cycle beat division) |
+| Knob 2 | Adjust musical length (bars:beats) |
 | Knob 3 | Zoom |
-| Knob 8 | Adjust scene BPM (Shift: fine ±0.1) — end marker rescales automatically to keep musical length constant |
-| Copy | Copy selection |
-| Shift+Copy | Paste at cursor (insert) |
+| Knob 8 | Adjust scene BPM (Shift: fine ±0.1) — length stays constant |
 | Down | Read BPM from filename |
-| Up | Estimate BPM from selection length (assumes 1 bar, 4/4) |
+| Up | Estimate BPM from selection (assumes 1 bar, 4/4) |
 | Left/Right | Move entire selection by one division |
-| Shift+L/R | Move entire selection by one division |
-| Step 15 | Set start marker at playback position (while playing) |
-| Step 16 | Set end marker at playback position (while playing) |
-| Shift+Loop | Toggle loop on/off |
 
-### Slice Mode (Step 3)
+### Pad Modes (Step 4 cycles)
+
+| Mode | LED | Behaviour |
+|------|-----|-----------|
+| Trigger | DarkGrey | Press to start; press playing pad to stop |
+| Gate | BrightRed | Plays only while pad is held |
+| One Shot | VividYellow | Always restarts from start on press; loop setting respected |
+
+Pad mode is saved **per scene**.
+
+### Quantize Modes (Shift+Step 5 cycles)
+
+| Mode | Description |
+|------|-------------|
+| FREE | Immediate launch |
+| BEAT | Wait for next beat |
+| 1BAR | Wait for next bar (default) |
+| 2BAR / 4BAR | Wait for next 2- or 4-bar boundary |
+| SAMPLE END | Wait for current clip to finish |
+
+### Slice Mode (Step 2)
 
 | Control | Function |
 |---------|----------|
-| Jog wheel | Cycle slice mode (Even / Auto / Lazy / BPM) |
+| Jog wheel | Cycle slice mode: Even / Auto / Lazy / BPM |
 | Knob 1 | Move slice start boundary |
 | Knob 2 | Move slice end boundary |
 | Knob 3 | Zoom |
-| Knob 4 | Vertical scale |
-| Knob 5 | Count (Even) / Threshold (Auto) / Chop-Play (Lazy) / BPM value (BPM) |
-| Knob 6 | Beat division (BPM mode only) |
+| Knob 5 | Count (Even) / Threshold (Auto) / BPM value (BPM) |
+| Knob 6 | Beat division (BPM mode) |
 | Knob 8 | Select slice |
 | Left/Right | Previous / next slice |
-| Shift+Left/Right | Move selected slice left/right (swap with neighbour) |
+| Shift+L/R | Move selected slice left/right |
 | Up | Merge slice with previous |
 | Down | Split slice at midpoint |
-| Shift+Up/Down | Scroll pad bank (when >32 slices) |
-| Copy | Copy selected slice to clipboard |
-| Shift+Copy | Paste clipboard insert before selected slice |
-| Remove | Cut selected slice (copy + remove from file) |
-| Step 9 | Fade in selected slice |
-| Step 10 | Fade out selected slice |
+| Copy | Copy selected slice |
+| Remove | Cut selected slice |
+| Step 9 / 10 | Fade in / Fade out selected slice |
 | Step 16 | Shuffle all slices randomly |
-| Pads | Audition slice (hold) |
-| Sample | Save slices / Drum Preset / REX Loop (if installed) |
-| Shift+Capture | Export current selection to new file |
-| Back | Hide (keeps DSP alive) |
+| Pads | Audition slice |
+| Sample | Save slices / Drum Preset / REX Loop |
 
 ## Header Indicators
 
+- `T1`–`T4` — active track
 - `*` — unsaved changes
 - `L` — loop mode enabled
+- `G` — Gate pad mode
+- `O` — One Shot pad mode
 
 ## Credits
 
-- **Move Everything framework**: [Charles Vestal](https://github.com/charlesvestal/move-everything)
+- **Schwung framework**: [Charles Vestal](https://github.com/charlesvestal/schwung)
 
 ## License
 
 MIT License — See [LICENSE](LICENSE)
 
-## AI Assistance Disclaimer
+## AI Assistance
 
-This module is part of Move Everything and was developed with AI assistance, including Claude, Codex, and other AI assistants.
-
-All architecture, implementation, and release decisions are reviewed by human maintainers.
-AI-assisted content may still contain errors, so please validate functionality, security, and license compatibility before production use.
+Developed with AI assistance (Claude). All architecture and release decisions reviewed by human maintainers.
