@@ -162,7 +162,7 @@ function sceneLoadFile(trackIdx, path) {
  */
 var SCENE_FIELDS = [
     "startSample", "endSample", "gainDb", "pitchSemitones", "tempoPercent",
-    "bpm", "beatDivIndex", "syncMode", "loopEnabled",
+    "bpm", "beatDivIndex", "syncMode", "loopEnabled", "gateMode",
     "sliceMode", "sliceCount", "sliceBoundaries", "selectedSlice",
     "slicePadOffset", "sliceRegionStart", "sliceRegionEnd", "sliceThreshold",
     "slicePitches", "sliceTempos", "lazySub",
@@ -429,6 +429,7 @@ function makeSceneState(path) {
         beatDivIndex:    beatDivIndex,
         syncMode:        (currentView === VIEW_SYNC),
         loopEnabled:     true,
+        gateMode:        PAD_MODE_TRIGGER,
         sliceMode:       SLICE_MODE_EVEN,
         sliceCount:      1,
         sliceBoundaries: [],
@@ -452,6 +453,10 @@ var pendingSceneSwitchTrack = -1;
 var lastBarCount            = 0;  /* bar count at last tick — for clock-based bar crossing detection */
 
 /* Quantize modes for scene launch (S-4 inspired) */
+var PAD_MODE_TRIGGER = 0;  /* toggle play/stop */
+var PAD_MODE_GATE    = 1;  /* play while pad held */
+var PAD_MODE_ONESHOT = 2;  /* always restart from start on press; loop respects scene setting */
+
 var QUANT_FREE       = 0;  /* immediate */
 var QUANT_BEAT       = 1;  /* next 1/4-note beat */
 var QUANT_BAR        = 2;  /* next bar (4 beats) */
@@ -475,7 +480,7 @@ function makeTrackState() {
         zoomLevel: 0, zoomCenter: 0, vScale: 1.0,
         playing: false, playPos: 0,
         gainDb: 0.0, peakDb: -96,
-        gateMode: false,
+        gateMode: PAD_MODE_TRIGGER,
         varispeedMode: false,  /* true = varispeed (repitch), false = stretch (Bungee) */
         loopEnabled: false,
         pitchSemitones: 0.0,
@@ -616,6 +621,9 @@ function restoreSceneToGlobals(scene) {
     /* SYNC scenes: recalculate tempoPercent from current globalBpm so it stays accurate */
     tempoPercent = syncMode ? Math.round(globalBpm / bpm * 100) : scene.tempoPercent;
     loopEnabled = scene.loopEnabled;
+    var _sgm = (scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER;
+    trackStates[activeTrack].gateMode = _sgm;
+    host_module_set_param("gate_mode", String(_sgm));
     sliceMode = scene.sliceMode;
     sliceCount = scene.sliceCount;
     sliceBoundaries = (scene.sliceBoundaries || []).slice();
@@ -641,6 +649,7 @@ function getGlobalsAsSceneSource() {
         startSample: startSample, endSample: endSample,
         gainDb: gainDb, pitchSemitones: pitchSemitones, tempoPercent: tempoPercent,
         bpm: bpm, beatDivIndex: beatDivIndex, syncMode: syncMode, loopEnabled: loopEnabled,
+        gateMode: trackStates[activeTrack].gateMode,
         sliceMode: sliceMode, sliceCount: sliceCount, sliceBoundaries: sliceBoundaries,
         selectedSlice: selectedSlice, slicePadOffset: slicePadOffset,
         sliceRegionStart: sliceRegionStart, sliceRegionEnd: sliceRegionEnd,
@@ -1032,7 +1041,7 @@ function saveProjectJson() {
             selectedSceneIdx: trackStates[_st].selectedSceneIdx,
             playingSceneIdx:  trackStates[_st].playingSceneIdx,
             muted:            !!trackStates[_st].muted,
-            gateMode:         !!trackStates[_st].gateMode
+            gateMode:         trackStates[_st].gateMode | 0
         });
     }
     if (typeof host_write_file === "function") {
@@ -1078,9 +1087,9 @@ function loadProjectJson() {
 
             /* Restore muted / gateMode */
             ts.muted    = !!td.muted;
-            ts.gateMode = !!td.gateMode;
-            host_module_set_param("t" + _lt + ":muted",     ts.muted    ? "1" : "0");
-            host_module_set_param("t" + _lt + ":gate_mode", ts.gateMode ? "1" : "0");
+            ts.gateMode = (td.gateMode >= 0 && td.gateMode <= 2) ? td.gateMode : PAD_MODE_TRIGGER;
+            host_module_set_param("t" + _lt + ":muted",     ts.muted ? "1" : "0");
+            host_module_set_param("t" + _lt + ":gate_mode", String(ts.gateMode));
 
             /* Find the scene to load (playing scene, or first available) */
             var _ltPlayIdx = ts.playingSceneIdx;
@@ -1317,8 +1326,9 @@ function updateLeds() {
     setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
     setLED(STEP_BASE + 2, Black);  /* freed */
 
-    /* Step 4: Gate/Trigger mode LED */
-    setLED(STEP_BASE + 3, isEdit ? (trackStates[activeTrack].gateMode ? BrightRed : DarkGrey) : Black);
+    /* Step 4: Pad mode LED — DarkGrey=Trigger, BrightRed=Gate, VividYellow=OneShot */
+    var _padModeLed = trackStates[activeTrack].gateMode;
+    setLED(STEP_BASE + 3, isEdit ? (_padModeLed === PAD_MODE_GATE ? BrightRed : _padModeLed === PAD_MODE_ONESHOT ? VividYellow : DarkGrey) : Black);
 
     /* Step 5: Clock Sync LED; dim dot when quantize != BAR */
     var syncOn = (host_module_get_param("sync_clock") === "1");
@@ -2232,7 +2242,8 @@ function buildModeHeader(modeName) {
     var s = "T" + (activeTrack + 1) + " " + modeName;
     if (dirty) s += "*";
     if (loopEnabled) s += " L";
-    if (trackStates[activeTrack].gateMode) s += " G";
+    var _hpm = trackStates[activeTrack].gateMode;
+    if (_hpm === PAD_MODE_GATE) s += " G"; else if (_hpm === PAD_MODE_ONESHOT) s += " O";
     if (pitchSemitones !== 0 || tempoPercent !== 100) s += " P";
     /* Scene indicator: S<armed> or S<armed>>S<playing> */
     var _sts = trackStates[activeTrack];
@@ -3260,6 +3271,7 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
+        setParamBlocking(_tp + "gate_mode", String((scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER), 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
     }
     if (autoPlay) {
@@ -3408,7 +3420,7 @@ function resetTrack(trackIdx) {
     ts.tempoPercent = 100;
     ts.loopEnabled = true;
     ts.muted = false;
-    ts.gateMode = false;
+    ts.gateMode = PAD_MODE_TRIGGER;
     ts.zoomLevel = 0;
     ts.zoomCenter = 0;
     ts.vScale = 1.0;
@@ -6285,13 +6297,19 @@ function handleNote(note, velocity) {
         }
         /* Not a knob touch — fall through to pad/step handling below */
     }
-    /* Step 4: Toggle Gate/Trigger mode for active track */
+    /* Step 4: Cycle pad mode — Trigger → Gate → OneShot → Trigger */
     if (velocity > 0 && note === STEP_BASE + 3) {
-        trackStates[activeTrack].gateMode = !trackStates[activeTrack].gateMode;
-        host_module_set_param("t" + activeTrack + ":gate_mode",
-            trackStates[activeTrack].gateMode ? "1" : "0");
-        announce(trackStates[activeTrack].gateMode ? "Gate Mode" : "Trigger Mode");
-        showStatus(trackStates[activeTrack].gateMode ? "Gate" : "Trigger", 60);
+        trackStates[activeTrack].gateMode = (trackStates[activeTrack].gateMode + 1) % 3;
+        var _newPadMode = trackStates[activeTrack].gateMode;
+        host_module_set_param("t" + activeTrack + ":gate_mode", String(_newPadMode));
+        /* Persist into the active scene so it's saved with the scene */
+        var _ts4 = trackStates[activeTrack];
+        if (_ts4.playingSceneIdx >= 0 && _ts4.playingSceneIdx < _ts4.scenes.length) {
+            _ts4.scenes[_ts4.playingSceneIdx].gateMode = _newPadMode;
+        }
+        var _pmLabel = _newPadMode === PAD_MODE_GATE ? "Gate Mode" : _newPadMode === PAD_MODE_ONESHOT ? "One Shot" : "Trigger";
+        announce(_pmLabel);
+        showStatus(_newPadMode === PAD_MODE_GATE ? "Gate" : _newPadMode === PAD_MODE_ONESHOT ? "1Shot" : "Trig", 60);
         updateLeds();
         return;
     }
@@ -6472,17 +6490,32 @@ function handleNote(note, velocity) {
                         copyPendingAction = false;
                     } else {
                         var _ts2 = trackStates[activeTrack];
-                        var _isTrigger = !_ts2.gateMode;
-                        if (_isTrigger && _ts2.playingSceneIdx === padIdx && _ts2.playing) {
-                            /* Trigger mode: pressing playing scene toggles it off */
-                            stopPlayback();
-                            _ts2.playingSceneIdx = -1;
-                            showStatus("Stop", 20);
-                        } else if (_isTrigger) {
-                            /* Trigger mode: arm scene; play only if transport is running */
-                            launchScene(activeTrack, padIdx, transportPlaying);
+                        var _isSameScene = (_ts2.playingSceneIdx === padIdx && _ts2.playing);
+                        /* For a different scene, use the TARGET scene's gateMode so the
+                         * correct behaviour applies immediately on first press. */
+                        var _targetSc = (_ts2.scenes && _ts2.scenes[padIdx]) ? _ts2.scenes[padIdx] : null;
+                        var _padMode2 = _isSameScene ? _ts2.gateMode
+                                      : (_targetSc && _targetSc.gateMode !== undefined) ? _targetSc.gateMode
+                                      : _ts2.gateMode;
+                        if (_padMode2 === PAD_MODE_TRIGGER) {
+                            if (_isSameScene) {
+                                /* Trigger: pressing playing scene stops it */
+                                stopPlayback();
+                                _ts2.playingSceneIdx = -1;
+                                showStatus("Stop", 20);
+                            } else {
+                                launchScene(activeTrack, padIdx, transportPlaying);
+                            }
+                        } else if (_padMode2 === PAD_MODE_ONESHOT) {
+                            if (_isSameScene) {
+                                /* OneShot: re-press restarts from start */
+                                stopPlayback();
+                                startPlaybackFrom(startSample);
+                            } else {
+                                launchScene(activeTrack, padIdx, true);
+                            }
                         } else {
-                            /* Gate mode: always start immediately, play while held */
+                            /* Gate: play while held */
                             launchScene(activeTrack, padIdx, true);
                             activePadNote = note;
                             host_module_set_param("t" + activeTrack + ":gate_held", "1");
@@ -6494,7 +6527,7 @@ function handleNote(note, velocity) {
                 /* Pad release — gate mode: stop when released */
                 if (padIdx >= 0 && padIdx < MAX_SCENES && note === activePadNote) {
                     var _tsR = trackStates[activeTrack];
-                    if (_tsR.gateMode) {
+                    if (_tsR.gateMode === PAD_MODE_GATE) {
                         activePadNote = -1;
                         host_module_set_param("t" + activeTrack + ":gate_held", "0");
                         stopPlayback();
@@ -6507,14 +6540,19 @@ function handleNote(note, velocity) {
             /* Loop view keeps audition on Pad 1 */
             var padIdx = note - PAD_NOTE_MIN;
             if (padIdx === 0) {
-                var isGateL = trackStates[activeTrack].gateMode;
+                var _loopPadMode = trackStates[activeTrack].gateMode;
                 if (velocity > 0) {
-                    if (isGateL) {
+                    if (_loopPadMode === PAD_MODE_GATE) {
                         activePadNote = note;
                         host_module_set_param("t" + activeTrack + ":gate_held", "1");
                         startPlayback();
+                    } else if (_loopPadMode === PAD_MODE_ONESHOT) {
+                        /* OneShot: always restart from start */
+                        activePadNote = note;
+                        if (playing) stopPlayback();
+                        startPlaybackFrom(startSample);
                     } else {
-                        /* Trigger mode: toggle */
+                        /* Trigger: toggle */
                         if (playing) {
                             stopPlayback();
                             activePadNote = -1;
@@ -6526,7 +6564,7 @@ function handleNote(note, velocity) {
                 } else {
                     if (note === activePadNote) {
                         activePadNote = -1;
-                        if (isGateL) {
+                        if (_loopPadMode === PAD_MODE_GATE) {
                             host_module_set_param("t" + activeTrack + ":gate_held", "0");
                             stopPlayback();
                         }
@@ -6566,7 +6604,7 @@ function handleNote(note, velocity) {
                 /* Normal slice or lazy play mode: audition slices */
                 var sliceIdx = slicePadOffset + padIdx;
                 if (sliceIdx < sliceCount) {
-                    var isGateSlice = trackStates[activeTrack].gateMode;
+                    var _slicePadMode = trackStates[activeTrack].gateMode;
                     if (velocity > 0) {
                         selectSlice(sliceIdx);
                         updateSlicePadLeds();
@@ -6578,13 +6616,13 @@ function handleNote(note, velocity) {
                             syncMarkersToDs();
                             startPlayback();
                             showStatus("Play " + (sliceIdx + 1) + "-" + sliceCount, 20);
-                        } else if (isGateSlice) {
-                            /* Gate mode: play slice while held */
+                        } else if (_slicePadMode === PAD_MODE_GATE) {
+                            /* Gate: play slice while held */
                             host_module_set_param("t" + activeTrack + ":gate_held", "1");
                             startPlayback();
                             showStatus("Gate " + (sliceIdx + 1), 20);
                         } else {
-                            /* Trigger mode: play slice */
+                            /* Trigger / OneShot: play slice once to end */
                             startPlayback();
                             showStatus("Slice " + (sliceIdx + 1), 20);
                         }
@@ -6592,12 +6630,12 @@ function handleNote(note, velocity) {
                         updateSlicePadLeds();
                         if (note === activePadNote) {
                             activePadNote = -1;
-                            if (isGateSlice) {
-                                /* Gate mode: stop on release */
+                            if (_slicePadMode === PAD_MODE_GATE) {
+                                /* Gate: stop on release */
                                 host_module_set_param("t" + activeTrack + ":gate_held", "0");
                                 stopPlayback();
                             }
-                            /* Trigger mode: do NOT stop — let slice play to end */
+                            /* Trigger / OneShot: do NOT stop — let slice play to end */
                         }
                     }
                 }
@@ -6669,7 +6707,7 @@ function doReconnectRestore() {
         _rcts.loopEnabled = (_rcLoop === "1");
 
         var _rcGate = host_module_get_param(_rcp + "gate_mode");
-        _rcts.gateMode = (_rcGate === "1");
+        _rcts.gateMode = (_rcGate ? parseInt(_rcGate, 10) : 0) || PAD_MODE_TRIGGER;
 
         var _rcMuted = host_module_get_param(_rcp + "muted");
         _rcts.muted = (_rcMuted === "1");

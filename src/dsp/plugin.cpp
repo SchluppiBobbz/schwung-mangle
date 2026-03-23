@@ -136,7 +136,7 @@ typedef struct {
 
     int mode;                   /* 0=trim, 1=gain */
 
-    int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play) */
+    int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play), 2=oneshot */
     int gate_held;              /* 1 while gate is held (pad/key down) */
     int muted;                  /* 1=track muted (non-destructive, skips render) */
     int play_mode;              /* 0=stretch (Bungee), 1=varispeed (repitch) */
@@ -1370,7 +1370,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     /* --- Gate mode --- */
     if (strcmp(param, "gate_mode") == 0) {
         if (!val) return;
-        t->gate_mode = atoi(val) ? 1 : 0;
+        { int _m = atoi(val); t->gate_mode = (_m >= 0 && _m <= 2) ? _m : 0; }
         return;
     }
 
@@ -2877,7 +2877,7 @@ static void do_apply_pitch_tempo(track_t *t) {
 static int render_track(track_t *t, int16_t *out, int frames) {
     if (!t->playing || !t->audio_data || t->audio_frames <= 0) return 0;
     if (t->muted) return 0;
-    if (t->gate_mode && !t->gate_held) return 0;
+    if (t->gate_mode == 1 && !t->gate_held) return 0;  /* gate: only play while held */
 
     /* Determine playback boundaries */
     int play_start, play_end;
