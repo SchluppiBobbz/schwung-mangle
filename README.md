@@ -1,6 +1,6 @@
 # Mangle for Schwung
 
-A 4-track sampler for your Ableton Move. Load samples, edit markers, slice, stretch, and perform with scenes — all on the device.
+A 4-track sample mangler running directly on Ableton Move via the [Schwung](https://github.com/charlesvestal/schwung) shadow UI. Slice, stretch, and warp samples in real time — with scene-based performance, varispeed, and quantized launching.
 
 ## Features
 
@@ -143,7 +143,7 @@ Pad mode is saved **per scene**.
 ## Credits
 
 - **Schwung framework**: [Charles Vestal](https://github.com/charlesvestal/schwung)
-- Based on [Wave Edit](https://github.com/charlesvestal/move-anything-waveform-editor) by Charles Vestal
+- Based on [Wave Edit](https://github.com/charlesvestal/schwung-waveform-editor) by Charles Vestal
 
 ## License
 
