@@ -139,6 +139,7 @@ typedef struct {
     int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play) */
     int gate_held;              /* 1 while gate is held (pad/key down) */
     int muted;                  /* 1=track muted (non-destructive, skips render) */
+    int play_mode;              /* 0=stretch (Bungee), 1=varispeed (repitch) */
 
     float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
     int   tempo_percent;        /* 50 to 200 */
@@ -1122,7 +1123,20 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
     /* --- File loading --- */
     if (strcmp(param, "file_path") == 0) {
-        if (!val || val[0] == '\0') return;
+        if (!val || val[0] == '\0') {
+            /* Empty path = unload track */
+            t->playing = 0;
+            t->file_path[0] = '\0';
+            t->file_name[0] = '\0';
+            if (t->audio_data) { free(t->audio_data); t->audio_data = NULL; }
+            t->audio_frames = 0;
+            t->start_sample = 0;
+            t->end_sample   = 0;
+            t->play_pos     = 0.0;
+            if (t->undo_buffer) { free(t->undo_buffer); t->undo_buffer = NULL; }
+            t->undo_frames  = 0;
+            return;
+        }
 
         /* Strip "?t=..." cache-bust suffix appended by the UI to defeat
          * the host's file_path deduplication. */
@@ -1360,6 +1374,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    /* --- Play mode: 0=stretch (Bungee), 1=varispeed (repitch) --- */
+    if (strcmp(param, "play_mode") == 0) {
+        if (!val) return;
+        t->play_mode = atoi(val) ? 1 : 0;
+        return;
+    }
+
     if (strcmp(param, "gate_held") == 0) {
         if (!val) return;
         t->gate_held = atoi(val) ? 1 : 0;
@@ -1419,11 +1440,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
      * file_info always returns the logical positions. */
     if (strcmp(param, "sync_tempo") == 0) {
         if (!val) return;
-        int tp, s, e;
-        if (sscanf(val, "%d,%d,%d", &tp, &s, &e) != 3) return;
-        if (tp < 30) tp = 30;
-        if (tp > 300) tp = 300;
-        t->tempo_percent = tp;
+        double tp; int s, e;
+        if (sscanf(val, "%lf,%d,%d", &tp, &s, &e) != 3) return;
+        if (tp < 30.0) tp = 30.0;
+        if (tp > 300.0) tp = 300.0;
+        t->tempo_percent = (int)round(tp);
         recompute_ratios(t);
         if (e > t->audio_frames) e = t->audio_frames;
         if (e < s) e = s;
@@ -1437,8 +1458,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->bng_play_start = s;
         t->bng_play_end = e;
         /* Update speed directly without resetting the stretcher so the loop
-         * boundary takes effect on the very next audio block (same as E2). */
-        t->bng_req.speed = (double)tp / 100.0;
+         * boundary takes effect on the very next audio block (same as E2).
+         * Use the full-precision float ratio to avoid cumulative drift. */
+        t->bng_req.speed = tp / 100.0;
         return;
     }
 
@@ -2876,13 +2898,23 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         linear_gain = powf(10.0f, t->gain_db / 20.0f);
     }
 
-    /* Use Bungee when pitch or tempo differ from default */
-    int use_bungee = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
+    /* Varispeed mode: skip Bungee entirely — tempo+pitch both applied via rate_inc.
+     * Stretch mode: use Bungee when pitch or tempo differ from default. */
+    int use_bungee;
+    if (t->play_mode == 1) {
+        use_bungee = 0; /* varispeed: always direct path */
+    } else {
+        use_bungee = !(fabsf(t->pitch_ratio - 1.0f) < 0.001f &&
                        fabsf(t->tempo_ratio - 1.0f) < 0.001f);
+    }
 
     /* Sample-rate conversion ratio: advance faster for files with higher
-     * sample rates (e.g. 48000/44100 ≈ 1.0884 for 48 kHz files). */
+     * sample rates (e.g. 48000/44100 ≈ 1.0884 for 48 kHz files).
+     * In varispeed mode, tempo_ratio and pitch_ratio are baked in here. */
     double rate_inc = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+    if (t->play_mode == 1) {
+        rate_inc *= (double)t->tempo_ratio * (double)t->pitch_ratio;
+    }
 
     int region_len = play_end - play_start;
     int produced = 0;

@@ -20,7 +20,7 @@
  *   E2 (Knob 2)   - Move end marker
  *   E3 (Knob 3)   - Zoom in/out  |  Shift: vertical scale (1x-32x)
  *   E4 (Knob 4)   - Adjust gain  |  Shift: normalize (confirm overlay)
- *   Any pad       - Hold to audition selection, release to stop
+ *   Any pad       - Gate: hold to audition, release to stop  |  Trigger: press to toggle play/stop
  *   Mute          - Mute (zero out) selection (all views)
  *   Copy          - Copy selection  |  Slice: copy selected slice
  *   Shift+Copy    - Paste at cursor (insert)  |  Slice: paste insert before selected slice
@@ -252,7 +252,9 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 /* ============ State ============ */
 
 var currentView = VIEW_FREE;
-var editMode = VIEW_SYNC;   /* last FREE/SYNC mode selected; default SYNC */
+var editMode = VIEW_SYNC;       /* last FREE/SYNC mode selected; default SYNC */
+/* Sub-mode within SYNC: false=stretch (Bungee, pitch-stable), true=varispeed (repitch) */
+var varispeedEnabled = false;
 var shiftHeld = false;
 var deleteHeld = false;
 var deletePendingCut = false;
@@ -449,6 +451,17 @@ var pendingSceneSwitch      = -1;
 var pendingSceneSwitchTrack = -1;
 var lastBarCount            = 0;  /* bar count at last tick — for clock-based bar crossing detection */
 
+/* Quantize modes for scene launch (S-4 inspired) */
+var QUANT_FREE       = 0;  /* immediate */
+var QUANT_BEAT       = 1;  /* next 1/4-note beat */
+var QUANT_BAR        = 2;  /* next bar (4 beats) */
+var QUANT_2BAR       = 3;  /* next 2-bar boundary */
+var QUANT_4BAR       = 4;  /* next 4-bar boundary */
+var QUANT_SAMPLE_END = 5;  /* when current clip finishes its loop cycle */
+var QUANT_LABELS     = ["FREE", "BEAT", "1BAR", "2BAR", "4BAR", "S.END"];
+var quantizeMode     = QUANT_BAR;  /* default: quantize to next bar */
+var lastBeatCount    = 0;  /* beat count at last tick — for QUANT_BEAT detection */
+
 /* Scene pad flash counter */
 var sceneFlashCounter = 0;
 
@@ -463,6 +476,7 @@ function makeTrackState() {
         playing: false, playPos: 0,
         gainDb: 0.0, peakDb: -96,
         gateMode: false,
+        varispeedMode: false,  /* true = varispeed (repitch), false = stretch (Bungee) */
         loopEnabled: false,
         pitchSemitones: 0.0,
         tempoPercent: 100,
@@ -520,6 +534,7 @@ function saveTrackUIState(idx) {
     ts.gainDb = gainDb;
     ts.peakDb = peakDb;
     ts.loopEnabled = loopEnabled;
+    ts.varispeedMode = varispeedEnabled;
     ts.pitchSemitones = pitchSemitones;
     ts.tempoPercent = tempoPercent;
     ts.fileDuration = fileDuration;
@@ -652,6 +667,7 @@ function restoreTrackUIState(idx) {
     gainDb = ts.gainDb;
     peakDb = ts.peakDb;
     loopEnabled = ts.loopEnabled;
+    varispeedEnabled = !!ts.varispeedMode;
     pitchSemitones = ts.pitchSemitones;
     tempoPercent = ts.tempoPercent;
     fileDuration = ts.fileDuration;
@@ -688,6 +704,8 @@ function restoreTrackUIState(idx) {
     bpm = ts.bpm;
     beatDivIndex = ts.beatDivIndex;
     syncMode = ts.syncMode || false;
+    /* Sync play_mode to DSP for restored track */
+    host_module_set_param("t" + idx + ":play_mode", varispeedEnabled ? "1" : "0");
     /* Flags — these will be refreshed from DSP in tick() */
     dirty = ts.dirty;
     hasUndo = ts.hasUndo;
@@ -733,7 +751,7 @@ function switchToTrack(idx) {
         setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
         setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
         if (syncMode) {
-            setParamBlocking("sync_tempo", tempoPercent + "," + startSample + "," + endSample, 500);
+            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
         } else {
             setParamBlocking("tempo", String(tempoPercent), 500);
         }
@@ -1115,7 +1133,7 @@ function loadProjectJson() {
                     endSample:      ts.endSample,
                     gainDb:         ts.gainDb,
                     pitchSemitones: ts.pitchSemitones,
-                    tempoPercent:   ts.tempoPercent,
+                    tempoPercent:   tempoPercent,  /* use freshly computed global (set by restoreSceneToGlobals above) */
                     loopEnabled:    ts.loopEnabled,
                     hasSlices:      ts.sliceBoundaries.length >= 2,
                     autoPlay:       false
@@ -1126,7 +1144,7 @@ function loadProjectJson() {
                 setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
                 setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
                 if (ts.syncMode) {
-                    setParamBlocking(_ltp + "sync_tempo", ts.tempoPercent + "," + ts.startSample + "," + ts.endSample, 500);
+                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(4) + "," + ts.startSample + "," + ts.endSample, 500);
                 } else {
                     setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
                 }
@@ -1292,16 +1310,21 @@ function updateLeds() {
     setButtonLED(CC_DOWN, (isSync || isSlice) ? LED_DIM : LED_OFF);
 
     /* Step view-selector LEDs */
-    setLED(STEP_BASE + 0, (editMode === VIEW_SYNC) ? Bright : PaleGreen);  /* shows editMode: Bright Orange=SYNC, PaleGreen=FREE */
+    /* Step 1 LED: PaleGreen=FREE, VividYellow=VARISPEED, BrightOrange=STRETCH */
+    var _step1Color = (editMode === VIEW_FREE) ? PaleGreen
+                    : varispeedEnabled ? VividYellow : Bright;
+    setLED(STEP_BASE + 0, _step1Color);
     setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
     setLED(STEP_BASE + 2, Black);  /* freed */
 
     /* Step 4: Gate/Trigger mode LED */
     setLED(STEP_BASE + 3, isEdit ? (trackStates[activeTrack].gateMode ? BrightRed : DarkGrey) : Black);
 
-    /* Step 5: Clock Sync LED */
+    /* Step 5: Clock Sync LED; dim dot when quantize != BAR */
     var syncOn = (host_module_get_param("sync_clock") === "1");
-    setLED(STEP_BASE + 4, isEdit ? (syncOn ? BrightGreen : DarkGrey) : Black);
+    var _qColor = syncOn ? BrightGreen : DarkGrey;
+    if (syncOn && quantizeMode !== QUANT_BAR) _qColor = VividYellow; /* yellow = non-default quantize */
+    setLED(STEP_BASE + 4, isEdit ? _qColor : Black);
 
     /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
     var _hasScenes = (trackStates[activeTrack].scenes.length > 0);
@@ -1333,10 +1356,7 @@ function updateLeds() {
         var _flashOn = (sceneFlashCounter % 12) < 6;
         for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
             var padIdx = p - PAD_NOTE_MIN;
-            if (padIdx === 8) {
-                /* Pad 9: stop */
-                setLED(p, playing ? BrightRed : DarkGrey);
-            } else if (padIdx >= 0 && padIdx < MAX_SCENES) {
+            if (padIdx >= 0 && padIdx < MAX_SCENES) {
                 var _isPending = (pendingSceneSwitch === padIdx && pendingSceneSwitchTrack === activeTrack);
                 var _isPlaying = (padIdx === _ts.playingSceneIdx && _ts.playing);
                 var _isSelected = (padIdx === _ts.selectedSceneIdx);
@@ -1796,7 +1816,8 @@ function syncMarkersToDs() {
  * Logical markers in JS are never modified.
  */
 function syncSyncModeToDs() {
-    host_module_set_param("sync_tempo", tempoPercent + "," + startSample + "," + endSample);
+    var _tp = (globalBpm / bpm * 100).toFixed(4);
+    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample);
 }
 
 /**
@@ -2985,8 +3006,8 @@ function drawSyncView() {
     /* Reuse trim view, then overlay BPM label and status bar */
     drawFreeView();
 
-    /* Rewrite full header: SYNC label left, globalBpm right (replaces file-duration) */
-    var bpmHeader = buildModeHeader("SYNC");
+    /* Rewrite full header: mode label left, globalBpm right */
+    var bpmHeader = buildModeHeader(varispeedEnabled ? "VASP" : "SYNC");
     fill_rect(0, 0, SCREEN_W, 10, 0);
     print(0, 0, bpmHeader, 1);
     var nameX = (bpmHeader.length + 1) * 6;
@@ -3039,10 +3060,12 @@ function switchView(view) {
         updateLeds();
         announce("Loop, " + fileName);
     } else if (view === VIEW_SYNC) {
+        /* Sync play_mode to DSP: varispeed=1 or stretch=0 */
+        host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
         refreshState();
         refreshWaveform();
         updateLeds();
-        announce("BPM, " + fileName);
+        announce(varispeedEnabled ? "Varispeed, " + fileName : "Stretch, " + fileName);
     } else if (view === VIEW_SLICE) {
         /* Disable looping for slice audition */
         savedLoopState = loopEnabled;
@@ -3182,7 +3205,8 @@ function findNextFreeSceneSlot(trackIdx) {
  *   false — loads the file and restores settings for editing, but does NOT
  *           start playback and does NOT change playingSceneIdx.
  */
-function applySceneLaunch(trackIdx, sceneIdx) {
+function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
+    if (autoPlay === undefined) autoPlay = true;
     var ts = trackStates[trackIdx];
 
     /* Save state of the scene we are leaving */
@@ -3209,10 +3233,10 @@ function applySceneLaunch(trackIdx, sceneIdx) {
             endSample:       scene.endSample,
             gainDb:          scene.gainDb,
             pitchSemitones:  scene.pitchSemitones,
-            tempoPercent:    scene.tempoPercent,
+            tempoPercent:    tempoPercent,  /* use freshly computed global (set by restoreSceneToGlobals above) */
             loopEnabled:     scene.loopEnabled,
             hasSlices:       scene.sliceBoundaries.length >= 2,
-            autoPlay:        true
+            autoPlay:        autoPlay
         };
     } else {
         /* Non-active track: restore state into trackState struct */
@@ -3231,15 +3255,17 @@ function applySceneLaunch(trackIdx, sceneIdx) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", scene.tempoPercent + "," + scene.startSample + "," + scene.endSample, 500);
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
     }
-    ts.playing = true;
-    if (trackIdx === activeTrack) playing = true;
+    if (autoPlay) {
+        ts.playing = true;
+        if (trackIdx === activeTrack) playing = true;
+    }
 
     saveSceneState(trackIdx);
     updateTrackLEDs();
@@ -3252,7 +3278,8 @@ function applySceneLaunch(trackIdx, sceneIdx) {
  *   Sync on  → queue for next bar boundary (press again = force immediate).
  * Pressing an empty pad just arms it.
  */
-function launchScene(trackIdx, sceneIdx) {
+function launchScene(trackIdx, sceneIdx, autoPlay) {
+    if (autoPlay === undefined) autoPlay = true;
     var ts = trackStates[trackIdx];
     dbg("launchScene t" + trackIdx + " s" + sceneIdx + " scenes.len=" + ts.scenes.length + " playingIdx=" + ts.playingSceneIdx + " playing=" + ts.playing);
     if (sceneIdx >= ts.scenes.length) {
@@ -3269,20 +3296,22 @@ function launchScene(trackIdx, sceneIdx) {
     for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
         if (trackStates[_lsi].playing) { anyPlaying = true; break; }
     }
-    if (syncOn && anyPlaying && transportPlaying) {
-        if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
-            /* Already cued — force immediate */
-            pendingSceneSwitch      = -1;
-            pendingSceneSwitchTrack = -1;
-            applySceneLaunch(trackIdx, sceneIdx);
-        } else {
-            /* Queue for next bar boundary (MIDI clock) */
-            pendingSceneSwitch      = sceneIdx;
-            pendingSceneSwitchTrack = trackIdx;
-            showStatus("Cue S" + (sceneIdx + 1), 30);
-        }
+    /* QUANT_FREE or sync off or nothing playing: fire immediately */
+    if (!syncOn || !anyPlaying || !transportPlaying || quantizeMode === QUANT_FREE) {
+        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
+        updateLeds();
+        return;
+    }
+    if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
+        /* Already cued — second press forces immediate */
+        pendingSceneSwitch      = -1;
+        pendingSceneSwitchTrack = -1;
+        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
     } else {
-        applySceneLaunch(trackIdx, sceneIdx);
+        /* Queue for boundary defined by quantizeMode */
+        pendingSceneSwitch      = sceneIdx;
+        pendingSceneSwitchTrack = trackIdx;
+        showStatus("Cue " + QUANT_LABELS[quantizeMode] + " S" + (sceneIdx + 1), 30);
     }
     updateLeds();
 }
@@ -3405,6 +3434,7 @@ function resetTrack(trackIdx) {
         waveformDirty = true;
     }
     saveSceneState(trackIdx);
+    saveProjectJson();
     updateTrackLEDs();
     updatePlayLED();
     showStatus("T" + (trackIdx + 1) + " Reset", 60);
@@ -3514,7 +3544,7 @@ function pasteTrack(trackIdx) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", scene.tempoPercent + "," + scene.startSample + "," + scene.endSample, 500);
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -6277,14 +6307,21 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 5: Toggle Clock Sync */
+    /* Step 5: Toggle Clock Sync; Shift+Step5 = cycle quantize mode */
     if (velocity > 0 && note === STEP_BASE + 4) {
-        var syncState = host_module_get_param("sync_clock");
-        var newSync = (syncState === "1") ? "0" : "1";
-        host_module_set_param("sync_clock", newSync);
-        announce(newSync === "1" ? "Sync On" : "Sync Off");
-        showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
-        updateLeds();
+        if (shiftHeld) {
+            quantizeMode = (quantizeMode + 1) % QUANT_LABELS.length;
+            showStatus("Q:" + QUANT_LABELS[quantizeMode], 90);
+            announce("Quantize " + QUANT_LABELS[quantizeMode]);
+            updateLeds();
+        } else {
+            var syncState = host_module_get_param("sync_clock");
+            var newSync = (syncState === "1") ? "0" : "1";
+            host_module_set_param("sync_clock", newSync);
+            announce(newSync === "1" ? "Sync On" : "Sync Off");
+            showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
+            updateLeds();
+        }
         return;
     }
 
@@ -6359,12 +6396,22 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 toggles between FREE and SYNC */
+    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 cycles FREE→VARISPEED→STRETCH→FREE */
     if (velocity > 0 && note === STEP_BASE) {
         var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
         if (editViews.indexOf(currentView) >= 0) {
             if (shiftHeld) {
-                editMode = (editMode === VIEW_SYNC) ? VIEW_FREE : VIEW_SYNC;
+                if (editMode === VIEW_FREE) {
+                    /* FREE → VARISPEED (SYNC sub-mode) */
+                    editMode = VIEW_SYNC;
+                    varispeedEnabled = true;
+                } else if (editMode === VIEW_SYNC && varispeedEnabled) {
+                    /* VARISPEED → STRETCH */
+                    varispeedEnabled = false;
+                } else {
+                    /* STRETCH → FREE */
+                    editMode = VIEW_FREE;
+                }
             }
             if (currentView !== editMode) {
                 /* Leaving slice mode: restore loop state and clear persisted slice state.
@@ -6382,7 +6429,12 @@ function handleNote(note, velocity) {
                 }
                 switchView(editMode);
             } else if (shiftHeld) {
-                /* Already in editMode but toggled — update LED to reflect new editMode */
+                /* Already in editMode (VIEW_SYNC) but varispeedEnabled toggled —
+                 * view isn't switching so send play_mode manually. */
+                if (editMode === VIEW_SYNC) {
+                    host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
+                    announce(varispeedEnabled ? "Varispeed" : "Stretch");
+                }
                 updateLeds();
             }
         }
@@ -6404,15 +6456,6 @@ function handleNote(note, velocity) {
             var padIdx = note - PAD_NOTE_MIN;
 
             if (velocity > 0) {
-                /* Pad 9: stop current track */
-                if (padIdx === 8) {
-                    stopPlayback();
-                    trackStates[activeTrack].playingSceneIdx = -1;
-                    showStatus("Stop", 20);
-                    updateLeds();
-                    return;
-                }
-
                 /* Pads 1-8: scene launch / arm / delete / copy / paste */
                 if (padIdx >= 0 && padIdx < MAX_SCENES) {
                     if (deleteHeld) {
@@ -6428,30 +6471,57 @@ function handleNote(note, velocity) {
                         }
                         copyPendingAction = false;
                     } else {
-                        launchScene(activeTrack, padIdx);
+                        var _ts2 = trackStates[activeTrack];
+                        var _isTrigger = !_ts2.gateMode;
+                        if (_isTrigger && _ts2.playingSceneIdx === padIdx && _ts2.playing) {
+                            /* Trigger mode: pressing playing scene toggles it off */
+                            stopPlayback();
+                            _ts2.playingSceneIdx = -1;
+                            showStatus("Stop", 20);
+                        } else if (_isTrigger) {
+                            /* Trigger mode: arm scene; play only if transport is running */
+                            launchScene(activeTrack, padIdx, transportPlaying);
+                        } else {
+                            /* Gate mode: always start immediately, play while held */
+                            launchScene(activeTrack, padIdx, true);
+                            activePadNote = note;
+                            host_module_set_param("t" + activeTrack + ":gate_held", "1");
+                        }
                     }
                     updateLeds();
+                }
+            } else {
+                /* Pad release — gate mode: stop when released */
+                if (padIdx >= 0 && padIdx < MAX_SCENES && note === activePadNote) {
+                    var _tsR = trackStates[activeTrack];
+                    if (_tsR.gateMode) {
+                        activePadNote = -1;
+                        host_module_set_param("t" + activeTrack + ":gate_held", "0");
+                        stopPlayback();
+                        updateLeds();
+                    }
                 }
             }
             return;
         } else if (currentView === VIEW_LOOP) {
             /* Loop view keeps audition on Pad 1 */
             var padIdx = note - PAD_NOTE_MIN;
-            if (padIdx === 8 && velocity > 0) {
-                stopPlayback();
-                showStatus("Stop", 20);
-                updateLeds();
-                return;
-            }
             if (padIdx === 0) {
                 var isGateL = trackStates[activeTrack].gateMode;
                 if (velocity > 0) {
-                    activePadNote = note;
                     if (isGateL) {
+                        activePadNote = note;
                         host_module_set_param("t" + activeTrack + ":gate_held", "1");
                         startPlayback();
                     } else {
-                        startPlayback();
+                        /* Trigger mode: toggle */
+                        if (playing) {
+                            stopPlayback();
+                            activePadNote = -1;
+                        } else {
+                            activePadNote = note;
+                            startPlayback();
+                        }
                     }
                 } else {
                     if (note === activePadNote) {
@@ -6822,14 +6892,19 @@ globalThis.tick = function() {
                     lastBarCount = 0;
                 }
             }
-            /* Bar-crossing detection: time-based using Date.now() + globalBpm */
+            /* Bar/beat-crossing detection: time-based using Date.now() + globalBpm */
             if (transportPlaying) {
-                var _barDurationMs = 4 * 60000 / globalBpm;  /* one 4/4 bar in ms */
+                var _beatDurationMs = 60000 / globalBpm;     /* one 1/4-note beat in ms */
+                var _barDurationMs  = 4 * _beatDurationMs;   /* one 4/4 bar in ms */
                 var _elapsed = Date.now() - transportPlayingTimestamp;
-                var _curBar = (_barDurationMs > 0) ? Math.floor(_elapsed / _barDurationMs) : 0;
+                var _curBar  = (_barDurationMs  > 0) ? Math.floor(_elapsed / _barDurationMs)  : 0;
+                var _curBeat = (_beatDurationMs > 0) ? Math.floor(_elapsed / _beatDurationMs) : 0;
                 if (_curBar > lastBarCount) {
                     _barCrossed = true;
                     lastBarCount = _curBar;
+                }
+                if (_curBeat > lastBeatCount) {
+                    lastBeatCount = _curBeat;
                 }
             }
             /* React to transport start/stop transitions */
@@ -6837,14 +6912,20 @@ globalThis.tick = function() {
                 lastTransportPlaying = transportPlaying;
                 if (transportPlaying) {
                     /* transportPlayingTimestamp and lastBarCount already reset above */
-                    host_module_set_param("play_all", "1");
+                    /* Only start tracks that have an active scene — not all loaded tracks */
                     for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
-                        if (trackStates[_ti].loaded) trackStates[_ti].playing = true;
+                        var _tts = trackStates[_ti];
+                        if (_tts.loaded && _tts.playingSceneIdx >= 0) {
+                            host_module_set_param("t" + _ti + ":play", "selection");
+                            _tts.playing = true;
+                        }
                     }
-                    if (trackStates[activeTrack].loaded) playing = true;
+                    if (trackStates[activeTrack].loaded && trackStates[activeTrack].playingSceneIdx >= 0) playing = true;
                 } else {
-                    host_module_set_param("play_all", "0");
                     for (var _ti2 = 0; _ti2 < NUM_TRACKS; _ti2++) {
+                        if (trackStates[_ti2].playing) {
+                            host_module_set_param("t" + _ti2 + ":play", "stop");
+                        }
                         trackStates[_ti2].playing = false;
                     }
                     playing = false;
@@ -6938,12 +7019,29 @@ globalThis.tick = function() {
         }
     }
 
-    /* Quantized scene switching — fire on MIDI-clock bar boundary.
-     * If transport is not running, fire immediately to avoid infinite hang. */
-    if (pendingSceneSwitch >= 0 && (_barCrossed || !transportPlaying)) {
-        applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
-        pendingSceneSwitch = -1;
-        pendingSceneSwitchTrack = -1;
+    /* Quantized scene switching — fire when the selected boundary is crossed.
+     * Falls back to immediate if transport is not running. */
+    if (pendingSceneSwitch >= 0) {
+        var _fire = !transportPlaying; /* always fire if transport stopped */
+        if (!_fire) {
+            var _elapsed2 = Date.now() - transportPlayingTimestamp;
+            var _beatMs   = 60000 / globalBpm;
+            var _curBeat2 = (_beatMs > 0) ? Math.floor(_elapsed2 / _beatMs) : 0;
+            var _curBar2  = Math.floor(_curBeat2 / 4);
+            switch (quantizeMode) {
+                case QUANT_BEAT:       _fire = (_curBeat2 > lastBeatCount); break;
+                case QUANT_BAR:        _fire = _barCrossed; break;
+                case QUANT_2BAR:       _fire = _barCrossed && (_curBar2 % 2 === 0); break;
+                case QUANT_4BAR:       _fire = _barCrossed && (_curBar2 % 4 === 0); break;
+                case QUANT_SAMPLE_END: _fire = !trackStates[pendingSceneSwitchTrack].playing; break;
+                default:               _fire = _barCrossed; break;
+            }
+        }
+        if (_fire) {
+            applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
+            pendingSceneSwitch = -1;
+            pendingSceneSwitchTrack = -1;
+        }
     }
 
     /* Flush queued play/stop command — issued here in tick() so it's the
@@ -7006,7 +7104,7 @@ globalThis.tick = function() {
                 if (_psr.tempoPercent !== undefined) {
                     tempoPercent = _psr.tempoPercent;
                     if (syncMode) {
-                        setParamBlocking("sync_tempo", tempoPercent + "," + startSample + "," + endSample, 500);
+                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
                     } else {
                         setParamBlocking("tempo", String(tempoPercent), 500);
                     }
