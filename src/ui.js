@@ -467,6 +467,7 @@ var QUANT_LABELS     = ["FREE", "BEAT", "1BAR", "2BAR", "4BAR", "S.END"];
 var quantizeMode     = QUANT_BAR;  /* default: quantize to next bar */
 var lastBeatCount    = 0;  /* beat count at last tick — for QUANT_BEAT detection */
 var dspQueuedPlayTrack = -1;  /* track index with a DSP-side queued_play pending (-1 = none) */
+var dspQueuedPlayScene = -1;  /* scene index for dspQueuedPlayTrack (-1 = none) */
 var syncEnabled = false;      /* local mirror of DSP sync_clock (avoids stale get_param reads) */
 
 /* Scene pad flash counter */
@@ -1368,7 +1369,8 @@ function updateLeds() {
         for (var p = PAD_NOTE_MIN; p <= PAD_NOTE_MAX; p++) {
             var padIdx = p - PAD_NOTE_MIN;
             if (padIdx >= 0 && padIdx < MAX_SCENES) {
-                var _isPending = (pendingSceneSwitch === padIdx && pendingSceneSwitchTrack === activeTrack);
+                var _isPending = (pendingSceneSwitch === padIdx && pendingSceneSwitchTrack === activeTrack)
+                              || (dspQueuedPlayTrack === activeTrack && dspQueuedPlayScene === padIdx);
                 var _isPlaying = (padIdx === _ts.playingSceneIdx && _ts.playing);
                 var _isSelected = (padIdx === _ts.selectedSceneIdx);
                 var _hasContent = (padIdx < _ts.scenes.length && _ts.scenes[padIdx] && _ts.scenes[padIdx].path);
@@ -3325,14 +3327,12 @@ function launchScene(trackIdx, sceneIdx, autoPlay) {
     }
 
     var syncOn = syncEnabled;
-    var anyPlaying = false;
-    for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
-        if (trackStates[_lsi].playing) { anyPlaying = true; break; }
-    }
 
     /* Conditions for DSP-side bar quantize:
-     * sync on + transport running + something playing + non-free quantize mode */
-    var useDspQuantize = syncOn && transportPlaying && anyPlaying && quantizeMode !== QUANT_FREE;
+     * sync on + transport running + non-free quantize mode.
+     * Note: anyPlaying is NOT required — even the first scene should be cued
+     * when sync is on and transport is running. */
+    var useDspQuantize = syncOn && transportPlaying && quantizeMode !== QUANT_FREE;
 
     if (useDspQuantize && quantizeMode === QUANT_SAMPLE_END) {
         /* UI-side: wait for current clip to finish, then fire play_now */
@@ -3355,14 +3355,16 @@ function launchScene(trackIdx, sceneIdx, autoPlay) {
          * Push quantize granularity to DSP, load scene immediately, let
          * DSP queue the play until the next bar boundary. */
         sendBeatsPerBarForQuantize();
-        if (dspQueuedPlayTrack === trackIdx) {
-            /* Second press of same track while DSP play is pending — force immediate */
+        if (dspQueuedPlayTrack === trackIdx && dspQueuedPlayScene === sceneIdx) {
+            /* Second press of same scene while DSP play is pending — force immediate */
             dspQueuedPlayTrack = -1;
+            dspQueuedPlayScene = -1;
             host_module_set_param("t" + trackIdx + ":play_now", "selection");
             ts.playing = true;
             if (trackIdx === activeTrack) playing = true;
         } else {
             dspQueuedPlayTrack = trackIdx;
+            dspQueuedPlayScene = sceneIdx;
             applySceneLaunch(trackIdx, sceneIdx, autoPlay, false /* DSP queues */);
             showStatus("Cue " + QUANT_LABELS[quantizeMode] + " S" + (sceneIdx + 1), 30);
         }
@@ -6548,12 +6550,19 @@ function handleNote(note, velocity) {
                                       : _ts2.gateMode;
                         if (_padMode2 === PAD_MODE_TRIGGER) {
                             if (_isSameScene) {
-                                /* Trigger: pressing playing scene stops it */
+                                /* Trigger: pressing playing scene stops it → Inactive */
                                 stopPlayback();
                                 _ts2.playingSceneIdx = -1;
                                 showStatus("Stop", 20);
-                            } else {
+                            } else if (padIdx >= _ts2.scenes.length || padIdx === _ts2.selectedSceneIdx) {
+                                /* Empty pad (arm) or already Selected → launch / cue */
                                 launchScene(activeTrack, padIdx, transportPlaying);
+                            } else {
+                                /* First press on filled, unselected scene → Select (no launch).
+                                 * 4-state model: Inactive → Selected → Cue/Active */
+                                _ts2.selectedSceneIdx = padIdx;
+                                showStatus("P" + (padIdx + 1), 30);
+                                updateLeds();
                             }
                         } else if (_padMode2 === PAD_MODE_ONESHOT) {
                             if (_isSameScene) {
@@ -7011,10 +7020,11 @@ globalThis.tick = function() {
                     if (trackStates[activeTrack].loaded && trackStates[activeTrack].playingSceneIdx >= 0) playing = true;
                 } else {
                     dspQueuedPlayTrack = -1;  /* cancel any pending DSP-queued play */
+                    dspQueuedPlayScene = -1;
+                    /* Stop all tracks atomically via play_all=0 — more reliable than
+                     * 4 individual set_param calls which can be dropped if queue is full. */
+                    host_module_set_param("play_all", "0");
                     for (var _ti2 = 0; _ti2 < NUM_TRACKS; _ti2++) {
-                        /* Always send stop — DSP may be playing or queued_play=1
-                         * without the UI knowing (e.g. bar-quantized launch pending). */
-                        host_module_set_param("t" + _ti2 + ":play", "stop");
                         trackStates[_ti2].playing = false;
                     }
                     playing = false;
