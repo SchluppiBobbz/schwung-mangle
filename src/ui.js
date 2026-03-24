@@ -466,6 +466,8 @@ var QUANT_SAMPLE_END = 5;  /* when current clip finishes its loop cycle */
 var QUANT_LABELS     = ["FREE", "BEAT", "1BAR", "2BAR", "4BAR", "S.END"];
 var quantizeMode     = QUANT_BAR;  /* default: quantize to next bar */
 var lastBeatCount    = 0;  /* beat count at last tick — for QUANT_BEAT detection */
+var dspQueuedPlayTrack = -1;  /* track index with a DSP-side queued_play pending (-1 = none) */
+var syncEnabled = false;      /* local mirror of DSP sync_clock (avoids stale get_param reads) */
 
 /* Scene pad flash counter */
 var sceneFlashCounter = 0;
@@ -1331,9 +1333,8 @@ function updateLeds() {
     setLED(STEP_BASE + 3, isEdit ? (_padModeLed === PAD_MODE_GATE ? BrightRed : _padModeLed === PAD_MODE_ONESHOT ? VividYellow : DarkGrey) : Black);
 
     /* Step 5: Clock Sync LED; dim dot when quantize != BAR */
-    var syncOn = (host_module_get_param("sync_clock") === "1");
-    var _qColor = syncOn ? BrightGreen : DarkGrey;
-    if (syncOn && quantizeMode !== QUANT_BAR) _qColor = VividYellow; /* yellow = non-default quantize */
+    var _qColor = syncEnabled ? BrightGreen : DarkGrey;
+    if (syncEnabled && quantizeMode !== QUANT_BAR) _qColor = VividYellow; /* yellow = non-default quantize */
     setLED(STEP_BASE + 4, isEdit ? _qColor : Black);
 
     /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
@@ -3216,8 +3217,9 @@ function findNextFreeSceneSlot(trackIdx) {
  *   false — loads the file and restores settings for editing, but does NOT
  *           start playback and does NOT change playingSceneIdx.
  */
-function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
+function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
     if (autoPlay === undefined) autoPlay = true;
+    if (immediate === undefined) immediate = true;
     var ts = trackStates[trackIdx];
 
     /* Save state of the scene we are leaving */
@@ -3247,7 +3249,8 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
             tempoPercent:    tempoPercent,  /* use freshly computed global (set by restoreSceneToGlobals above) */
             loopEnabled:     scene.loopEnabled,
             hasSlices:       scene.sliceBoundaries.length >= 2,
-            autoPlay:        autoPlay
+            autoPlay:        autoPlay,
+            playNow:         !!immediate   /* true = play_now (bypass DSP queue) */
         };
     } else {
         /* Non-active track: restore state into trackState struct */
@@ -3285,10 +3288,28 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay) {
 }
 
 /**
- * Launch a scene — single-click model:
- *   Sync off → switch immediately.
- *   Sync on  → queue for next bar boundary (press again = force immediate).
- * Pressing an empty pad just arms it.
+ * Map current quantizeMode to beats_per_bar and push to DSP so the clock
+ * trigger grid matches the selected quantize granularity.
+ * Call whenever quantizeMode changes or sync_clock is enabled.
+ */
+function sendBeatsPerBarForQuantize() {
+    var bpb;
+    switch (quantizeMode) {
+        case QUANT_BEAT:  bpb = 1;  break;
+        case QUANT_2BAR:  bpb = 8;  break;
+        case QUANT_4BAR:  bpb = 16; break;
+        case QUANT_BAR:
+        default:          bpb = 4;  break;
+    }
+    host_module_set_param("beats_per_bar", String(bpb));
+}
+
+/**
+ * Launch a scene — DSP handles bar quantization when sync+clock are active.
+ *   Sync off / QUANT_FREE / transport stopped → load + play immediately.
+ *   Sync on + QUANT_BEAT..4BAR → load immediately, DSP queues play at bar boundary.
+ *     Second press of same scene while pending → force play_now.
+ *   QUANT_SAMPLE_END → UI-side timer (tick), fires play_now when clip ends.
  */
 function launchScene(trackIdx, sceneIdx, autoPlay) {
     if (autoPlay === undefined) autoPlay = true;
@@ -3303,28 +3324,54 @@ function launchScene(trackIdx, sceneIdx, autoPlay) {
         return;
     }
 
-    var syncOn = (host_module_get_param("sync_clock") === "1");
+    var syncOn = syncEnabled;
     var anyPlaying = false;
     for (var _lsi = 0; _lsi < NUM_TRACKS; _lsi++) {
         if (trackStates[_lsi].playing) { anyPlaying = true; break; }
     }
-    /* QUANT_FREE or sync off or nothing playing: fire immediately */
-    if (!syncOn || !anyPlaying || !transportPlaying || quantizeMode === QUANT_FREE) {
-        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
+
+    /* Conditions for DSP-side bar quantize:
+     * sync on + transport running + something playing + non-free quantize mode */
+    var useDspQuantize = syncOn && transportPlaying && anyPlaying && quantizeMode !== QUANT_FREE;
+
+    if (useDspQuantize && quantizeMode === QUANT_SAMPLE_END) {
+        /* UI-side: wait for current clip to finish, then fire play_now */
+        if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
+            /* Second press — force immediate */
+            pendingSceneSwitch      = -1;
+            pendingSceneSwitchTrack = -1;
+            applySceneLaunch(trackIdx, sceneIdx, autoPlay, true /* immediate */);
+        } else {
+            pendingSceneSwitch      = sceneIdx;
+            pendingSceneSwitchTrack = trackIdx;
+            showStatus("Cue S.END S" + (sceneIdx + 1), 30);
+        }
         updateLeds();
         return;
     }
-    if (pendingSceneSwitch === sceneIdx && pendingSceneSwitchTrack === trackIdx) {
-        /* Already cued — second press forces immediate */
-        pendingSceneSwitch      = -1;
-        pendingSceneSwitchTrack = -1;
-        applySceneLaunch(trackIdx, sceneIdx, autoPlay);
-    } else {
-        /* Queue for boundary defined by quantizeMode */
-        pendingSceneSwitch      = sceneIdx;
-        pendingSceneSwitchTrack = trackIdx;
-        showStatus("Cue " + QUANT_LABELS[quantizeMode] + " S" + (sceneIdx + 1), 30);
+
+    if (useDspQuantize) {
+        /* DSP handles bar quantize (QUANT_BEAT / BAR / 2BAR / 4BAR).
+         * Push quantize granularity to DSP, load scene immediately, let
+         * DSP queue the play until the next bar boundary. */
+        sendBeatsPerBarForQuantize();
+        if (dspQueuedPlayTrack === trackIdx) {
+            /* Second press of same track while DSP play is pending — force immediate */
+            dspQueuedPlayTrack = -1;
+            host_module_set_param("t" + trackIdx + ":play_now", "selection");
+            ts.playing = true;
+            if (trackIdx === activeTrack) playing = true;
+        } else {
+            dspQueuedPlayTrack = trackIdx;
+            applySceneLaunch(trackIdx, sceneIdx, autoPlay, false /* DSP queues */);
+            showStatus("Cue " + QUANT_LABELS[quantizeMode] + " S" + (sceneIdx + 1), 30);
+        }
+        updateLeds();
+        return;
     }
+
+    /* Immediate launch: sync off, QUANT_FREE, transport stopped, or nothing playing */
+    applySceneLaunch(trackIdx, sceneIdx, autoPlay, true /* immediate */);
     updateLeds();
 }
 
@@ -6331,13 +6378,15 @@ function handleNote(note, velocity) {
             quantizeMode = (quantizeMode + 1) % QUANT_LABELS.length;
             showStatus("Q:" + QUANT_LABELS[quantizeMode], 90);
             announce("Quantize " + QUANT_LABELS[quantizeMode]);
+            /* Push new granularity to DSP so clock grid realigns */
+            if (syncEnabled) sendBeatsPerBarForQuantize();
             updateLeds();
         } else {
-            var syncState = host_module_get_param("sync_clock");
-            var newSync = (syncState === "1") ? "0" : "1";
-            host_module_set_param("sync_clock", newSync);
-            announce(newSync === "1" ? "Sync On" : "Sync Off");
-            showStatus(newSync === "1" ? "Sync On" : "Sync Off", 60);
+            syncEnabled = !syncEnabled;
+            host_module_set_param("sync_clock", syncEnabled ? "1" : "0");
+            if (syncEnabled) sendBeatsPerBarForQuantize();
+            announce(syncEnabled ? "Sync On" : "Sync Off");
+            showStatus(syncEnabled ? "Sync On" : "Sync Off", 60);
             updateLeds();
         }
         return;
@@ -6950,20 +6999,22 @@ globalThis.tick = function() {
                 lastTransportPlaying = transportPlaying;
                 if (transportPlaying) {
                     /* transportPlayingTimestamp and lastBarCount already reset above */
-                    /* Only start tracks that have an active scene — not all loaded tracks */
+                    /* Only start tracks that have an active scene — not all loaded tracks.
+                     * Use play_now: transport just started (bar 1 = immediate), no DSP queue. */
                     for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
                         var _tts = trackStates[_ti];
                         if (_tts.loaded && _tts.playingSceneIdx >= 0) {
-                            host_module_set_param("t" + _ti + ":play", "selection");
+                            host_module_set_param("t" + _ti + ":play_now", "selection");
                             _tts.playing = true;
                         }
                     }
                     if (trackStates[activeTrack].loaded && trackStates[activeTrack].playingSceneIdx >= 0) playing = true;
                 } else {
+                    dspQueuedPlayTrack = -1;  /* cancel any pending DSP-queued play */
                     for (var _ti2 = 0; _ti2 < NUM_TRACKS; _ti2++) {
-                        if (trackStates[_ti2].playing) {
-                            host_module_set_param("t" + _ti2 + ":play", "stop");
-                        }
+                        /* Always send stop — DSP may be playing or queued_play=1
+                         * without the UI knowing (e.g. bar-quantized launch pending). */
+                        host_module_set_param("t" + _ti2 + ":play", "stop");
                         trackStates[_ti2].playing = false;
                     }
                     playing = false;
@@ -7076,7 +7127,7 @@ globalThis.tick = function() {
             }
         }
         if (_fire) {
-            applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch);
+            applySceneLaunch(pendingSceneSwitchTrack, pendingSceneSwitch, true, true /* immediate */);
             pendingSceneSwitch = -1;
             pendingSceneSwitchTrack = -1;
         }
@@ -7097,7 +7148,10 @@ globalThis.tick = function() {
                 syncMarkersToDs();
                 host_module_get_param("dirty"); /* sync barrier: blocks until DSP processes markers */
             }
-            host_module_set_param("play", pendingPlay);
+            /* "_now" suffix → play_now (immediate, bypasses DSP sync queue) */
+            var _isNow = pendingPlay.indexOf("_now") >= 0;
+            var _playMode = _isNow ? pendingPlay.replace("_now", "") : pendingPlay;
+            host_module_set_param(_isNow ? "play_now" : "play", _playMode);
         }
         pendingPlay = "";
     }
@@ -7160,7 +7214,7 @@ globalThis.tick = function() {
                 /* Now that the file is confirmed loaded, trigger playback.
                  * Use "selection" so play_whole=0 and marker boundaries are
                  * respected immediately during playback (not ignored). */
-                if (_psr.autoPlay) pendingPlay = "selection";
+                if (_psr.autoPlay) pendingPlay = _psr.playNow ? "selection_now" : "selection";
             }
             refreshWaveform();
         }

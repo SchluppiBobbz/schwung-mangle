@@ -138,6 +138,8 @@ typedef struct {
 
     int gate_mode;              /* 0=trigger (toggle), 1=gate (hold-to-play), 2=oneshot */
     int gate_held;              /* 1 while gate is held (pad/key down) */
+    int queued_play;            /* 1 = waiting for next bar boundary to start */
+    int queued_whole;           /* play mode for queued_play: 0=selection, 1=whole file */
     int muted;                  /* 1=track muted (non-destructive, skips render) */
     int play_mode;              /* 0=stretch (Bungee), 1=varispeed (repitch) */
 
@@ -171,8 +173,24 @@ typedef struct {
 typedef struct {
     track_t tracks[NUM_TRACKS];
     int active_track;           /* 0-3, which track is being edited */
-    int sync_to_clock;          /* Global clock sync flag */
-    float project_bpm;          /* Global project BPM from host (used in SYNC mode) */
+    int sync_to_clock;          /* 1 = MIDI clock sync enabled */
+    float project_bpm;          /* global project BPM (used for internal bar timing) */
+
+    /* Clock sync state — SYNC_CLOCK path (mirrors SuperArp pattern) */
+    int clock_running;          /* 1 if MIDI transport is running */
+    int clock_counter;          /* ticks since last bar start (0..clocks_per_bar-1) */
+    uint64_t clock_tick_total;  /* cumulative ticks since last 0xFA Start */
+    int clocks_per_bar;         /* MIDI clocks per bar = beats_per_bar * 24 */
+    int beats_per_bar;          /* time signature numerator (default 4) */
+    int pending_bar_triggers;   /* bar-start triggers queued for render_block */
+    int delayed_bar_triggers;   /* bar triggers delayed 1 F8 tick (block-boundary safety) */
+
+    /* Internal sync — BPM-based sample counting when clock not running */
+    double samples_per_bar_f;   /* bar duration in samples */
+    double samples_until_bar_f; /* countdown to next bar boundary */
+    int timing_dirty;           /* 1 = recalc_timing() needed */
+    int cached_sample_rate;     /* sample rate used in last recalc_timing() */
+
     char module_dir[512];
 
     /* Skipback ring buffers — filled continuously during render_block */
@@ -892,6 +910,59 @@ static void bng_reset_stretcher(track_t *t, double position);
 static void do_apply_pitch_tempo(track_t *t);
 
 /* ============================================================================
+ * Clock sync helpers — modelled on SuperArp SYNC_CLOCK pattern
+ * ============================================================================ */
+
+/* Compute clocks_per_bar from beats_per_bar and 24 PPQN MIDI clock. */
+static void recalc_clock_timing(instance_t *inst) {
+    if (!inst) return;
+    if (inst->beats_per_bar < 1) inst->beats_per_bar = 4;
+    inst->clocks_per_bar = inst->beats_per_bar * 24; /* 24 PPQN per beat */
+    if (inst->clocks_per_bar < 1) inst->clocks_per_bar = 96;
+}
+
+/* Snap clock_counter to current tick position after a beats_per_bar change.
+ * Drops any queued triggers from the previous grid — same pattern as SuperArp
+ * realign_clock_phase(). */
+static void realign_clock_phase(instance_t *inst) {
+    if (!inst) return;
+    if (inst->clocks_per_bar < 1) inst->clocks_per_bar = 96;
+    inst->clock_counter = (int)(inst->clock_tick_total % (uint64_t)inst->clocks_per_bar);
+    inst->pending_bar_triggers = 0;
+    inst->delayed_bar_triggers = 0;
+}
+
+/* Compute bar duration in samples from project_bpm for internal (non-clock) sync.
+ * Called whenever project_bpm, beats_per_bar, or sample_rate changes. */
+static void recalc_timing(instance_t *inst, int sample_rate) {
+    double bpm;
+    int bpb;
+    if (!inst || sample_rate <= 0) return;
+    bpm = (double)inst->project_bpm;
+    if (bpm < 20.0) bpm = 20.0;
+    if (bpm > 300.0) bpm = 300.0;
+    bpb = inst->beats_per_bar > 0 ? inst->beats_per_bar : 4;
+    inst->samples_per_bar_f = ((double)sample_rate * 60.0 / bpm) * (double)bpb;
+    if (inst->samples_per_bar_f < 1.0) inst->samples_per_bar_f = 1.0;
+    /* Clamp countdown so it never exceeds one bar */
+    if (inst->samples_until_bar_f <= 0.0 || inst->samples_until_bar_f > inst->samples_per_bar_f)
+        inst->samples_until_bar_f = inst->samples_per_bar_f;
+    inst->cached_sample_rate = sample_rate;
+    inst->timing_dirty = 0;
+}
+
+/* Stop all tracks and cancel queued plays — called on 0xFC (Stop) and when
+ * sync_to_clock is disabled while clock was running. */
+static void handle_transport_stop(instance_t *inst) {
+    int i;
+    if (!inst) return;
+    for (i = 0; i < NUM_TRACKS; i++) {
+        inst->tracks[i].playing = 0;
+        inst->tracks[i].queued_play = 0;
+    }
+}
+
+/* ============================================================================
  * V2 API implementation
  * ============================================================================ */
 
@@ -916,6 +987,20 @@ static void* v2_create(const char *module_dir, const char *json_defaults) {
     inst->active_track = 0;
     inst->sync_to_clock = 0;
     inst->project_bpm = 120.0f;
+
+    /* Clock sync state */
+    inst->clock_running = 0;
+    inst->clock_counter = 0;
+    inst->clock_tick_total = 0;
+    inst->beats_per_bar = 4;
+    inst->clocks_per_bar = 96; /* overwritten by recalc_clock_timing */
+    inst->pending_bar_triggers = 0;
+    inst->delayed_bar_triggers = 0;
+    inst->samples_per_bar_f = 0.0;
+    inst->samples_until_bar_f = 0.0;
+    inst->timing_dirty = 1;
+    inst->cached_sample_rate = 0;
+    recalc_clock_timing(inst);
 
     /* Allocate skipback ring buffers */
     inst->master_rb = (int16_t *)calloc((size_t)RB_FRAMES * 2, sizeof(int16_t));
@@ -949,11 +1034,67 @@ static void v2_destroy(void *instance) {
 
 static void v2_on_midi(void *instance, const uint8_t *msg, int len,
                        int source) {
-    /* Waveform editor does not process MIDI (yet — clock sync TODO) */
-    (void)instance;
-    (void)msg;
-    (void)len;
+    instance_t *inst = (instance_t *)instance;
+    uint8_t status;
     (void)source;
+    if (!inst || !msg || len < 1) return;
+    status = msg[0];
+
+    if (inst->sync_to_clock) {
+        if (status == 0xFA) { /* Start — reset phase, arm immediate bar trigger */
+            inst->clock_running = 1;
+            inst->clock_counter = 0;
+            inst->clock_tick_total = 0;
+            inst->pending_bar_triggers = 0;
+            inst->delayed_bar_triggers = 0;
+            /* Fire bar-zero immediately so queued tracks start on downbeat */
+            inst->pending_bar_triggers = 1;
+            return;
+        }
+        if (status == 0xFB) { /* Continue — resume at current position */
+            inst->clock_running = 1;
+            inst->pending_bar_triggers = 0;
+            inst->delayed_bar_triggers = 0;
+            return;
+        }
+        if (status == 0xFC) { /* Stop */
+            inst->clock_running = 0;
+            inst->clock_counter = 0;
+            inst->pending_bar_triggers = 0;
+            inst->delayed_bar_triggers = 0;
+            handle_transport_stop(inst);
+            return;
+        }
+        if (status == 0xF8) { /* Clock tick */
+            if (!inst->clock_running) return;
+            /* Drain delayed triggers from the previous tick first (1-tick delay
+             * avoids bar triggers landing in an already-started render block,
+             * same pattern as SuperArp CLOCK_ARP_OUTPUT_DELAY_TICKS). */
+            if (inst->delayed_bar_triggers > 0) {
+                inst->pending_bar_triggers += inst->delayed_bar_triggers;
+                inst->delayed_bar_triggers = 0;
+            }
+            inst->clock_tick_total++;
+            inst->clock_counter = (int)(inst->clock_tick_total % (uint64_t)inst->clocks_per_bar);
+            if (inst->clock_counter == 0) {
+                inst->delayed_bar_triggers++;
+            }
+            return;
+        }
+    } else {
+        /* sync_to_clock off — still track transport to reset internal phase */
+        if (status == 0xFA || status == 0xFB) {
+            if (inst->timing_dirty && inst->cached_sample_rate > 0)
+                recalc_timing(inst, inst->cached_sample_rate);
+            inst->samples_until_bar_f = inst->samples_per_bar_f > 0.0
+                                        ? inst->samples_per_bar_f : 1.0;
+            return;
+        }
+        if (status == 0xFC) {
+            handle_transport_stop(inst);
+            return;
+        }
+    }
 }
 
 /* ============================================================================
@@ -1014,18 +1155,25 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (!t->audio_data || t->audio_frames <= 0) continue;
             if (start) {
                 if (!t->playing) {
-                    t->play_whole = 0;
-                    t->playing = 1;
-                    t->play_pos = t->start_sample;
-                    t->play_pos_frac = (double)t->start_sample;
-                    /* Reset Bungee state */
-                    t->bng_out_count = 0;
-                    t->bng_play_start = t->start_sample;
-                    t->bng_play_end = t->end_sample;
-                    bng_reset_stretcher(t, (double)t->start_sample);
+                    if (inst->sync_to_clock && inst->clock_running) {
+                        /* Queue for next bar boundary */
+                        t->queued_play = 1;
+                        t->queued_whole = 0;
+                    } else {
+                        t->queued_play = 0;
+                        t->play_whole = 0;
+                        t->playing = 1;
+                        t->play_pos = t->start_sample;
+                        t->play_pos_frac = (double)t->start_sample;
+                        t->bng_out_count = 0;
+                        t->bng_play_start = t->start_sample;
+                        t->bng_play_end = t->end_sample;
+                        bng_reset_stretcher(t, (double)t->start_sample);
+                    }
                 }
             } else {
                 t->playing = 0;
+                t->queued_play = 0;
             }
         }
         return;
@@ -1033,14 +1181,56 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
     if (strcmp(key, "sync_clock") == 0) {
         if (!val) return;
-        inst->sync_to_clock = atoi(val) ? 1 : 0;
+        int enabled = atoi(val) ? 1 : 0;
+        if (enabled && !inst->sync_to_clock) {
+            /* Enabling sync: reset clock state, assume transport is running */
+            inst->clock_running = 1;
+            inst->clock_counter = 0;
+            inst->clock_tick_total = 0;
+            inst->pending_bar_triggers = 0;
+            inst->delayed_bar_triggers = 0;
+            recalc_clock_timing(inst);
+            if (inst->cached_sample_rate > 0)
+                recalc_timing(inst, inst->cached_sample_rate);
+        } else if (!enabled && inst->sync_to_clock) {
+            /* Disabling sync: cancel queued plays, reset internal phase */
+            for (int _i = 0; _i < NUM_TRACKS; _i++)
+                inst->tracks[_i].queued_play = 0;
+            inst->clock_running = 0;
+            inst->pending_bar_triggers = 0;
+            inst->delayed_bar_triggers = 0;
+        }
+        inst->sync_to_clock = enabled;
         return;
     }
 
     if (strcmp(key, "project_bpm") == 0) {
         if (!val) return;
-        float bpm = atof(val);
-        if (bpm > 0) inst->project_bpm = bpm;
+        float bpm = (float)atof(val);
+        if (bpm > 0.0f) {
+            inst->project_bpm = bpm;
+            inst->timing_dirty = 1;
+            if (inst->cached_sample_rate > 0) {
+                recalc_timing(inst, inst->cached_sample_rate);
+                if (inst->sync_to_clock && inst->clock_running)
+                    realign_clock_phase(inst);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(key, "beats_per_bar") == 0) {
+        if (!val) return;
+        int bpb = atoi(val);
+        if (bpb >= 1 && bpb <= 16) {
+            inst->beats_per_bar = bpb;
+            recalc_clock_timing(inst);
+            if (inst->sync_to_clock && inst->clock_running)
+                realign_clock_phase(inst);
+            inst->timing_dirty = 1;
+            if (inst->cached_sample_rate > 0)
+                recalc_timing(inst, inst->cached_sample_rate);
+        }
         return;
     }
 
@@ -1298,11 +1488,21 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
         if (val && strcmp(val, "stop") == 0) {
             t->playing = 0;
+            t->queued_play = 0;
             return;
         }
 
         /* Value encodes play mode: "whole" = entire file, anything else = selection */
         int whole = (val && strcmp(val, "whole") == 0) ? 1 : 0;
+
+        if (inst->sync_to_clock && inst->clock_running) {
+            /* Queue for next bar boundary; cancel any previous queue */
+            t->queued_play = 1;
+            t->queued_whole = whole;
+            return;
+        }
+
+        t->queued_play = 0;
         t->play_whole = whole;
         t->playing = 1;
         if (whole) {
@@ -1326,6 +1526,38 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                      track_idx, whole, t->start_sample, t->end_sample,
                      t->play_pos, t->audio_frames);
             plugin_log(dbg);
+        }
+        return;
+    }
+
+    /* play_now: always starts immediately, bypasses sync queuing.
+     * Used when the UI has already done its own quantize (transport start,
+     * force-immediate second press, QUANT_SAMPLE_END). */
+    if (strcmp(param, "play_now") == 0) {
+        if (!t->audio_data || t->audio_frames <= 0) return;
+        if (val && strcmp(val, "stop") == 0) {
+            t->playing = 0;
+            t->queued_play = 0;
+            return;
+        }
+        int whole = (val && strcmp(val, "whole") == 0) ? 1 : 0;
+        t->queued_play = 0;
+        t->play_whole = whole;
+        t->playing = 1;
+        if (whole) {
+            t->play_pos = 0;
+            t->play_pos_frac = 0.0;
+            t->bng_play_start = 0;
+            t->bng_play_end = t->audio_frames;
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, 0.0);
+        } else {
+            t->play_pos = t->start_sample;
+            t->play_pos_frac = (double)t->start_sample;
+            t->bng_play_start = t->start_sample;
+            t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+            t->bng_out_count = 0;
+            bng_reset_stretcher(t, (double)t->start_sample);
         }
         return;
     }
@@ -1370,7 +1602,16 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     /* --- Gate mode --- */
     if (strcmp(param, "gate_mode") == 0) {
         if (!val) return;
-        { int _m = atoi(val); t->gate_mode = (_m >= 0 && _m <= 2) ? _m : 0; }
+        int new_mode = atoi(val);
+        if (new_mode < 0 || new_mode > 2) new_mode = 0;
+        /* Switching TO Gate while playing: treat as held so current playback
+         * continues. Gate semantics (stop on release) apply from next launch. */
+        if (new_mode == 1 && t->gate_mode != 1 && t->playing)
+            t->gate_held = 1;
+        /* Leaving Gate: clear held flag so it doesn't carry over */
+        if (new_mode != 1)
+            t->gate_held = 0;
+        t->gate_mode = new_mode;
         return;
     }
 
@@ -2289,6 +2530,16 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
+    if (strcmp(key, "beats_per_bar") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%d", inst->beats_per_bar);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
+    if (strcmp(key, "clock_running") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%d", inst->clock_running);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
     if (strcmp(key, "project_dir") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%s", inst->project_dir);
         return (n >= 0 && n < buf_len) ? n : -1;
@@ -3065,6 +3316,61 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
 
     /* Clear output */
     memset(out_interleaved_lr, 0, (size_t)frames * 2 * sizeof(int16_t));
+
+    /* -----------------------------------------------------------------------
+     * Clock sync: compute bar triggers for this block.
+     *
+     * SYNC_CLOCK path: drain pending_bar_triggers queued by v2_on_midi.
+     * Internal path: count samples against samples_per_bar_f when the MIDI
+     * clock is not running (no Start received yet, or sync_to_clock off).
+     * ----------------------------------------------------------------------- */
+    if (inst->sync_to_clock) {
+        int bar_triggers = 0;
+        int sr = (g_host && g_host->sample_rate > 0) ? g_host->sample_rate : MOVE_SAMPLE_RATE;
+
+        if (inst->clock_running) {
+            /* Drain MIDI-clock triggered bar starts */
+            bar_triggers = inst->pending_bar_triggers;
+            inst->pending_bar_triggers = 0;
+        } else {
+            /* Internal BPM fallback — count samples, fire on bar boundary */
+            if (inst->timing_dirty || inst->cached_sample_rate != sr)
+                recalc_timing(inst, sr);
+            if (inst->samples_per_bar_f > 0.0) {
+                inst->samples_until_bar_f -= (double)frames;
+                while (inst->samples_until_bar_f <= 0.0) {
+                    bar_triggers++;
+                    inst->samples_until_bar_f += inst->samples_per_bar_f;
+                    if (inst->samples_until_bar_f < 1.0) inst->samples_until_bar_f = 1.0;
+                }
+            }
+        }
+
+        /* Launch queued tracks on each bar trigger */
+        if (bar_triggers > 0) {
+            for (int ti = 0; ti < NUM_TRACKS; ti++) {
+                track_t *t = &inst->tracks[ti];
+                if (!t->queued_play) continue;
+                if (!t->audio_data || t->audio_frames <= 0) { t->queued_play = 0; continue; }
+                t->queued_play = 0;
+                t->play_whole = t->queued_whole;
+                t->playing = 1;
+                if (t->queued_whole) {
+                    t->play_pos = 0;
+                    t->play_pos_frac = 0.0;
+                    t->bng_play_start = 0;
+                    t->bng_play_end = t->audio_frames;
+                } else {
+                    t->play_pos = t->start_sample;
+                    t->play_pos_frac = (double)t->start_sample;
+                    t->bng_play_start = t->start_sample;
+                    t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+                }
+                t->bng_out_count = 0;
+                bng_reset_stretcher(t, t->play_pos_frac);
+            }
+        }
+    }
 
     /* Temporary buffer for each track */
     int16_t tmp[MOVE_FRAMES_PER_BLOCK * 2];
