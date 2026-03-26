@@ -325,6 +325,7 @@ var bpm = 120.0;
 var globalBpm = 120;       /* project BPM from host, default 120 */
 var syncMode = false;      /* true when active scene/file uses BPM sync */
 var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
+var bpmSetLocally = 0;      /* tick count when BPM was set via knob — suppress overlay overwrite */
 /* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
 var injectQueue = [];
 var lastInjectTime = 0;
@@ -629,7 +630,7 @@ function restoreSceneToGlobals(scene) {
     beatDivIndex = scene.beatDivIndex;
     syncMode = scene.syncMode || false;
     /* SYNC scenes: recalculate tempoPercent from current globalBpm so it stays accurate */
-    tempoPercent = syncMode ? Math.round(globalBpm / bpm * 100) : scene.tempoPercent;
+    tempoPercent = syncMode ? Math.round(globalBpm / bpm * 100 * 10) / 10 : scene.tempoPercent;
     loopEnabled = scene.loopEnabled;
     var _sgm = (scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER;
     trackStates[activeTrack].gateMode = _sgm;
@@ -770,7 +771,7 @@ function switchToTrack(idx) {
         setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
         setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
         if (syncMode) {
-            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
+            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample, 500);
         } else {
             setParamBlocking("tempo", String(tempoPercent), 500);
         }
@@ -1092,9 +1093,47 @@ function loadScenesFromProjectJson() {
  * Load project.json from the project folder and restore all tracks.
  * Returns true on success.
  */
+/**
+ * Push sync_tempo to DSP for all SYNC-mode tracks after globalBpm changed.
+ */
+function updateSyncTempoAllTracks() {
+    for (var _bi = 0; _bi < NUM_TRACKS; _bi++) {
+        var _bts = trackStates[_bi];
+        var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
+            ? _bts.scenes[_bts.playingSceneIdx] : null;
+        if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
+            var _tpFull = Math.round(globalBpm / _bsc.bpm * 100 * 10) / 10;
+            if (_tpFull < 30) _tpFull = 30;
+            if (_tpFull > 300) _tpFull = 300;
+            var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
+            var _ss = _bsc.startSample || 0;
+            var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
+            host_module_set_param(_stkey, _tpFull.toFixed(1) + "," + _ss + "," + _se);
+            if (_bi === activeTrack) tempoPercent = _tpFull;
+        }
+    }
+}
+
+/**
+ * Read globalBpm from overlay immediately (don't wait for tick).
+ * Call before any code that computes sync_tempo from globalBpm.
+ */
+function initGlobalBpmFromOverlay() {
+    if (typeof shadow_get_overlay_state !== "function") return;
+    var _ov = shadow_get_overlay_state();
+    if (_ov && typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0) {
+        globalBpm = Math.round(_ov.samplerBpm * 10) / 10;
+        if (globalBpm !== lastProjectBpm) {
+            host_module_set_param("project_bpm", String(globalBpm));
+            lastProjectBpm = globalBpm;
+        }
+    }
+}
+
 function loadProjectJson() {
     if (!projectDir || projectDir === "_no_project") return false;
     if (typeof host_read_file !== "function") return false;
+    initGlobalBpmFromOverlay();
     var raw = host_read_file(projectDir + "/project.json");
     if (!raw || raw.length < 2) return false;
     try {
@@ -1192,7 +1231,7 @@ function loadProjectJson() {
                 setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
                 setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
                 if (ts.syncMode) {
-                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(4) + "," + ts.startSample + "," + ts.endSample, 500);
+                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(1) + "," + ts.startSample + "," + ts.endSample, 500);
                 } else {
                     setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
                 }
@@ -1720,7 +1759,7 @@ function detectBpmFromFilename() {
     }
     bpm = Math.round(detectedBpm * 10) / 10;
     syncMode = true;
-    tempoPercent = Math.round(globalBpm / bpm * 100);
+    tempoPercent = Math.round(globalBpm / bpm * 100 * 10) / 10;
     if (endSample > totalFrames) endSample = totalFrames;
     syncMarkersToDs();
     syncSyncModeToDs();
@@ -1857,7 +1896,7 @@ function syncMarkersToDs() {
  * Logical markers in JS are never modified.
  */
 function syncSyncModeToDs() {
-    var _tp = (globalBpm / bpm * 100).toFixed(4);
+    var _tp = (globalBpm / bpm * 100).toFixed(1);
     host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample);
 }
 
@@ -3303,7 +3342,7 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -3637,7 +3676,7 @@ function pasteTrack(trackIdx) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(4) + "," + scene.startSample + "," + scene.endSample, 500);
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -5548,7 +5587,7 @@ function handleCC(cc, value) {
                 }
                 bpm = estimatedBpm;
                 syncMode = true;
-                tempoPercent = Math.round(globalBpm / bpm * 100);
+                tempoPercent = Math.round(globalBpm / bpm * 100 * 10) / 10;
                 syncSyncModeToDs();
                 showStatus("BPM: " + bpm.toFixed(1), 90);
             }
@@ -6014,6 +6053,11 @@ function handleCC(cc, value) {
                 beatDivIndex += (delta > 0 ? 1 : -1);
                 if (beatDivIndex < 0) beatDivIndex = 0;
                 if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                /* Snap length to nearest grid of new division */
+                var _snapStep = getBeatStepSamples();
+                var _curLen = endSample - startSample;
+                var _snapped = Math.max(1, Math.round(_curLen / _snapStep)) * _snapStep;
+                endSample = Math.min(startSample + _snapped, totalFrames);
                 refreshWaveform();
                 return;
             }
@@ -6083,6 +6127,11 @@ function handleCC(cc, value) {
                 beatDivIndex += (delta > 0 ? 1 : -1);
                 if (beatDivIndex < 0) beatDivIndex = 0;
                 if (beatDivIndex >= BEAT_DIVISIONS.length) beatDivIndex = BEAT_DIVISIONS.length - 1;
+                /* Snap length to nearest grid of new division */
+                var _snapStep2 = getBeatStepSamples();
+                var _curLen2 = endSample - startSample;
+                var _snapped2 = Math.max(1, Math.round(_curLen2 / _snapStep2)) * _snapStep2;
+                endSample = Math.min(startSample + _snapped2, totalFrames);
                 refreshWaveform();
                 return;
             }
@@ -6246,9 +6295,22 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* E6 (Knob 6): Division in VIEW_SLICE (BPM mode) */
+    /* E6 (Knob 6): Shift+E6 = global BPM; else Division in VIEW_SLICE (BPM mode) */
     if (cc === CC_E6) {
         var delta = decodeDelta(value);
+        if (delta !== 0 && shiftHeld) {
+            var step = deleteHeld ? 0.1 : 1.0;
+            var newBpm = Math.round((globalBpm + delta * step) * 10) / 10;
+            if (newBpm < 20) newBpm = 20;
+            if (newBpm > 999) newBpm = 999;
+            globalBpm = newBpm;
+            lastProjectBpm = newBpm;
+            bpmSetLocally = tickFrame + 30;  /* suppress overlay overwrite for ~30 ticks (~500ms) */
+            host_module_set_param("project_bpm", String(newBpm));
+            updateSyncTempoAllTracks();
+            showKnobStatus(5, "Global BPM:" + newBpm.toFixed(1));
+            return;
+        }       
         if (delta !== 0) {
             if (currentView === VIEW_SLICE && sliceMode === SLICE_MODE_BPM && !lazyChopping) {
                 beatDivIndex += (delta > 0 ? 1 : -1);
@@ -6334,7 +6396,7 @@ function handleCC(cc, value) {
             if (bpm < 20) bpm = 20;
             if (bpm > 999) bpm = 999;
             bpm = Math.round(bpm * 10) / 10;
-            tempoPercent = Math.round(globalBpm / bpm * 100);
+            tempoPercent = Math.round(globalBpm / bpm * 100 * 10) / 10;
             if (tempoPercent < 30) { tempoPercent = 30; bpm = Math.round(globalBpm / 0.3 * 10) / 10; }
             if (tempoPercent > 300) { tempoPercent = 300; bpm = Math.round(globalBpm / 3.0 * 10) / 10; }
             /* Rescale endSample so musical length stays constant:
@@ -6794,6 +6856,8 @@ function handleNote(note, velocity) {
  * or immediately when reconnecting without a saved project).
  */
 function doReconnectRestore() {
+    /* Ensure globalBpm is accurate before any sync_tempo calculations */
+    initGlobalBpmFromOverlay();
     /* Restore per-track state from DSP without reloading files.
      * We only READ from DSP here — no file_path is sent, so playback
      * continues uninterrupted in the DSP. */
@@ -7099,26 +7163,16 @@ globalThis.tick = function() {
                     saveProjectJson();
                 }
             }
-            /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes */
-            if (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0 && _ov.samplerBpm !== lastProjectBpm) {
-                host_module_set_param("project_bpm", String(_ov.samplerBpm));
-                lastProjectBpm = _ov.samplerBpm;
-                globalBpm = lastProjectBpm;
-                for (var _bi = 0; _bi < NUM_TRACKS; _bi++) {
-                    var _bts = trackStates[_bi];
-                    var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
-                        ? _bts.scenes[_bts.playingSceneIdx] : null;
-                    if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
-                        var _tp = Math.round(globalBpm / _bsc.bpm * 100);
-                        if (_tp < 30) _tp = 30;
-                        if (_tp > 300) _tp = 300;
-                        var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
-                        var _ss = _bsc.startSample || 0;
-                        var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
-                        host_module_set_param(_stkey, _tp + "," + _ss + "," + _se);
-                        if (_bi === activeTrack) tempoPercent = _tp;
-                    }
-                }
+            /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes.
+             * Skip if BPM was recently set locally via knob (avoid overlay overwrite race). */
+            var _ovBpmRounded = (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0)
+                ? Math.round(_ov.samplerBpm * 10) / 10 : 0;
+            if (_ovBpmRounded > 0 && _ovBpmRounded !== lastProjectBpm
+                && tickFrame > bpmSetLocally) {
+                lastProjectBpm = _ovBpmRounded;
+                globalBpm = _ovBpmRounded;
+                host_module_set_param("project_bpm", String(_ovBpmRounded));
+                updateSyncTempoAllTracks();
             }
         }
     }
@@ -7269,7 +7323,7 @@ globalThis.tick = function() {
                 if (_psr.tempoPercent !== undefined) {
                     tempoPercent = _psr.tempoPercent;
                     if (syncMode) {
-                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(4) + "," + startSample + "," + endSample, 500);
+                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample, 500);
                     } else {
                         setParamBlocking("tempo", String(tempoPercent), 500);
                     }
