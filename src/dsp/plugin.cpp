@@ -159,6 +159,7 @@ typedef struct {
     int    bng_play_start;      /* playback region start for Bungee */
     int    bng_play_end;        /* playback region end for Bungee */
     int    sync_play_end;       /* SYNC mode: tempo-scaled loop boundary (0 = not set, use end_sample) */
+    double loop_len_exact;      /* exact musical loop length in input samples (0 = use integer region_len) */
 
     char copy_result[256];
     char load_error[256];
@@ -1681,23 +1682,54 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
      * file_info always returns the logical positions. */
     if (strcmp(param, "sync_tempo") == 0) {
         if (!val) return;
-        double tp; int s, e;
-        if (sscanf(val, "%lf,%d,%d", &tp, &s, &e) != 3) return;
+        double tp; int s, e; double exact_len = 0.0;
+        /* Accept optional 4th field: exact loop length in input samples (float).
+         * When present, used for drift-free loop wrap instead of integer (e-s). */
+        int n = sscanf(val, "%lf,%d,%d,%lf", &tp, &s, &e, &exact_len);
+        if (n < 3) return;
         if (tp < 30.0) tp = 30.0;
         if (tp > 300.0) tp = 300.0;
         t->tempo_percent = (int)round(tp);
         recompute_ratios(t);
         if (e > t->audio_frames) e = t->audio_frames;
         if (e < s) e = s;
-        /* Also update the physical markers so render_track (which reads
-         * play_end = t->end_sample directly) picks up the change immediately.
-         * Previously only sync_play_end / bng_play_end were set here, but
-         * render_track never reads those — it reads end_sample. */
-        t->start_sample = s;
-        t->end_sample   = e;
-        t->sync_play_end = e;
-        t->bng_play_start = s;
-        t->bng_play_end = e;
+
+        /* Phase-preserving update: if the track is playing, compute the current
+         * loop phase and seek to the proportional position in the new region so
+         * that tempo/length changes mid-playback don't cause an audible jump.
+         * (SPP-style: playback continues from the same relative loop position.) */
+        if (t->playing && t->end_sample > t->start_sample) {
+            double old_len = (t->loop_len_exact > 0.0)
+                             ? t->loop_len_exact
+                             : (double)(t->end_sample - t->start_sample);
+            double phase = (t->play_pos_frac - (double)t->start_sample) / old_len;
+            if (phase < 0.0) phase = 0.0;
+            phase = fmod(phase, 1.0);
+
+            t->start_sample  = s;
+            t->end_sample    = e;
+            t->sync_play_end = e;
+            t->bng_play_start = s;
+            t->bng_play_end  = e;
+            t->loop_len_exact = (exact_len > 0.0) ? exact_len : (double)(e - s);
+
+            double new_pos = (double)s + phase * t->loop_len_exact;
+            if (new_pos >= (double)e) new_pos = (double)s;
+            t->play_pos_frac = new_pos;
+            t->play_pos      = (int)new_pos;
+            if (t->stretcher) {
+                bng_reset_stretcher(t, new_pos);
+            }
+        } else {
+            /* Not playing — update markers and exact loop length. */
+            t->start_sample  = s;
+            t->end_sample    = e;
+            t->sync_play_end = e;
+            t->bng_play_start = s;
+            t->bng_play_end  = e;
+            t->loop_len_exact = (exact_len > 0.0) ? exact_len : 0.0;
+        }
+
         /* Update speed directly without resetting the stretcher so the loop
          * boundary takes effect on the very next audio block (same as E2).
          * Use the full-precision float ratio to avoid cumulative drift. */
@@ -3181,7 +3213,8 @@ static int render_track(track_t *t, int16_t *out, int frames) {
 
             while (t->play_pos_frac >= (double)play_end) {
                 if (t->play_loop && region_len > 0) {
-                    t->play_pos_frac -= (double)region_len;
+                    double wrap_len = (t->loop_len_exact > 0.0) ? t->loop_len_exact : (double)region_len;
+                    t->play_pos_frac -= wrap_len;
                 } else {
                     t->playing = 0;
                     break;
@@ -3231,8 +3264,9 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             /* Handle loop wrap */
             if (t->bng_req.position >= (double)play_end) {
                 if (t->play_loop && region_len > 0) {
+                    double wrap_len = (t->loop_len_exact > 0.0) ? t->loop_len_exact : (double)region_len;
                     double wrapped = (double)play_start +
-                        fmod(t->bng_req.position - (double)play_start, (double)region_len);
+                        fmod(t->bng_req.position - (double)play_start, wrap_len);
                     if (wrapped < (double)play_start) wrapped = (double)play_start;
                     bng_reset_stretcher(t, wrapped);
                 } else {

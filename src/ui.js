@@ -161,7 +161,7 @@ function sceneLoadFile(trackIdx, path) {
  * when copying to avoid shared mutation.
  */
 var SCENE_FIELDS = [
-    "startSample", "endSample", "gainDb", "pitchSemitones", "tempoPercent",
+    "startSample", "endSample", "exactLen", "gainDb", "pitchSemitones", "tempoPercent",
     "bpm", "beatDivIndex", "syncMode", "loopEnabled", "gateMode",
     "sliceMode", "sliceCount", "sliceBoundaries", "selectedSlice",
     "slicePadOffset", "sliceRegionStart", "sliceRegionEnd", "sliceThreshold",
@@ -322,6 +322,7 @@ var loopSelectedField = 0;
 
 /* BPM state */
 var bpm = 120.0;
+var exactLoopLen = 0;      /* exact musical loop length in input samples (float); 0 = use integer (endSample-startSample) */
 var globalBpm = 120;       /* project BPM from host, default 120 */
 var syncMode = false;      /* true when active scene/file uses BPM sync */
 var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
@@ -444,7 +445,8 @@ function makeSceneState(path) {
         lazySub:         LAZY_SUB_CHOP,
         zoomLevel:       0,
         zoomCenter:      0,
-        vScale:          1.0
+        vScale:          1.0,
+        exactLen:        0    /* exact musical loop length in input samples (float, 0 = use integer) */
     };
 }
 
@@ -624,6 +626,7 @@ function saveCurrentSceneState(trackIdx) {
 function restoreSceneToGlobals(scene) {
     startSample = scene.startSample;
     endSample = scene.endSample;
+    exactLoopLen = scene.exactLen || 0;
     gainDb = scene.gainDb;
     pitchSemitones = scene.pitchSemitones;
     bpm = scene.bpm;
@@ -657,7 +660,7 @@ function restoreSceneToGlobals(scene) {
  */
 function getGlobalsAsSceneSource() {
     return {
-        startSample: startSample, endSample: endSample,
+        startSample: startSample, endSample: endSample, exactLen: exactLoopLen,
         gainDb: gainDb, pitchSemitones: pitchSemitones, tempoPercent: tempoPercent,
         bpm: bpm, beatDivIndex: beatDivIndex, syncMode: syncMode, loopEnabled: loopEnabled,
         gateMode: trackStates[activeTrack].gateMode,
@@ -774,7 +777,8 @@ function switchToTrack(idx) {
         setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
         setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
         if (syncMode) {
-            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample, 500);
+            var _stEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample + _stEl, 500);
         } else {
             setParamBlocking("tempo", String(tempoPercent), 500);
         }
@@ -1111,7 +1115,8 @@ function updateSyncTempoAllTracks() {
             var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
             var _ss = _bsc.startSample || 0;
             var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
-            host_module_set_param(_stkey, _tpFull.toFixed(1) + "," + _ss + "," + _se);
+            var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(3) : "";
+            host_module_set_param(_stkey, _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
             if (_bi === activeTrack) tempoPercent = _tpFull;
         }
     }
@@ -1234,7 +1239,8 @@ function loadProjectJson() {
                 setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
                 setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
                 if (ts.syncMode) {
-                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(1) + "," + ts.startSample + "," + ts.endSample, 500);
+                    var _ltEl = (_ltScene.exactLen > 0) ? "," + _ltScene.exactLen.toFixed(3) : "";
+                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(1) + "," + ts.startSample + "," + ts.endSample + _ltEl, 500);
                 } else {
                     setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
                 }
@@ -1900,7 +1906,8 @@ function syncMarkersToDs() {
  */
 function syncSyncModeToDs() {
     var _tp = (globalBpm / bpm * 100).toFixed(1);
-    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample);
+    var _el = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
 }
 
 /**
@@ -3345,7 +3352,8 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample, 500);
+            var _aplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(3) : "";
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample + _aplEl, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -3685,7 +3693,8 @@ function pasteTrack(trackIdx) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample, 500);
+            var _cplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(3) : "";
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample + _cplEl, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -6153,6 +6162,7 @@ function handleCC(cc, value) {
                 return;
             }
             adjustMarker(1, delta * getBeatStepSamples());
+            exactLoopLen = endSample - startSample;  /* grid-snapped value resets fractional accumulation */
             showKnobStatus(1, "Len:" + formatBarsBeats(endSample - startSample));
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
@@ -6424,9 +6434,12 @@ function handleCC(cc, value) {
             /* Rescale endSample so musical length stays constant:
              * musicalLength (beats) = (endSample - startSample) / sampleRate * oldBpm / 60
              * newEndSample = startSample + musicalLength * 60 / newBpm * sampleRate
-             *              = startSample + (endSample - startSample) * oldBpm / newBpm */
-            var oldLen = endSample - startSample;
-            endSample = startSample + Math.round(oldLen * oldBpm / bpm);
+             *              = startSample + (endSample - startSample) * oldBpm / newBpm
+             * Accumulate fractional part in exactLoopLen to avoid rounding drift
+             * across repeated BPM adjustments. */
+            var oldExact = exactLoopLen > 0 ? exactLoopLen : (endSample - startSample);
+            exactLoopLen = oldExact * oldBpm / bpm;
+            endSample = startSample + Math.round(exactLoopLen);
             if (endSample > totalFrames) endSample = totalFrames;
             if (endSample < startSample + 1) endSample = startSample + 1;
             syncMarkersToDs();
@@ -7354,7 +7367,8 @@ globalThis.tick = function() {
                 if (_psr.tempoPercent !== undefined) {
                     tempoPercent = _psr.tempoPercent;
                     if (syncMode) {
-                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample, 500);
+                        var _psrEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample + _psrEl, 500);
                     } else {
                         setParamBlocking("tempo", String(tempoPercent), 500);
                     }
