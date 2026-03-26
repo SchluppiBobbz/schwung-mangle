@@ -6074,7 +6074,15 @@ function handleCC(cc, value) {
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
-            adjustMarker(0, delta * step);
+            /* Move whole selection: start + end shift together, length stays fixed */
+            var _selLen = endSample - startSample;
+            var _newStart = startSample + delta * step;
+            if (_newStart < 0) _newStart = 0;
+            if (_newStart + _selLen > totalFrames) _newStart = totalFrames - _selLen;
+            if (_newStart < 0) _newStart = 0;
+            startSample = _newStart;
+            endSample  = _newStart + _selLen;
+            syncMarkersToDs();
             showKnobStatus(0, shiftHeld ? "S:" + startSample : "Start:" + formatTime(startSample));
             refreshWaveform();
         } else if (currentView === VIEW_LOOP) {
@@ -6140,8 +6148,13 @@ function handleCC(cc, value) {
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
             var step = shiftHeld ? 1 : getCoarseStep();
-            adjustMarker(1, delta * step);
-            showKnobStatus(1, shiftHeld ? "E:" + endSample : "End:" + formatTime(endSample));
+            /* Adjust length: end moves, start stays fixed */
+            var _freeNewLen = (endSample - startSample) + delta * step;
+            if (_freeNewLen < 1) _freeNewLen = 1;
+            endSample = startSample + _freeNewLen;
+            if (endSample > totalFrames) endSample = totalFrames;
+            syncMarkersToDs();
+            showKnobStatus(1, shiftHeld ? "Len:" + (endSample - startSample) : "Len:" + formatTime(endSample - startSample));
             refreshWaveform();
         } else if (currentView === VIEW_LOOP) {
             var step = shiftHeld ? 1 : getLoopCoarseStep();
@@ -6421,6 +6434,10 @@ function handleCC(cc, value) {
             host_module_set_param("tempo", String(tempoPercent));
             bpm = Math.round(globalBpm * tempoPercent / 100 * 10) / 10;
             showKnobStatus(7, "Tempo:" + tempoPercent + "% BPM:" + bpm.toFixed(1));
+            if (currentView === VIEW_FREE) {
+                knobStatusMsg[0] = "Start:" + formatTime(startSample);
+                knobStatusMsg[1] = "Len:" + formatTime(endSample - startSample);
+            }
             return;
         }
     }
