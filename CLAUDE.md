@@ -85,11 +85,22 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 - MoveRow1-4 (CC 43,42,41,40): select track (second press = toggle play)
 - Shift+MoveRow: open file browser for that track
 - MovePlay (CC 85): start/stop ALL loaded tracks
+- MoveBack: no action in main view (exit removed; use Menu → Minimize)
+- Shift+MoveBack: stop all playing scenes (`play_all=0` + clear UI state)
+- MoveMenu: open project menu (Save Project / Switch Project / Minimize / Close)
+
+**Scene pad model (4 states):**
+- Inactive → **Selected** (Shift+Pad, no DSP file load, no launch)
+- Selected → **Cue** (Pad press while sync+transport: queued for bar boundary)
+- Selected → **Active** (Pad press, immediate)
+- Active → **Inactive** (Pad press on playing scene in Trigger mode)
+- Pad mode (Gate/OneShot): always immediate launch, no selection step
 
 **LEDs:**
 - Track LEDs: Green=playing, WhiteBright=active, WhiteDim=loaded, Black=empty
 - Play LED: Green if any track playing
 - Step 1: PaleGreen = FREE active, BrightOrange = SYNC active
+- Cue LED: VividYellow flashing on pending pad (`dspQueuedPlayScene` or `pendingSceneSwitch`)
 
 **Header:** Shows `T1`..`T4` prefix + gate indicator `G`
 

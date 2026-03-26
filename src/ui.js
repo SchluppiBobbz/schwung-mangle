@@ -600,6 +600,13 @@ function saveTrackUIState(idx) {
 function saveCurrentSceneState(trackIdx) {
     var ts = trackStates[trackIdx];
     var idx = ts.playingSceneIdx;
+    /* When the active track is in background-edit mode the globals reflect
+     * selectedSceneIdx, not playingSceneIdx — save to the right scene. */
+    if (trackIdx === activeTrack
+            && ts.selectedSceneIdx !== ts.playingSceneIdx
+            && ts.selectedSceneIdx >= 0 && ts.selectedSceneIdx < ts.scenes.length) {
+        idx = ts.selectedSceneIdx;
+    }
     if (idx < 0 || idx >= ts.scenes.length) return;
     var sc = ts.scenes[idx];
     /* For the active track, globals ARE the live state; for inactive tracks
@@ -846,11 +853,11 @@ var jogShiftMenuItems = ["Paste (insert)", "Paste (overwrite)", "Export"];
 var jogShiftMenuIndex = 0;
 
 /* Main menu (MoveMenu button) */
-var mainMenuItems = ["Save Project", "Switch Project", "Close"];
+var mainMenuItems = ["Save Project", "Switch Project", "Minimize", "Close"];
 var mainMenuIndex = 0;
 var mainMenuReturnView = VIEW_FREE;
 
-/* Close confirmation dialog (Shift+Back) */
+/* Close confirmation dialog (Menu → Close) */
 var closeDialogItems = ["Save & Close", "Discard & Close", "Cancel"];
 var closeDialogIndex = 0;
 var closeDialogReturnView = VIEW_FREE;
@@ -1049,6 +1056,35 @@ function saveProjectJson() {
     }
     if (typeof host_write_file === "function") {
         host_write_file(projectDir + "/project.json", JSON.stringify(d));
+    }
+}
+
+/**
+ * Read scene arrays from project.json without sending any DSP params.
+ * Used during reconnect to restore scene lists when DSP scene_state is volatile.
+ */
+function loadScenesFromProjectJson() {
+    if (!projectDir || projectDir === "_no_project") return false;
+    if (typeof host_read_file !== "function") return false;
+    var raw = host_read_file(projectDir + "/project.json");
+    if (!raw || raw.length < 2) return false;
+    try {
+        var d = JSON.parse(raw);
+        for (var _lt = 0; _lt < NUM_TRACKS; _lt++) {
+            var td = (d.tracks && d.tracks[_lt]) || {};
+            var ts = trackStates[_lt];
+            var _rawScenes = td.scenes || [];
+            ts.scenes = _rawScenes.map(function(sc) {
+                if (typeof sc === "string") return makeSceneState(sc);
+                return sc;
+            });
+            ts.playingSceneIdx  = (td.playingSceneIdx !== undefined) ? td.playingSceneIdx : -1;
+            ts.selectedSceneIdx = ts.scenes.length;
+            if (ts.selectedSceneIdx >= MAX_SCENES) ts.selectedSceneIdx = MAX_SCENES - 1;
+        }
+        return true;
+    } catch (e) {
+        return false;
     }
 }
 
@@ -1670,20 +1706,6 @@ function getBeatStepSamples() {
 }
 
 /**
- * Snap sample count down to the nearest musical division:
- * whole bar (≥1 bar), whole beat (≥1 beat), or whole sixteenth note.
- */
-function snapLengthFloor(samples) {
-    var samplesPerQuarter = sampleRate / (bpm / 60.0);
-    var bar      = Math.round(samplesPerQuarter * 4);
-    var beat     = Math.round(samplesPerQuarter);
-    var sixteenth = Math.max(1, Math.round(samplesPerQuarter / 4));
-    if (samples >= bar)  return Math.floor(samples / bar)  * bar;
-    if (samples >= beat) return Math.floor(samples / beat) * beat;
-    return Math.max(sixteenth, Math.floor(samples / sixteenth) * sixteenth);
-}
-
-/**
  * Detect BPM from the current filename and snap end marker to the nearest beat step.
  * Returns true if a valid BPM was found.
  */
@@ -1699,8 +1721,6 @@ function detectBpmFromFilename() {
     bpm = Math.round(detectedBpm * 10) / 10;
     syncMode = true;
     tempoPercent = Math.round(globalBpm / bpm * 100);
-    var snapped = snapLengthFloor(endSample - startSample);
-    endSample = startSample + Math.max(1, snapped);
     if (endSample > totalFrames) endSample = totalFrames;
     syncMarkersToDs();
     syncSyncModeToDs();
@@ -1818,6 +1838,14 @@ function adjustMarker(field, deltaSamples) {
  * in overtake mode where rapid sequential calls overwrite each other.
  */
 function syncMarkersToDs() {
+    var _tsMk = trackStates[activeTrack];
+    if (_tsMk.selectedSceneIdx !== _tsMk.playingSceneIdx
+            && _tsMk.selectedSceneIdx >= 0 && _tsMk.selectedSceneIdx < _tsMk.scenes.length) {
+        /* Background-edit mode: persist markers in scene object, skip DSP */
+        _tsMk.scenes[_tsMk.selectedSceneIdx].startSample = startSample;
+        _tsMk.scenes[_tsMk.selectedSceneIdx].endSample   = endSample;
+        return;
+    }
     host_module_set_param("markers", startSample + "," + endSample);
 }
 
@@ -1917,15 +1945,19 @@ function loadFileIntoEditor(filePath, loadEditMode) {
     /* Auto-detect BPM from filename when SYNC editMode is active.
      * detectBpmFromFilename() sets syncMode=true and tempoPercent on success.
      * Falls back to globalBpm if no BPM found in filename. */
-    var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
-    if (_targetMode === VIEW_SYNC) {
-        if (!detectBpmFromFilename()) {
-            bpm = globalBpm;
-            tempoPercent = 100;
-            host_module_set_param("tempo", "100");
-        }
-        switchView(VIEW_SYNC);
+    // var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
+    // if (_targetMode === VIEW_SYNC) {
+    if (!detectBpmFromFilename()) {
+        bpm = globalBpm;
+        tempoPercent = 100;
+        host_module_set_param("tempo", "100");
     }
+    // switchView(VIEW_SYNC);
+    // }
+    beatDivIndex = 5; /* 1/4 */
+    var samplesPerBar = Math.round(sampleRate * 60.0 / bpm * 4);
+    endSample = startSample + samplesPerBar;
+    syncMarkersToDs();
     refreshWaveform();
     refreshState();
     /* Update track state */
@@ -5082,22 +5114,22 @@ function handleCC(cc, value) {
 
     /* Back button */
     if (cc === CC_BACK && value > 0) {
-        /* Shift+Back: show Save/Discard/Cancel dialog before closing */
+        /* Shift+Back: stop all playing scenes */
         if (shiftHeld) {
-            closeDialogIndex = 0;
-            closeDialogReturnView = currentView;
-            switchView(VIEW_CONFIRM_CLOSE);
-            return;
-        }
-        /* During recording/paused/record-ready, just hide — DSP keeps recording */
-        if (recordState === "recording" || recordState === "ready" || recordState === "paused") {
-            exitEditor();
+            host_module_set_param("play_all", "0");
+            dspQueuedPlayTrack = -1;
+            dspQueuedPlayScene = -1;
+            for (var _ti3 = 0; _ti3 < NUM_TRACKS; _ti3++) {
+                trackStates[_ti3].playing = false;
+            }
+            showStatus("Stop All", 30);
+            updateLeds();
             return;
         }
         switch (currentView) {
             case VIEW_FREE:
             case VIEW_LOOP:
-                exitEditor();
+                /* Back in main view — no exit (use Menu → Minimize) */
                 break;
             case VIEW_SLICE:
                 if (sliceMode === SLICE_MODE_LAZY && lazyChopping) {
@@ -5114,13 +5146,12 @@ function handleCC(cc, value) {
                     updateSlicePadLeds();
                     showStatus("Chop done, " + sliceCount + " slices", 30);
                 } else {
-                    /* Hide — persist slice state to DSP for reconnect */
                     saveSliceState();
-                    exitEditor();
+                    switchView(VIEW_FREE);
                 }
                 break;
             case VIEW_MODE_MENU:
-                exitEditor();
+                switchView(VIEW_FREE);
                 break;
             case VIEW_CONFIRM_EXIT:
                 switchView(VIEW_FREE);
@@ -5797,7 +5828,10 @@ function handleCC(cc, value) {
                         saveProjectJson();
                         initProjectBrowser();
                         break;
-                    case 2: /* Close */
+                    case 2: /* Minimize */
+                        exitEditor();
+                        break;
+                    case 3: /* Close */
                         closeDialogIndex = 0;
                         closeDialogReturnView = mainMenuReturnView;
                         switchView(VIEW_CONFIRM_CLOSE);
@@ -6197,7 +6231,14 @@ function handleCC(cc, value) {
                 gainDb += delta * GAIN_STEP;
                 if (gainDb < GAIN_MIN) gainDb = GAIN_MIN;
                 if (gainDb > GAIN_MAX) gainDb = GAIN_MAX;
-                host_module_set_param("gain_db", gainDb.toFixed(1));
+                var _tsGn = trackStates[activeTrack];
+                if (_tsGn.selectedSceneIdx !== _tsGn.playingSceneIdx
+                        && _tsGn.selectedSceneIdx >= 0 && _tsGn.selectedSceneIdx < _tsGn.scenes.length) {
+                    /* Background-edit mode: persist gain in scene object, skip DSP */
+                    _tsGn.scenes[_tsGn.selectedSceneIdx].gainDb = gainDb;
+                } else {
+                    host_module_set_param("gain_db", gainDb.toFixed(1));
+                }
                 showKnobStatus(4, "Gain:" + formatDb(gainDb));
                 invalidateWaveform();
             }
@@ -6540,6 +6581,29 @@ function handleNote(note, velocity) {
                         }
                         copyPendingAction = false;
                     } else {
+                        /* Shift+Pad: select scene for editing without interrupting playback.
+                         * Globals are updated to the selected scene's stored data so that
+                         * marker/gain edits target that scene (saved in memory, sent to DSP
+                         * on launch). The DSP keeps the playing scene loaded. */
+                        if (shiftHeld) {
+                            var _ts2s = trackStates[activeTrack];
+                            if (padIdx < _ts2s.scenes.length) {
+                                /* Flush edits to the currently selected scene before switching */
+                                if (_ts2s.selectedSceneIdx >= 0 && _ts2s.selectedSceneIdx < _ts2s.scenes.length) {
+                                    copySceneFields(getGlobalsAsSceneSource(), _ts2s.scenes[_ts2s.selectedSceneIdx]);
+                                }
+                                _ts2s.selectedSceneIdx = padIdx;
+                                /* Restore the new scene's data into globals for display/editing */
+                                restoreSceneToGlobals(_ts2s.scenes[padIdx]);
+                                showStatus("P" + (padIdx + 1), 30);
+                            } else {
+                                /* Empty slot — arm */
+                                _ts2s.selectedSceneIdx = padIdx;
+                                showStatus("P" + (padIdx + 1), 30);
+                            }
+                            updateLeds();
+                            return;
+                        }
                         var _ts2 = trackStates[activeTrack];
                         var _isSameScene = (_ts2.playingSceneIdx === padIdx && _ts2.playing);
                         /* For a different scene, use the TARGET scene's gateMode so the
@@ -6554,15 +6618,9 @@ function handleNote(note, velocity) {
                                 stopPlayback();
                                 _ts2.playingSceneIdx = -1;
                                 showStatus("Stop", 20);
-                            } else if (padIdx >= _ts2.scenes.length || padIdx === _ts2.selectedSceneIdx) {
-                                /* Empty pad (arm) or already Selected → launch / cue */
-                                launchScene(activeTrack, padIdx, transportPlaying);
                             } else {
-                                /* First press on filled, unselected scene → Select (no launch).
-                                 * 4-state model: Inactive → Selected → Cue/Active */
-                                _ts2.selectedSceneIdx = padIdx;
-                                showStatus("P" + (padIdx + 1), 30);
-                                updateLeds();
+                                /* Direct launch / cue — scene selection via Shift+Pad */
+                                launchScene(activeTrack, padIdx, transportPlaying);
                             }
                         } else if (_padMode2 === PAD_MODE_ONESHOT) {
                             if (_isSameScene) {
@@ -6770,6 +6828,11 @@ function doReconnectRestore() {
         var _rcMuted = host_module_get_param(_rcp + "muted");
         _rcts.muted = (_rcMuted === "1");
     }
+
+    /* Load scene lists from project.json as baseline — DSP scene_state is
+     * volatile and empty after a UI restart. restoreSceneState below will
+     * override with in-memory DSP state if available (e.g. unsaved edits). */
+    loadScenesFromProjectJson();
 
     /* Restore scene state (bpm, syncMode, tempoPercent, beatDivIndex) from the
      * playing scene — these aren't surfaced as individual DSP params so we pull

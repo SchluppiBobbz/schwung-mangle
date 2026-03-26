@@ -83,8 +83,9 @@
         "  audition selection",
         "  release to stop",
         "",
-        "Shift+Pad: preview",
-        "  near end marker",
+        "Shift+Pad: select",
+        "  scene without",
+        "  launching it",
         "",
         "E7 touch+twist: toggle",
         "  loop mode on/off",
@@ -242,8 +243,8 @@
         "  to resume. You can",
         "  leave and return.",
         "",
-        "Back: cancel and",
-        "  return to browser"
+        "Back: no action",
+        "  during recording"
       ]
     },
     {
@@ -263,11 +264,22 @@
         "  One Shot",
         "  (saved per scene)",
         "",
+        "4 scene states:",
+        "  Inactive → Selected",
+        "  → Cue → Active",
+        "Shift+Pad: Select",
+        "  (no launch)",
+        "Pad: launch/stop",
+        "",
         "Trigger: press to",
-        "  play/stop toggle",
+        "  launch; re-press to",
+        "  stop",
         "Gate: play while held",
         "One Shot: always",
         "  restarts on press",
+        "",
+        "Shift+Back: stop all",
+        "  playing scenes",
         "",
         "Step 5: Clock Sync",
         "Shift+Step5: quantize",
@@ -302,10 +314,16 @@
         "  Samples/Move Everything",
         "  /Recordings",
         "",
-        "Back: hide (keeps DSP",
-        "  alive). Close Session",
-        "  from menu to fully",
-        "  exit."
+        "Menu button:",
+        "  Save Project",
+        "  Switch Project",
+        "  Minimize (hide,",
+        "    DSP stays alive)",
+        "  Close (fully exit)",
+        "",
+        "Back: no action in",
+        "  main view.",
+        "Shift+Back: stop all."
       ]
     }
   ]

@@ -41,6 +41,9 @@ cd schwung-mangle
 | MoveRow 1–4 | Select active track (press again to toggle play/stop) |
 | Shift+MoveRow | Open file browser for that track |
 | Play | Start/stop ALL loaded tracks |
+| Back | No action in main view (use Menu → Minimize to hide) |
+| Shift+Back | Stop all playing scenes immediately |
+| Menu | Open project menu: Save Project / Switch Project / Minimize / Close |
 
 ### View Selection (Step Buttons)
 
@@ -90,11 +93,21 @@ cd schwung-mangle
 | Up | Estimate BPM from selection (assumes 1 bar, 4/4) |
 | Left/Right | Move entire selection by one division |
 
+### Scene Pads
+
+| Input | Action |
+|-------|--------|
+| Pad | Launch / cue scene (stop if already playing in Trigger mode) |
+| Shift+Pad | **Select** scene without launching it |
+| Pad (second press on selected) | Launch / cue the selected scene |
+
+Scenes have four states: **Inactive** → **Selected** (Shift+Pad) → **Cue** (pending bar boundary) → **Active** (playing). Pressing a playing pad stops it.
+
 ### Pad Modes (Step 4 cycles)
 
 | Mode | LED | Behaviour |
 |------|-----|-----------|
-| Trigger | DarkGrey | Press to start; press playing pad to stop |
+| Trigger | DarkGrey | Press to launch; press playing pad to stop |
 | Gate | BrightRed | Plays only while pad is held |
 | One Shot | VividYellow | Always restarts from start on press; loop setting respected |
 
