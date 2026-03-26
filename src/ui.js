@@ -744,8 +744,11 @@ function switchToTrack(idx) {
     /* Save current state */
     saveTrackUIState(activeTrack);
     activeTrack = idx;
-    /* Tell DSP which track is active */
-    host_module_set_param("active_track", String(idx));
+    /* Tell DSP which track is active — MUST be blocking so that
+     * subsequent get_param("file_info") reads from the correct track.
+     * Non-blocking set_param uses a single shared-memory slot and may
+     * not be processed before the next get_param call. */
+    setParamBlockingWithBarrier("active_track", String(idx), 500);
     /* Restore UI state for new track */
     restoreTrackUIState(idx);
     /* Force waveform refresh */
@@ -3349,6 +3352,12 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "gate_mode", String((scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER), 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
+        /* Send play command for non-active track — previously missing, so DSP
+         * never started playback even though ts.playing was set in JS.
+         * Use play_now for immediate launches, play for DSP-queued (bar quantize). */
+        if (autoPlay) {
+            setParamBlocking(_tp + (immediate ? "play_now" : "play"), "selection", 500);
+        }
     }
     if (autoPlay) {
         ts.playing = true;
@@ -3374,7 +3383,7 @@ function sendBeatsPerBarForQuantize() {
         case QUANT_BAR:
         default:          bpb = 4;  break;
     }
-    host_module_set_param("beats_per_bar", String(bpb));
+    setParamBlocking("beats_per_bar", String(bpb), 500);
 }
 
 /**
@@ -3430,7 +3439,7 @@ function launchScene(trackIdx, sceneIdx, autoPlay) {
             /* Second press of same scene while DSP play is pending — force immediate */
             dspQueuedPlayTrack = -1;
             dspQueuedPlayScene = -1;
-            host_module_set_param("t" + trackIdx + ":play_now", "selection");
+            setParamBlocking("t" + trackIdx + ":play_now", "selection", 500);
             ts.playing = true;
             if (trackIdx === activeTrack) playing = true;
         } else {
@@ -5118,7 +5127,7 @@ function handleCC(cc, value) {
                 if (_t !== activeTrack) {
                     saveTrackUIState(activeTrack);
                     activeTrack = _t;
-                    host_module_set_param("active_track", String(_t));
+                    setParamBlockingWithBarrier("active_track", String(_t), 500);
                     restoreTrackUIState(_t);
                 }
                 /* Enter file browser — open in last used folder for this track */
@@ -6505,7 +6514,10 @@ function handleNote(note, velocity) {
             updateLeds();
         } else {
             syncEnabled = !syncEnabled;
-            host_module_set_param("sync_clock", syncEnabled ? "1" : "0");
+            /* MUST be blocking — sendBeatsPerBarForQuantize() below sends
+             * another param immediately; non-blocking would be overwritten
+             * in the single shared-memory slot before DSP processes it. */
+            setParamBlocking("sync_clock", syncEnabled ? "1" : "0", 500);
             if (syncEnabled) sendBeatsPerBarForQuantize();
             announce(syncEnabled ? "Sync On" : "Sync Off");
             showStatus(syncEnabled ? "Sync On" : "Sync Off", 60);
@@ -7153,11 +7165,13 @@ globalThis.tick = function() {
                 if (transportPlaying) {
                     /* transportPlayingTimestamp and lastBarCount already reset above */
                     /* Only start tracks that have an active scene — not all loaded tracks.
-                     * Use play_now: transport just started (bar 1 = immediate), no DSP queue. */
+                     * Use play_now: transport just started (bar 1 = immediate), no DSP queue.
+                     * MUST use blocking calls — non-blocking calls use a single shared-memory
+                     * slot and only the last one would survive when sent in a loop. */
                     for (var _ti = 0; _ti < NUM_TRACKS; _ti++) {
                         var _tts = trackStates[_ti];
                         if (_tts.loaded && _tts.playingSceneIdx >= 0) {
-                            host_module_set_param("t" + _ti + ":play_now", "selection");
+                            setParamBlocking("t" + _ti + ":play_now", "selection", 500);
                             _tts.playing = true;
                         }
                     }
