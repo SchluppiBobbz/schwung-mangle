@@ -3202,6 +3202,14 @@ static int render_track(track_t *t, int16_t *out, int frames) {
     int region_len = play_end - play_start;
     int produced = 0;
 
+    /* Exact loop endpoint: when loop_len_exact is set, the musical loop length
+     * may be fractionally longer or shorter than the integer region_len.
+     * Use the exact endpoint for wrap checks to avoid drift and prevent
+     * infinite-reset loops when loop_len_exact > region_len. */
+    double loop_end = (t->loop_len_exact > 0.0)
+                      ? (double)play_start + t->loop_len_exact
+                      : (double)play_end;
+
     if (!use_bungee) {
         /* Direct playback path (no pitch/tempo change) */
         for (int i = 0; i < frames; i++) {
@@ -3211,10 +3219,9 @@ static int render_track(track_t *t, int16_t *out, int frames) {
                 continue;
             }
 
-            while (t->play_pos_frac >= (double)play_end) {
+            while (t->play_pos_frac >= loop_end) {
                 if (t->play_loop && region_len > 0) {
-                    double wrap_len = (t->loop_len_exact > 0.0) ? t->loop_len_exact : (double)region_len;
-                    t->play_pos_frac -= wrap_len;
+                    t->play_pos_frac -= (loop_end - (double)play_start);
                 } else {
                     t->playing = 0;
                     break;
@@ -3228,6 +3235,7 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             }
 
             int pos_int = (int)t->play_pos_frac;
+            if (pos_int >= play_end) pos_int = play_end - 1; /* clamp for exact loop overshoot */
             float frac = (float)(t->play_pos_frac - (double)pos_int);
             int next = pos_int + 1;
             if (next >= play_end) {
@@ -3262,9 +3270,9 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         int safety = 256;
         while (t->bng_out_count < frames && safety-- > 0) {
             /* Handle loop wrap */
-            if (t->bng_req.position >= (double)play_end) {
+            if (t->bng_req.position >= loop_end) {
                 if (t->play_loop && region_len > 0) {
-                    double wrap_len = (t->loop_len_exact > 0.0) ? t->loop_len_exact : (double)region_len;
+                    double wrap_len = loop_end - (double)play_start;
                     double wrapped = (double)play_start +
                         fmod(t->bng_req.position - (double)play_start, wrap_len);
                     if (wrapped < (double)play_start) wrapped = (double)play_start;
