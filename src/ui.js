@@ -325,8 +325,8 @@ var bpm = 120.0;
 var exactLoopLen = 0;      /* exact musical loop length in input samples (float); 0 = use integer (endSample-startSample) */
 var globalBpm = 120;       /* project BPM from host, default 120 */
 var syncMode = false;      /* true when active scene/file uses BPM sync */
-var lastProjectBpm = 0;     /* last samplerBpm pushed to DSP — tracks changes */
-var bpmSetLocally = 0;      /* tick count when BPM was set via knob — suppress overlay overwrite */
+var lastProjectBpm = 0;     /* dedup: last overlay BPM applied — only used when lockBpmToProject=true */
+var lockBpmToProject = false; /* if true, tick block follows overlay samplerBpm; default: Mangle owns BPM */
 /* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
 var injectQueue = [];
 var lastInjectTime = 0;
@@ -1052,7 +1052,7 @@ function saveProjectJson() {
     /* Flush active track's current editor state into trackStates and scene */
     saveTrackUIState(activeTrack);
     saveCurrentSceneState(activeTrack);
-    var d = { version: 1, activeTrack: activeTrack, tracks: [] };
+    var d = { version: 1, activeTrack: activeTrack, globalBpm: globalBpm, lockBpmToProject: lockBpmToProject, tracks: [] };
     for (var _st = 0; _st < NUM_TRACKS; _st++) {
         d.tracks.push({
             scenes:           trackStates[_st].scenes,
@@ -1131,10 +1131,7 @@ function initGlobalBpmFromOverlay() {
     var _ov = shadow_get_overlay_state();
     if (_ov && typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0) {
         globalBpm = Math.round(_ov.samplerBpm * 10) / 10;
-        if (globalBpm !== lastProjectBpm) {
-            host_module_set_param("project_bpm", String(globalBpm));
-            lastProjectBpm = globalBpm;
-        }
+        lastProjectBpm = globalBpm;  /* prime dedup so lock-mode doesn't fire immediately */
     }
 }
 
@@ -1146,6 +1143,13 @@ function loadProjectJson() {
     if (!raw || raw.length < 2) return false;
     try {
         var d = JSON.parse(raw);
+        if (typeof d.globalBpm === "number" && d.globalBpm >= 20 && d.globalBpm <= 999) {
+            globalBpm = d.globalBpm;
+            lastProjectBpm = globalBpm;
+        }
+        if (typeof d.lockBpmToProject === "boolean") {
+            lockBpmToProject = d.lockBpmToProject;
+        }
         var _savedActiveTrack = (d.activeTrack !== undefined && d.activeTrack >= 0 && d.activeTrack < NUM_TRACKS)
             ? d.activeTrack : 0;
 
@@ -3106,7 +3110,7 @@ function drawSyncView() {
     fill_rect(0, 0, SCREEN_W, 10, 0);
     print(0, 0, bpmHeader, 1);
     var nameX = (bpmHeader.length + 1) * 6;
-    var gbStr = globalBpm.toFixed(0) + "B";
+    var gbStr = globalBpm.toFixed(0) + (lockBpmToProject ? "~" : "B");
     var maxNameW = SCREEN_W - nameX - gbStr.length * 6 - 6;
     var maxNameChars = Math.floor(maxNameW / 6);
     if (maxNameChars > 0) print(nameX, 0, truncate(fileName, maxNameChars), 1);
@@ -6336,8 +6340,7 @@ function handleCC(cc, value) {
             if (newBpm < 20) newBpm = 20;
             if (newBpm > 999) newBpm = 999;
             globalBpm = newBpm;
-            lastProjectBpm = newBpm;
-            bpmSetLocally = tickFrame + 30;  /* suppress overlay overwrite for ~30 ticks (~500ms) */
+            lastProjectBpm = newBpm;   /* prevent lock-mode tick from immediately reverting */
             host_module_set_param("project_bpm", String(newBpm));
             updateSyncTempoAllTracks();
             showKnobStatus(5, "Global BPM:" + newBpm.toFixed(1));
@@ -7207,16 +7210,17 @@ globalThis.tick = function() {
                     saveProjectJson();
                 }
             }
-            /* Push BPM to DSP when changed; recalculate tempo for all SYNC scenes.
-             * Skip if BPM was recently set locally via knob (avoid overlay overwrite race). */
-            var _ovBpmRounded = (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0)
-                ? Math.round(_ov.samplerBpm * 10) / 10 : 0;
-            if (_ovBpmRounded > 0 && _ovBpmRounded !== lastProjectBpm
-                && tickFrame > bpmSetLocally) {
-                lastProjectBpm = _ovBpmRounded;
-                globalBpm = _ovBpmRounded;
-                host_module_set_param("project_bpm", String(_ovBpmRounded));
-                updateSyncTempoAllTracks();
+            /* When lockBpmToProject is true, follow overlay samplerBpm changes.
+             * Default: Mangle owns globalBpm — overlay does not overwrite it. */
+            if (lockBpmToProject) {
+                var _ovBpmRounded = (typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0)
+                    ? Math.round(_ov.samplerBpm * 10) / 10 : 0;
+                if (_ovBpmRounded > 0 && _ovBpmRounded !== lastProjectBpm) {
+                    lastProjectBpm = _ovBpmRounded;
+                    globalBpm = _ovBpmRounded;
+                    host_module_set_param("project_bpm", String(_ovBpmRounded));
+                    updateSyncTempoAllTracks();
+                }
             }
         }
     }

@@ -81,6 +81,16 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 - DSP `sync_tempo` param updates `start_sample`, `end_sample`, `sync_play_end`, `bng_play_end`, and `bng_req.speed` atomically — no stretcher reset during playback so loop boundary takes effect on the next audio block
 - E1: start marker (bars:beats, Shift: cycle beat division), E2: length (bars:beats), E8: scene BPM
 
+**Global BPM (Shift+E6):**
+- `globalBpm` is owned by Mangle — the overlay's `samplerBpm` does NOT overwrite it automatically
+- On module load: initialized from overlay as starting reference (`initGlobalBpmFromOverlay`)
+- Shift+E6 changes `globalBpm` locally and sends `host_module_set_param("project_bpm", ...)` to the shim
+- The shim writes `/tmp/link-tempo`; the `link-subscriber` process polls it every 500ms and propagates the new tempo to the Ableton Link session → Move hardware metronome follows
+- `lockBpmToProject` (default `false`): if `true`, the tick block re-enables overlay → `globalBpm` sync (old behavior)
+- `globalBpm` and `lockBpmToProject` are persisted in `project.json`
+- Header shows `<bpm>B` (Mangle-owned) or `<bpm>~` (locked to project BPM)
+- **Requires:** `link_audio_enabled: true` in `features.json` and `link-subscriber` running (started automatically by shim)
+
 **Button mapping:**
 - MoveRow1-4 (CC 43,42,41,40): select track (second press = toggle play)
 - Shift+MoveRow: open file browser for that track
@@ -107,3 +117,4 @@ Shadow UI creates exactly **one DSP instance** per tool module. All 4 tracks liv
 ### Known Issues / Not Yet Tested
 - Clock sync parameter is wired but MIDI clock tracking in `on_midi` is minimal
 - Gate mode pad hold/release needs hardware verification
+- `lockBpmToProject` toggle has no UI gesture yet (wired, persisted, but always `false` by default)
