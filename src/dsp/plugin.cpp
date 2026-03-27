@@ -1416,6 +1416,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             if (t->audio_data && e > t->audio_frames) e = t->audio_frames;
             t->start_sample = s;
             t->end_sample = e;
+            /* Also update Bungee playback boundaries so the loop respects the
+             * new markers immediately without waiting for a play restart.
+             * Clear sync_play_end so the Bungee path uses end_sample directly. */
+            t->sync_play_end = 0;
+            t->bng_play_start = s;
+            t->bng_play_end = e;
         }
         return;
     }
@@ -1662,6 +1668,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (v > 300) v = 300;
         t->tempo_percent = v;
         t->sync_play_end = 0; /* FREE mode: disable SYNC loop boundary */
+        t->tempo_speed_precise = 0.0; /* clear SYNC precise speed so recompute_ratios uses tempo_percent */
         recompute_ratios(t);
         /* Sync Bungee state to current playback position so the transition
          * from direct path to Bungee path is seamless. */

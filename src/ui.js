@@ -1106,18 +1106,30 @@ function loadScenesFromProjectJson() {
 function updateSyncTempoAllTracks() {
     for (var _bi = 0; _bi < NUM_TRACKS; _bi++) {
         var _bts = trackStates[_bi];
+        /* For the active track, use live globals — the scene object may not have
+         * been saved yet (saveCurrentSceneState only runs on transport stop). */
+        if (_bi === activeTrack) {
+            if (bpm > 0 && (currentView === VIEW_SYNC || syncMode)) {
+                var _tpFull = Math.round(globalBpm / bpm * 100 * 10) / 10;
+                if (_tpFull < 30) _tpFull = 30;
+                if (_tpFull > 300) _tpFull = 300;
+                var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+                var _seA = endSample > 0 ? endSample : _bts.totalFrames;
+                host_module_set_param("sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
+                tempoPercent = _tpFull;
+            }
+            continue;
+        }
         var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
             ? _bts.scenes[_bts.playingSceneIdx] : null;
         if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
             var _tpFull = Math.round(globalBpm / _bsc.bpm * 100 * 10) / 10;
             if (_tpFull < 30) _tpFull = 30;
             if (_tpFull > 300) _tpFull = 300;
-            var _stkey = (_bi === activeTrack) ? "sync_tempo" : "t" + _bi + ":sync_tempo";
             var _ss = _bsc.startSample || 0;
-            var _se = (_bsc.endSample > 0) ? _bsc.endSample : trackStates[_bi].totalFrames;
+            var _se = (_bsc.endSample > 0) ? _bsc.endSample : _bts.totalFrames;
             var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(3) : "";
-            host_module_set_param(_stkey, _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
-            if (_bi === activeTrack) tempoPercent = _tpFull;
+            host_module_set_param("t" + _bi + ":sync_tempo", _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
         }
     }
 }
@@ -6080,6 +6092,8 @@ function handleCC(cc, value) {
                 var _curLen = endSample - startSample;
                 var _snapped = Math.max(1, Math.round(_curLen / _snapStep)) * _snapStep;
                 endSample = Math.min(startSample + _snapped, totalFrames);
+                exactLoopLen = endSample - startSample;
+                syncSyncModeToDs();
                 refreshWaveform();
                 return;
             }
@@ -6091,7 +6105,15 @@ function handleCC(cc, value) {
             if (_newStart < 0) _newStart = 0;
             startSample = _newStart;
             endSample   = _newStart + _selLen;
-            syncMarkersToDs();
+            var _e1bts = trackStates[activeTrack];
+            if (_e1bts.selectedSceneIdx !== _e1bts.playingSceneIdx
+                    && _e1bts.selectedSceneIdx >= 0 && _e1bts.selectedSceneIdx < _e1bts.scenes.length) {
+                /* Background-edit: persist to scene object, do not disturb playing DSP */
+                _e1bts.scenes[_e1bts.selectedSceneIdx].startSample = startSample;
+                _e1bts.scenes[_e1bts.selectedSceneIdx].endSample   = endSample;
+            } else {
+                syncSyncModeToDs();  /* sync_tempo covers start_sample + end_sample atomically */
+            }
             showKnobStatus(0, "Start:" + formatBarsBeats(startSample));
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
@@ -6162,11 +6184,14 @@ function handleCC(cc, value) {
                 var _curLen2 = endSample - startSample;
                 var _snapped2 = Math.max(1, Math.round(_curLen2 / _snapStep2)) * _snapStep2;
                 endSample = Math.min(startSample + _snapped2, totalFrames);
+                exactLoopLen = endSample - startSample;
+                syncSyncModeToDs();
                 refreshWaveform();
                 return;
             }
             adjustMarker(1, delta * getBeatStepSamples());
             exactLoopLen = endSample - startSample;  /* grid-snapped value resets fractional accumulation */
+            syncSyncModeToDs();
             showKnobStatus(1, "Len:" + formatBarsBeats(endSample - startSample));
             refreshWaveform();
         } else if (currentView === VIEW_FREE) {
@@ -6341,8 +6366,11 @@ function handleCC(cc, value) {
             if (newBpm > 999) newBpm = 999;
             globalBpm = newBpm;
             lastProjectBpm = newBpm;   /* prevent lock-mode tick from immediately reverting */
-            host_module_set_param("project_bpm", String(newBpm));
+            /* Send sync_tempo updates first, then project_bpm last — the shim reads
+             * project_bpm to update Ableton Link, and the queue slot must not be
+             * overwritten by subsequent sync_tempo calls. */
             updateSyncTempoAllTracks();
+            host_module_set_param("project_bpm", String(newBpm));
             showKnobStatus(5, "Global BPM:" + newBpm.toFixed(1));
             return;
         }       
@@ -6445,8 +6473,7 @@ function handleCC(cc, value) {
             endSample = startSample + Math.round(exactLoopLen);
             if (endSample > totalFrames) endSample = totalFrames;
             if (endSample < startSample + 1) endSample = startSample + 1;
-            syncMarkersToDs();
-            syncSyncModeToDs();
+            syncSyncModeToDs();  /* sync_tempo covers start_sample + end_sample atomically */
             showKnobStatus(7, "BPM:" + bpm.toFixed(1) + " L:" + formatBarsBeats(endSample - startSample));
             return;
         }
@@ -7218,8 +7245,8 @@ globalThis.tick = function() {
                 if (_ovBpmRounded > 0 && _ovBpmRounded !== lastProjectBpm) {
                     lastProjectBpm = _ovBpmRounded;
                     globalBpm = _ovBpmRounded;
-                    host_module_set_param("project_bpm", String(_ovBpmRounded));
                     updateSyncTempoAllTracks();
+                    host_module_set_param("project_bpm", String(_ovBpmRounded));
                 }
             }
         }
