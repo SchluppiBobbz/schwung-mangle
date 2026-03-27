@@ -89,6 +89,7 @@ var VIEW_PROJECT  = 13;  /* Project folder selection at startup */
 var VIEW_MAIN_MENU = 14; /* MoveMenu button — main project menu */
 var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) */
 var VIEW_CONFIRM_RESUME = 16; /* Resume previous session or start new project */
+var VIEW_MODE_SELECT = 17;    /* Shift+Step1 mini-menu: Sync / Free / Varispeed */
 
 /* ============ Debug Logging ============ */
 /* Set to true to enable debug logging to /tmp/scene_debug.log on device.
@@ -251,7 +252,7 @@ var VSCALE_STEP = 0.25; /* multiplicative: scale *= 2^step per tick */
 
 /* ============ State ============ */
 
-var currentView = VIEW_FREE;
+var currentView = VIEW_SYNC;    /* default view: SYNC */
 var editMode = VIEW_SYNC;       /* last FREE/SYNC mode selected; default SYNC */
 /* Sub-mode within SYNC: false=stretch (Bungee, pitch-stable), true=varispeed (repitch) */
 var varispeedEnabled = false;
@@ -429,7 +430,7 @@ function makeSceneState(path) {
         tempoPercent:    100,
         bpm:             bpm,
         beatDivIndex:    beatDivIndex,
-        syncMode:        (currentView === VIEW_SYNC),
+        syncMode:        (editMode === VIEW_SYNC),
         loopEnabled:     true,
         gateMode:        PAD_MODE_TRIGGER,
         sliceMode:       SLICE_MODE_EVEN,
@@ -754,6 +755,15 @@ function switchToTrack(idx) {
     setParamBlockingWithBarrier("active_track", String(idx), 500);
     /* Restore UI state for new track */
     restoreTrackUIState(idx);
+    /* Switch view to match the restored track's syncMode.
+     * Only switch between FREE/SYNC — don't disturb SLICE or LOOP views. */
+    if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
+        var _trackTargetView = syncMode ? VIEW_SYNC : VIEW_FREE;
+        if (currentView !== _trackTargetView) {
+            currentView = _trackTargetView;
+            editMode = _trackTargetView;
+        }
+    }
     /* Force waveform refresh */
     waveformDirty = true;
     seamWaveformDirty = true;
@@ -869,6 +879,11 @@ var mainMenuReturnView = VIEW_FREE;
 var closeDialogItems = ["Save & Close", "Discard & Close", "Cancel"];
 var closeDialogIndex = 0;
 var closeDialogReturnView = VIEW_FREE;
+
+/* Mode select mini-menu (Shift+Step1) */
+var modeSelectItems = ["Sync", "Free", "Varispeed"];
+var modeSelectIndex = 0;
+var modeSelectReturnView = VIEW_SYNC;
 
 /* Resume session dialog (shown on reconnect when a project is active) */
 var resumeItems = ["Resume", "New Project"];
@@ -1109,13 +1124,13 @@ function updateSyncTempoAllTracks() {
         /* For the active track, use live globals — the scene object may not have
          * been saved yet (saveCurrentSceneState only runs on transport stop). */
         if (_bi === activeTrack) {
-            if (bpm > 0 && (currentView === VIEW_SYNC || syncMode)) {
+            if (bpm > 0 && syncMode) {
                 var _tpFull = Math.round(globalBpm / bpm * 100 * 10) / 10;
                 if (_tpFull < 30) _tpFull = 30;
                 if (_tpFull > 300) _tpFull = 300;
                 var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
                 var _seA = endSample > 0 ? endSample : _bts.totalFrames;
-                host_module_set_param("sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
+                host_module_set_param_blocking("sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
                 tempoPercent = _tpFull;
             }
             continue;
@@ -1129,7 +1144,7 @@ function updateSyncTempoAllTracks() {
             var _ss = _bsc.startSample || 0;
             var _se = (_bsc.endSample > 0) ? _bsc.endSample : _bts.totalFrames;
             var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(3) : "";
-            host_module_set_param("t" + _bi + ":sync_tempo", _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
+            host_module_set_param_blocking("t" + _bi + ":sync_tempo", _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
         }
     }
 }
@@ -1923,7 +1938,7 @@ function syncMarkersToDs() {
 function syncSyncModeToDs() {
     var _tp = (globalBpm / bpm * 100).toFixed(1);
     var _el = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
-    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
+    host_module_set_param_blocking("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
 }
 
 /**
@@ -2007,21 +2022,28 @@ function loadFileIntoEditor(filePath, loadEditMode) {
     host_module_set_param("play_loop", "1");
     refreshFileInfo();
     waveformDirty = true;
-    /* Auto-detect BPM from filename when SYNC editMode is active.
-     * detectBpmFromFilename() sets syncMode=true and tempoPercent on success.
-     * Falls back to globalBpm if no BPM found in filename. */
-    // var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
-    // if (_targetMode === VIEW_SYNC) {
-    if (!detectBpmFromFilename()) {
-        bpm = globalBpm;
+    /* BPM detection and bar-snap only in SYNC mode.
+     * In FREE mode, use full file length with flat tempo. */
+    var _targetMode = (loadEditMode !== undefined) ? loadEditMode : editMode;
+    if (_targetMode === VIEW_SYNC) {
+        if (!detectBpmFromFilename()) {
+            bpm = globalBpm;
+            tempoPercent = 100;
+            host_module_set_param("tempo", "100");
+        }
+        syncMode = true;
+        beatDivIndex = 5; /* 1/4 */
+        var samplesPerBar = Math.round(sampleRate * 60.0 / bpm * 4);
+        endSample = startSample + samplesPerBar;
+        if (endSample > totalFrames && totalFrames > 0) endSample = totalFrames;
+    } else {
+        /* FREE mode: use full file, no BPM sync */
+        syncMode = false;
+        bpm = globalBpm;  /* informational only */
         tempoPercent = 100;
         host_module_set_param("tempo", "100");
+        endSample = totalFrames;
     }
-    // switchView(VIEW_SYNC);
-    // }
-    beatDivIndex = 5; /* 1/4 */
-    var samplesPerBar = Math.round(sampleRate * 60.0 / bpm * 4);
-    endSample = startSample + samplesPerBar;
     syncMarkersToDs();
     refreshWaveform();
     refreshState();
@@ -3022,6 +3044,83 @@ function drawConfirmResume() {
     }
 }
 
+/* ============ Drawing: Mode Select (Shift+Step1) ============ */
+
+function drawModeSelect() {
+    clear_screen();
+    printCentered(2, "Mode");
+    drawDivider(12);
+    var startY = 16;
+    var itemH = 14;
+    /* Show indicator next to the currently active mode */
+    var activeIdx = (editMode === VIEW_FREE) ? 1 : varispeedEnabled ? 2 : 0;
+    for (var i = 0; i < modeSelectItems.length; i++) {
+        var y = startY + i * itemH;
+        var label = modeSelectItems[i];
+        if (i === activeIdx) label = "\u2022 " + label;  /* bullet = active */
+        else label = "  " + label;
+        if (i === modeSelectIndex) {
+            fill_rect(0, y, SCREEN_W, itemH, 1);
+            print(6, y + 3, label, 0);
+        } else {
+            print(6, y + 3, label, 1);
+        }
+    }
+}
+
+/**
+ * Apply mode selection from the mini-menu.
+ * 0=Sync (stretch), 1=Free, 2=Varispeed
+ */
+function applyModeSelectChoice(idx) {
+    switch (idx) {
+        case 0: /* Sync (stretch) */
+            editMode = VIEW_SYNC;
+            varispeedEnabled = false;
+            syncMode = true;
+            break;
+        case 1: /* Free */
+            editMode = VIEW_FREE;
+            varispeedEnabled = false;
+            syncMode = false;
+            break;
+        case 2: /* Varispeed */
+            editMode = VIEW_SYNC;
+            varispeedEnabled = true;
+            syncMode = true;
+            break;
+    }
+    host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
+}
+
+/**
+ * Close mode-select menu and switch to the chosen editMode.
+ */
+function switchToEditMode() {
+    applyModeSelectChoice(modeSelectIndex);
+    leaveNonEditView();
+    switchView(editMode);
+}
+
+/**
+ * Clean up when leaving a non-edit view (SLICE, LOOP, MODE_SELECT) to return
+ * to an edit view (FREE/SYNC). Restores loop state from SLICE, etc.
+ */
+function leaveNonEditView() {
+    if (currentView === VIEW_SLICE) {
+        if (savedLoopState) {
+            loopEnabled = true;
+            host_module_set_param("play_loop", "1");
+        }
+        startSample = sliceBoundaries[0];
+        endSample = sliceBoundaries[sliceCount];
+        playPos = startSample;
+        host_module_set_param("slice_state", "");
+        syncMarkersToDs();
+    }
+    /* VIEW_MODE_SELECT and VIEW_LOOP need no special cleanup */
+}
+
 /* ============ Drawing: Confirm Save ============ */
 
 function drawConfirmSave() {
@@ -3264,7 +3363,7 @@ function switchView(view) {
 function menuSelect() {
     switch (menuIndex) {
         case 0: /* Edit */
-            switchView(VIEW_FREE);
+            switchView(editMode);
             break;
         case 1: /* Loop */
             switchView(VIEW_LOOP);
@@ -3336,6 +3435,16 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         openedFilePath   = scene.path;
         totalFrames      = 0;   /* reset — tick retry loop will refetch */
         waveformDirty    = true;
+
+        /* Switch view to match the scene's syncMode so display stays consistent.
+         * Only switch between FREE/SYNC — don't disturb SLICE or LOOP views. */
+        var _targetView = syncMode ? VIEW_SYNC : VIEW_FREE;
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
+            if (currentView !== _targetView) {
+                currentView = _targetView;
+                editMode = _targetView;
+            }
+        }
 
         /* Defer ALL DSP params until the file is confirmed loaded.
          * Sending non-blocking params before the blocking file_path
@@ -3491,9 +3600,13 @@ function removeScene(trackIdx, sceneIdx) {
 
     /* Stop playback if this scene is currently playing */
     if (ts.playingSceneIdx === sceneIdx && ts.playing) {
-        host_module_set_param("t" + trackIdx + ":stop", "1");
+        if (trackIdx === activeTrack) {
+            host_module_set_param("stop", "1");
+            playing = false;
+        } else {
+            host_module_set_param("t" + trackIdx + ":stop", "1");
+        }
         ts.playing = false;
-        if (trackIdx === activeTrack) playing = false;
     }
 
     ts.scenes.splice(sceneIdx, 1);
@@ -3993,10 +4106,10 @@ function normalizeSelect() {
     switch (normalizeIndex) {
         case 0: /* Normalize */
             doNormalize();
-            switchView(VIEW_FREE);
+            switchView(editMode);
             break;
         case 1: /* Cancel */
-            switchView(VIEW_FREE);
+            switchView(editMode);
             break;
     }
 }
@@ -5111,6 +5224,10 @@ function handleCC(cc, value) {
             beatDivPopupOpen = false;
             refreshWaveform();
         }
+        /* Close mode-select menu on Shift release — apply chosen mode */
+        if (!shiftHeld && currentView === VIEW_MODE_SELECT) {
+            switchToEditMode();
+        }
         return;
     }
 
@@ -5220,22 +5337,27 @@ function handleCC(cc, value) {
                     showStatus("Chop done, " + sliceCount + " slices", 30);
                 } else {
                     saveSliceState();
-                    switchView(VIEW_FREE);
+                    switchView(editMode);
                 }
                 break;
             case VIEW_MODE_MENU:
-                switchView(VIEW_FREE);
+                switchView(editMode);
                 break;
             case VIEW_CONFIRM_EXIT:
-                switchView(VIEW_FREE);
+                switchView(editMode);
                 break;
             case VIEW_CONFIRM_NORMALIZE:
-                switchView(VIEW_FREE);
+                switchView(editMode);
                 break;
             case VIEW_JOG_MENU:
             case VIEW_JOG_SHIFT_MENU:
+                switchView(editMode);
+                break;
             case VIEW_SYNC:
-                switchView(VIEW_FREE);
+                break;
+            case VIEW_MODE_SELECT:
+                /* Back = cancel, return to previous view */
+                switchView(modeSelectReturnView);
                 break;
             case VIEW_MAIN_MENU:
                 switchView(mainMenuReturnView);
@@ -5255,7 +5377,7 @@ function handleCC(cc, value) {
                 newProjectFileBrowser = false;
                 recordState = "ready";
                 recordLedCounter = 0;
-                currentView = VIEW_FREE;
+                currentView = editMode;
                 updateLeds();
                 announce("New Recording, press REC to record");
                 break;
@@ -5291,7 +5413,7 @@ function handleCC(cc, value) {
                         newProjectFileBrowser = false;
                         recordState = "ready";
                         recordLedCounter = 0;
-                        currentView = VIEW_FREE;
+                        currentView = editMode;
                         updateLeds();
                         announce("New Recording, press REC to record");
                     } else {
@@ -5400,7 +5522,7 @@ function handleCC(cc, value) {
                 showStatus("Zero-X found", 60);
             } else {
                 /* Loop button in loop view: return to trim */
-                switchView(VIEW_FREE);
+                switchView(editMode;
             }
         } else if (currentView === VIEW_SYNC) {
             if (shiftHeld) {
@@ -5783,6 +5905,15 @@ function handleCC(cc, value) {
                 announce(resumeItems[resumeDialogIndex]);
                 break;
 
+            case VIEW_MODE_SELECT:
+                /* Jog scrolls mode menu too (in addition to Shift+Step1) */
+                modeSelectIndex += delta;
+                if (modeSelectIndex < 0) modeSelectIndex = modeSelectItems.length - 1;
+                if (modeSelectIndex >= modeSelectItems.length) modeSelectIndex = 0;
+                updateLeds();
+                announce(modeSelectItems[modeSelectIndex]);
+                break;
+
             case VIEW_SYNC:
                 /* Jog scrolls viewport (same as VIEW_FREE when zoomed) */
                 if (zoomLevel > 0) {
@@ -5872,7 +6003,7 @@ function handleCC(cc, value) {
                     case 3: doTrim(); break;
                     case 4: doNormalizeSelection(); break;
                 }
-                switchView(VIEW_FREE);
+                switchView(editMode);
                 break;
 
             case VIEW_SYNC:
@@ -5887,7 +6018,7 @@ function handleCC(cc, value) {
                     case 1: doPasteOverwrite(); break;
                     case 2: doExport(); break;
                 }
-                switchView(VIEW_FREE);
+                switchView(editMode);
                 break;
 
             case VIEW_MAIN_MENU:
@@ -5938,6 +6069,11 @@ function handleCC(cc, value) {
                 }
                 break;
 
+            case VIEW_MODE_SELECT:
+                /* Jog click confirms selection and switches to the chosen mode */
+                switchToEditMode();
+                break;
+
             case VIEW_LOOP:
                 /* Toggle loop point / end field */
                 loopSelectedField = loopSelectedField === 0 ? 1 : 0;
@@ -5972,7 +6108,7 @@ function handleCC(cc, value) {
                         newProjectFileBrowser = false;
                         recordState = "ready";
                         recordLedCounter = 0;
-                        currentView = VIEW_FREE;
+                        currentView = editMode;
                         updateLeds();
                         announce("New Recording, press REC to record");
                     } else if (pItem) {
@@ -6004,7 +6140,7 @@ function handleCC(cc, value) {
                             } else {
                                 announce("Project " + pItem.label);
                             }
-                            currentView = VIEW_FREE;
+                            currentView = editMode;
                             updateLeds();
                         }
                     }
@@ -6026,7 +6162,7 @@ function handleCC(cc, value) {
                         recordState = "ready";
                         recordLedCounter = 0;
                         openFileBrowserState = null;
-                        switchView(VIEW_FREE);
+                        switchView(editMode);
                         announce("New Recording, press REC to record");
                         break;
                     }
@@ -6058,7 +6194,7 @@ function handleCC(cc, value) {
                         saveProjectJson();
                         openFileBrowserState = null;
                         var _prevEditMode = editMode;
-                        switchView(VIEW_FREE);
+                        switchView(editMode);
                         /* Use blocking load so file_info is valid immediately */
                         loadFileIntoEditor(result.value, _prevEditMode);
                         announce("Loaded " + fileName);
@@ -6370,7 +6506,7 @@ function handleCC(cc, value) {
              * project_bpm to update Ableton Link, and the queue slot must not be
              * overwritten by subsequent sync_tempo calls. */
             updateSyncTempoAllTracks();
-            host_module_set_param("project_bpm", String(newBpm));
+            host_module_set_param_blocking("project_bpm", String(newBpm));
             showKnobStatus(5, "Global BPM:" + newBpm.toFixed(1));
             return;
         }       
@@ -6640,46 +6776,37 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 cycles FREE→VARISPEED→STRETCH→FREE */
+    /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 = mode select mini-menu */
     if (velocity > 0 && note === STEP_BASE) {
         var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
-        if (editViews.indexOf(currentView) >= 0) {
+        if (editViews.indexOf(currentView) >= 0 || currentView === VIEW_MODE_SELECT) {
             if (shiftHeld) {
-                if (editMode === VIEW_FREE) {
-                    /* FREE → VARISPEED (SYNC sub-mode) */
-                    editMode = VIEW_SYNC;
-                    varispeedEnabled = true;
-                } else if (editMode === VIEW_SYNC && varispeedEnabled) {
-                    /* VARISPEED → STRETCH */
-                    varispeedEnabled = false;
+                /* Shift+Step1: open mini-menu or advance to next entry */
+                if (currentView !== VIEW_MODE_SELECT) {
+                    /* First press: open menu, highlight current mode */
+                    modeSelectReturnView = currentView;
+                    if (editMode === VIEW_FREE) modeSelectIndex = 1;
+                    else if (varispeedEnabled) modeSelectIndex = 2;
+                    else modeSelectIndex = 0;
+                    currentView = VIEW_MODE_SELECT;
                 } else {
-                    /* STRETCH → FREE */
-                    editMode = VIEW_FREE;
-                }
-            }
-            if (currentView !== editMode) {
-                /* Leaving slice mode: restore loop state and clear persisted slice state.
-                 * Do NOT stop playback — jam workflow requires continuous playback across view switches. */
-                if (currentView === VIEW_SLICE) {
-                    if (savedLoopState) {
-                        loopEnabled = true;
-                        host_module_set_param("play_loop", "1");
-                    }
-                    startSample = sliceBoundaries[0];
-                    endSample = sliceBoundaries[sliceCount];
-                    playPos = startSample;
-                    host_module_set_param("slice_state", "");
-                    syncMarkersToDs();
-                }
-                switchView(editMode);
-            } else if (shiftHeld) {
-                /* Already in editMode (VIEW_SYNC) but varispeedEnabled toggled —
-                 * view isn't switching so send play_mode manually. */
-                if (editMode === VIEW_SYNC) {
-                    host_module_set_param("t" + activeTrack + ":play_mode", varispeedEnabled ? "1" : "0");
-                    announce(varispeedEnabled ? "Varispeed" : "Stretch");
+                    /* Subsequent presses: advance with wrap */
+                    modeSelectIndex = (modeSelectIndex + 1) % modeSelectItems.length;
                 }
                 updateLeds();
+                announce("Mode: " + modeSelectItems[modeSelectIndex]);
+                return;
+            }
+            /* Step1 without Shift */
+            if (currentView === VIEW_MODE_SELECT) {
+                /* Close menu — switch to the chosen editMode */
+                switchToEditMode();
+                return;
+            }
+            if (currentView !== editMode) {
+                /* Leave slice/loop, enter editMode */
+                leaveNonEditView();
+                switchView(editMode);
             }
         }
         return;
@@ -7058,7 +7185,7 @@ function doReconnectRestore() {
         recordFilePath = SCRATCH_PATH;
         recordState = "ready";
         recordLedCounter = 0;
-        currentView = VIEW_FREE;
+        currentView = editMode;
         selectedField = 0;
         announce("New Recording, press REC to record");
     } else if (restoreSliceState()) {
@@ -7069,7 +7196,7 @@ function doReconnectRestore() {
         syncMarkersToDs();
         announce("Mangle,slice mode, " + sliceCount + " slices");
     } else {
-        currentView = VIEW_FREE;
+        currentView = syncMode ? VIEW_SYNC : editMode;
         selectedField = 0;
         announce("Mangle," + (fileName || "no file") + ", " + formatTime(totalFrames));
     }
@@ -7118,7 +7245,7 @@ globalThis.init = function() {
         announce("Resume project? Resume");
     } else {
         /* Fresh session */
-        currentView = VIEW_FREE;
+        currentView = editMode;  /* default: VIEW_SYNC */
         selectedField = 0;
         host_module_set_param("mode", "0");
 
@@ -7554,6 +7681,9 @@ globalThis.tick = function() {
             break;
         case VIEW_CONFIRM_RESUME:
             drawConfirmResume();
+            break;
+        case VIEW_MODE_SELECT:
+            drawModeSelect();
             break;
     }
 };
