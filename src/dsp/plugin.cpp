@@ -145,8 +145,9 @@ typedef struct {
 
     float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
     int   tempo_percent;        /* 50 to 200 */
-    float pitch_ratio;          /* cached: pow(2, pitch_semitones/12) */
-    float tempo_ratio;          /* cached: tempo_percent / 100.0 */
+    double pitch_ratio;         /* cached: pow(2, pitch_semitones/12) */
+    double tempo_ratio;         /* cached: tempo_percent / 100.0 */
+    double tempo_speed_precise; /* full-precision speed from sync_tempo (tp/100), survives loop wraps */
     double play_pos_frac;       /* fractional playback position */
 
     /* Bungee time-stretch state */
@@ -1690,50 +1691,22 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (tp < 30.0) tp = 30.0;
         if (tp > 300.0) tp = 300.0;
         t->tempo_percent = (int)round(tp);
+        t->tempo_speed_precise = tp / 100.0; /* preserve full precision before int rounding */
         recompute_ratios(t);
         if (e > t->audio_frames) e = t->audio_frames;
         if (e < s) e = s;
 
-        /* Phase-preserving update: if the track is playing, compute the current
-         * loop phase and seek to the proportional position in the new region so
-         * that tempo/length changes mid-playback don't cause an audible jump.
-         * (SPP-style: playback continues from the same relative loop position.) */
-        if (t->playing && t->end_sample > t->start_sample) {
-            double old_len = (t->loop_len_exact > 0.0)
-                             ? t->loop_len_exact
-                             : (double)(t->end_sample - t->start_sample);
-            double phase = (t->play_pos_frac - (double)t->start_sample) / old_len;
-            if (phase < 0.0) phase = 0.0;
-            phase = fmod(phase, 1.0);
-
-            t->start_sample  = s;
-            t->end_sample    = e;
-            t->sync_play_end = e;
-            t->bng_play_start = s;
-            t->bng_play_end  = e;
-            t->loop_len_exact = (exact_len > 0.0) ? exact_len : (double)(e - s);
-
-            double new_pos = (double)s + phase * t->loop_len_exact;
-            if (new_pos >= (double)e) new_pos = (double)s;
-            t->play_pos_frac = new_pos;
-            t->play_pos      = (int)new_pos;
-            if (t->stretcher) {
-                bng_reset_stretcher(t, new_pos);
-            }
-        } else {
-            /* Not playing — update markers and exact loop length. */
-            t->start_sample  = s;
-            t->end_sample    = e;
-            t->sync_play_end = e;
-            t->bng_play_start = s;
-            t->bng_play_end  = e;
-            t->loop_len_exact = (exact_len > 0.0) ? exact_len : 0.0;
-        }
+        t->start_sample  = s;
+        t->end_sample    = e;
+        t->sync_play_end = e;
+        t->bng_play_start = s;
+        t->bng_play_end  = e;
+        t->loop_len_exact = (exact_len > 0.0) ? exact_len : 0.0;
 
         /* Update speed directly without resetting the stretcher so the loop
          * boundary takes effect on the very next audio block (same as E2).
          * Use the full-precision float ratio to avoid cumulative drift. */
-        t->bng_req.speed = tp / 100.0;
+        t->bng_req.speed = t->tempo_speed_precise;
         return;
     }
 
@@ -2893,8 +2866,8 @@ static int v2_get_error(void *instance, char *buf, int buf_len) {
 /* ---- pitch/tempo helpers ---- */
 
 static void recompute_ratios(track_t *t) {
-    t->pitch_ratio = powf(2.0f, t->pitch_semitones / 12.0f);
-    t->tempo_ratio = (float)t->tempo_percent / 100.0f;
+    t->pitch_ratio = pow(2.0, (double)t->pitch_semitones / 12.0);
+    t->tempo_ratio = (double)t->tempo_percent / 100.0;
 }
 
 /* ---- Bungee time-stretch helpers ---- */
@@ -2925,7 +2898,9 @@ static void bng_feed_grain(track_t *t, const Bungee::InputChunk &chunk) {
 static void bng_reset_stretcher(track_t *t, double position) {
     if (!t->stretcher) return;
     t->bng_req.position = position;
-    t->bng_req.speed = (double)t->tempo_percent / 100.0;
+    t->bng_req.speed = (t->tempo_speed_precise > 0.0)
+                        ? t->tempo_speed_precise
+                        : (double)t->tempo_percent / 100.0;
     t->bng_req.pitch = pow(2.0, (double)t->pitch_semitones / 12.0);
     t->bng_req.reset = true;
     t->bng_req.resampleMode = resampleMode_autoOut;
