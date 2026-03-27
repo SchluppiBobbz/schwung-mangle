@@ -6884,7 +6884,11 @@ function handleNote(note, velocity) {
                                       : _ts2.gateMode;
                         if (_padMode2 === PAD_MODE_TRIGGER) {
                             if (_isSameScene) {
-                                /* Trigger: pressing playing scene stops it → Inactive */
+                                /* Trigger: pressing playing scene stops it → Inactive.
+                                 * Save current scene state (including any view-mode changes
+                                 * the user made while playing) before clearing playingSceneIdx,
+                                 * so that a subsequent re-launch restores the correct state. */
+                                saveCurrentSceneState(activeTrack);
                                 stopPlayback();
                                 _ts2.playingSceneIdx = -1;
                                 showStatus("Stop", 20);

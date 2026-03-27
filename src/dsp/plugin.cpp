@@ -1446,8 +1446,10 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             t->end_sample = e;
             /* Also update Bungee playback boundaries so the loop respects the
              * new markers immediately without waiting for a play restart.
-             * Clear sync_play_end so the Bungee path uses end_sample directly. */
+             * Clear sync_play_end and loop_len_exact so the render path uses
+             * end_sample directly as the loop boundary (not the stale SYNC value). */
             t->sync_play_end = 0;
+            t->loop_len_exact = 0.0;
             t->bng_play_start = s;
             t->bng_play_end = e;
         }
@@ -1706,15 +1708,30 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         int v = atoi(val);
         if (v < 30) v = 30;
         if (v > 300) v = 300;
+        /* Check if already using the Bungee path before the change.
+         * tempo_speed_precise > 0 means SYNC mode was active (Bungee running).
+         * Any non-unity pitch or tempo also means Bungee is running.
+         * Only reset the stretcher when transitioning direct→Bungee to
+         * avoid clicks/pops on in-flight tempo changes (same as pitch handler). */
+        float cur_pitch_ratio = (float)pow(2.0, (double)t->pitch_semitones / 12.0);
+        int already_bungee = (t->tempo_speed_precise > 0.0) ||
+                             !(fabsf(cur_pitch_ratio - 1.0f) < 0.001f &&
+                               fabsf(t->tempo_ratio  - 1.0f) < 0.001f);
         t->tempo_percent = v;
-        t->sync_play_end = 0; /* FREE mode: disable SYNC loop boundary */
+        t->sync_play_end = 0;    /* FREE mode: disable SYNC loop boundary */
+        t->loop_len_exact = 0.0; /* clear exact length so render uses end_sample */
         t->tempo_speed_precise = 0.0; /* clear SYNC precise speed so recompute_ratios uses tempo_percent */
         recompute_ratios(t);
-        /* Sync Bungee state to current playback position so the transition
-         * from direct path to Bungee path is seamless. */
         if (t->playing) {
-            t->bng_out_count = 0;
-            bng_reset_stretcher(t, t->play_pos_frac);
+            if (already_bungee) {
+                /* Already in Bungee: update speed in-flight, no reset needed.
+                 * Preserves loop position and avoids clicks/pops. */
+                t->bng_req.speed = (double)v / 100.0;
+            } else {
+                /* Transitioning direct→Bungee: full init required. */
+                t->bng_out_count = 0;
+                bng_reset_stretcher(t, t->play_pos_frac);
+            }
         } else {
             t->bng_req.speed = (double)v / 100.0;
         }
