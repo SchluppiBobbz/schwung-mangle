@@ -308,6 +308,8 @@ var waveformData = null; /* Array of [min, max] pairs, length 128 */
 var cachedVisStart = -1;
 var cachedVisEnd = -1;
 var waveformDirty = true; /* Force fetch on first draw */
+var waveformRefreshCooldown = 0; /* Ticks to wait before refreshing (debounce for zoom) */
+var WAVEFORM_ZOOM_DEBOUNCE = 1; /* Skip N ticks after zoom change before refreshing */
 
 /* Seam waveform cache (loop mode) */
 var seamZoomLevel = 4;
@@ -1938,7 +1940,10 @@ function syncMarkersToDs() {
 function syncSyncModeToDs() {
     var _tp = (globalBpm / bpm * 100).toFixed(1);
     var _el = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
-    host_module_set_param_blocking("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
+    /* Non-blocking: sync_tempo is handled atomically in DSP, no need to
+     * wait for confirmation. Blocking caused audio glitches during rapid
+     * knob turns because it stalls the UI thread waiting for DSP ack. */
+    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
 }
 
 /**
@@ -1947,7 +1952,11 @@ function syncSyncModeToDs() {
  * fire-and-forget race (SET is lost when followed by GET).
  */
 function syncZoomToDsp() {
-    refreshWaveform();
+    /* Debounce: mark dirty and delay refresh so rapid knob turns don't
+     * trigger expensive compute_waveform_range on every tick. The tick
+     * function will call refreshWaveform() once the cooldown expires. */
+    waveformDirty = true;
+    waveformRefreshCooldown = WAVEFORM_ZOOM_DEBOUNCE;
 }
 
 /* ============ DSP Communication ============ */
@@ -5522,7 +5531,7 @@ function handleCC(cc, value) {
                 showStatus("Zero-X found", 60);
             } else {
                 /* Loop button in loop view: return to trim */
-                switchView(editMode;
+                switchView(editMode);
             }
         } else if (currentView === VIEW_SYNC) {
             if (shiftHeld) {
@@ -7632,6 +7641,14 @@ globalThis.tick = function() {
         recordLedCounter++;
         if (recordLedCounter % 30 === 0) {
             setButtonLED(CC_REC, (recordLedCounter % 60 < 30) ? DeepRed : LED_OFF);
+        }
+    }
+
+    /* Debounced waveform refresh — runs after zoom cooldown expires */
+    if (waveformRefreshCooldown > 0) {
+        waveformRefreshCooldown--;
+        if (waveformRefreshCooldown <= 0 && waveformDirty) {
+            refreshWaveform();
         }
     }
 

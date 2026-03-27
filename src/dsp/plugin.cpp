@@ -117,9 +117,9 @@ typedef struct {
     int16_t *clipboard_data;    /* Clipboard buffer (stereo interleaved) */
     int clipboard_frames;
 
-    int16_t waveform_min[MAX_WAVEFORM_COLS];
+    int16_t waveform_min[MAX_WAVEFORM_COLS]; /* Full-file overview, updated on audio data change */
     int16_t waveform_max[MAX_WAVEFORM_COLS];
-    int waveform_cols;
+    int waveform_valid;         /* 1 once full-file waveform has been computed */
 
     int start_sample;
     int end_sample;
@@ -506,6 +506,7 @@ static int load_wav(track_t *t, const char *path) {
     t->undo_frames = 0;
     t->has_undo = 0;
     t->dirty = 0;
+    t->waveform_valid = 0;
 
     t->sample_rate = (int)wav_sample_rate;
     t->channels = 2; /* Always stereo internally */
@@ -684,59 +685,86 @@ static void get_visible_range(const track_t *t,
 }
 
 /*
- * Compute waveform overview (min/max per column) for an explicit sample range.
- * Uses L channel only for display.
+ * Compute full-file waveform overview (min/max per column).
+ * Always covers [0, audio_frames] at MAX_WAVEFORM_COLS resolution.
+ * Called only when audio data changes (file load, normalize, undo, paste, trim).
+ * NOT called from the waveform GET handler — use resample_waveform_range() there.
  */
-static void compute_waveform_range(track_t *t, int num_cols,
-                                   int vis_start, int vis_end) {
-    if (num_cols <= 0) num_cols = 1;
-    if (num_cols > MAX_WAVEFORM_COLS) num_cols = MAX_WAVEFORM_COLS;
-
-    t->waveform_cols = num_cols;
+static void compute_waveform(track_t *t, int num_cols) {
+    (void)num_cols; /* Always uses MAX_WAVEFORM_COLS for the full-file overview */
+    int n = MAX_WAVEFORM_COLS;
+    t->waveform_valid = 0;
 
     if (!t->audio_data || t->audio_frames <= 0) {
-        memset(t->waveform_min, 0, (size_t)num_cols * sizeof(int16_t));
-        memset(t->waveform_max, 0, (size_t)num_cols * sizeof(int16_t));
+        memset(t->waveform_min, 0, (size_t)n * sizeof(int16_t));
+        memset(t->waveform_max, 0, (size_t)n * sizeof(int16_t));
         return;
     }
 
-    /* Clamp range */
-    if (vis_start < 0) vis_start = 0;
-    if (vis_end > t->audio_frames) vis_end = t->audio_frames;
-    int vis_frames = vis_end - vis_start;
-    if (vis_frames <= 0) {
-        memset(t->waveform_min, 0, (size_t)num_cols * sizeof(int16_t));
-        memset(t->waveform_max, 0, (size_t)num_cols * sizeof(int16_t));
-        return;
-    }
-
-    for (int col = 0; col < num_cols; col++) {
-        int col_start = vis_start + (col * vis_frames) / num_cols;
-        int col_end   = vis_start + ((col + 1) * vis_frames) / num_cols;
+    int total = t->audio_frames;
+    for (int col = 0; col < n; col++) {
+        int col_start = (col * total) / n;
+        int col_end   = ((col + 1) * total) / n;
         if (col_end <= col_start) col_end = col_start + 1;
-        if (col_end > vis_end) col_end = vis_end;
+        if (col_end > total) col_end = total;
 
         int16_t mn = 32767;
         int16_t mx = -32768;
-
         for (int i = col_start; i < col_end; i++) {
             int16_t s = t->audio_data[i * 2]; /* L channel */
             if (s < mn) mn = s;
             if (s > mx) mx = s;
         }
-
         t->waveform_min[col] = mn;
         t->waveform_max[col] = mx;
     }
+    t->waveform_valid = 1;
 }
 
 /*
- * Compute waveform overview using internal zoom state.
+ * Resample the precomputed full-file waveform for a sub-range [vis_start, vis_end].
+ * O(MAX_WAVEFORM_COLS) — no raw sample scanning, safe to call from the audio thread.
+ * out_min/out_max must each have room for num_cols entries.
  */
-static void compute_waveform(track_t *t, int num_cols) {
-    int vis_start, vis_end;
-    get_visible_range(t, &vis_start, &vis_end);
-    compute_waveform_range(t, num_cols, vis_start, vis_end);
+static void resample_waveform_range(track_t *t,
+                                    int16_t *out_min, int16_t *out_max,
+                                    int num_cols, int vis_start, int vis_end) {
+    int total = t->audio_frames;
+    if (!t->waveform_valid || total <= 0 || num_cols <= 0) {
+        memset(out_min, 0, (size_t)num_cols * sizeof(int16_t));
+        memset(out_max, 0, (size_t)num_cols * sizeof(int16_t));
+        return;
+    }
+    if (vis_start < 0) vis_start = 0;
+    if (vis_end > total) vis_end = total;
+    if (vis_end <= vis_start) {
+        memset(out_min, 0, (size_t)num_cols * sizeof(int16_t));
+        memset(out_max, 0, (size_t)num_cols * sizeof(int16_t));
+        return;
+    }
+
+    int range = vis_end - vis_start;
+    for (int col = 0; col < num_cols; col++) {
+        /* Sample range covered by this output column */
+        int samp_start = vis_start + (int)((long)range * col       / num_cols);
+        int samp_end   = vis_start + (int)((long)range * (col + 1) / num_cols);
+        if (samp_end <= samp_start) samp_end = samp_start + 1;
+
+        /* Map sample range to full-file precomputed column indices */
+        int fc_start = (int)((long)samp_start * MAX_WAVEFORM_COLS / total);
+        int fc_end   = (int)((long)(samp_end - 1) * MAX_WAVEFORM_COLS / total);
+        if (fc_start < 0) fc_start = 0;
+        if (fc_end >= MAX_WAVEFORM_COLS) fc_end = MAX_WAVEFORM_COLS - 1;
+        if (fc_start > fc_end) fc_start = fc_end;
+
+        int16_t mn = 32767, mx = -32768;
+        for (int fc = fc_start; fc <= fc_end; fc++) {
+            if (t->waveform_min[fc] < mn) mn = t->waveform_min[fc];
+            if (t->waveform_max[fc] > mx) mx = t->waveform_max[fc];
+        }
+        out_min[col] = mn;
+        out_max[col] = mx;
+    }
 }
 
 /* ============================================================================
@@ -1647,14 +1675,26 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         float v = (float)atof(val);
         if (v < -36.0f) v = -36.0f;
         if (v > 36.0f) v = 36.0f;
+        /* Check if we are already using the Bungee path before the change.
+         * In SYNC mode (tempo_speed_precise set) or with any existing pitch
+         * offset the stretcher is already running — only update bng_req.pitch
+         * directly to avoid a reset-induced click.  A reset is only needed
+         * when transitioning from the direct (no-stretch) path to Bungee. */
+        float old_pitch_ratio = (float)pow(2.0, (double)t->pitch_semitones / 12.0);
+        int already_bungee = !(fabsf(old_pitch_ratio - 1.0f) < 0.001f &&
+                                fabsf(t->tempo_ratio  - 1.0f) < 0.001f);
         t->pitch_semitones = v;
         recompute_ratios(t);
-        /* Sync Bungee state to current playback position so the transition
-         * from direct path to Bungee path is seamless (no position jump,
-         * correct sample-rate-aware resampling from the start). */
         if (t->playing) {
-            t->bng_out_count = 0;
-            bng_reset_stretcher(t, t->play_pos_frac);
+            if (already_bungee) {
+                /* Already in Bungee: update pitch in-flight, no reset needed.
+                 * This preserves loop position and avoids clicks/pops. */
+                t->bng_req.pitch = pow(2.0, (double)v / 12.0);
+            } else {
+                /* Transitioning direct→Bungee: full init required. */
+                t->bng_out_count = 0;
+                bng_reset_stretcher(t, t->play_pos_frac);
+            }
         } else {
             t->bng_req.pitch = pow(2.0, (double)v / 12.0);
         }
@@ -2600,20 +2640,19 @@ static int v2_get_param(void *instance, const char *key, char *buf,
 
     /* --- Waveform data --- */
     if (strncmp(param, "waveform", 8) == 0) {
-        int vis_start = -1, vis_end = -1;
-        if (param[8] == ':') {
-            sscanf(param + 9, "%d,%d", &vis_start, &vis_end);
-        }
-        if (vis_start >= 0 && vis_end > vis_start) {
-            compute_waveform_range(t, 128, vis_start, vis_end);
-        } else {
-            compute_waveform(t, 128);
-        }
-
-        if (t->waveform_cols <= 0 || !t->audio_data) {
+        if (!t->audio_data || !t->waveform_valid) {
             int n = snprintf(buf, (size_t)buf_len, "[]");
             return (n >= 0 && n < buf_len) ? n : -1;
         }
+
+        /* Resample from precomputed full-file waveform — O(128), no raw scan */
+        int16_t col_min[MAX_WAVEFORM_COLS], col_max[MAX_WAVEFORM_COLS];
+        int vis_start = 0, vis_end = t->audio_frames;
+        if (param[8] == ':') {
+            sscanf(param + 9, "%d,%d", &vis_start, &vis_end);
+        }
+        resample_waveform_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
+                                vis_start, vis_end);
 
         /* Build JSON array: [[min,max],[min,max],...] */
         int pos = 0;
@@ -2623,9 +2662,9 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         buf[pos++] = '[';
         remaining--;
 
-        for (int i = 0; i < t->waveform_cols; i++) {
-            float mn = (float)t->waveform_min[i] / 32768.0f;
-            float mx = (float)t->waveform_max[i] / 32768.0f;
+        for (int i = 0; i < MAX_WAVEFORM_COLS; i++) {
+            float mn = (float)col_min[i] / 32768.0f;
+            float mx = (float)col_max[i] / 32768.0f;
 
             /* Clamp to -1..1 */
             if (mn < -1.0f) mn = -1.0f;
@@ -2679,26 +2718,17 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         int left_end = sw_end;
         if (left_end > t->audio_frames) left_end = t->audio_frames;
 
-        compute_waveform_range(t, 64, left_start, left_end);
-
-        /* Save first-half results to stack before second call overwrites */
+        /* Build seam waveform from precomputed full-file data — no raw scan */
         int16_t seam_min[128], seam_max[128];
-        for (int i = 0; i < 64; i++) {
-            seam_min[i] = (i < t->waveform_cols) ? t->waveform_min[i] : 0;
-            seam_max[i] = (i < t->waveform_cols) ? t->waveform_max[i] : 0;
-        }
+        resample_waveform_range(t, seam_min, seam_max, 64, left_start, left_end);
 
         /* Second half: continuing from loop start (start .. start + half_samples) */
         int right_start = sw_start;
         int right_end = sw_start + half_samples;
         if (right_end > t->audio_frames) right_end = t->audio_frames;
 
-        compute_waveform_range(t, 64, right_start, right_end);
-
-        for (int i = 0; i < 64; i++) {
-            seam_min[64 + i] = (i < t->waveform_cols) ? t->waveform_min[i] : 0;
-            seam_max[64 + i] = (i < t->waveform_cols) ? t->waveform_max[i] : 0;
-        }
+        resample_waveform_range(t, seam_min + 64, seam_max + 64,
+                                64, right_start, right_end);
 
         /* Build JSON array: [[min,max],[min,max],...] — 128 pairs */
         int pos = 0;
