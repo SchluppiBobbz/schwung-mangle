@@ -685,6 +685,49 @@ static void get_visible_range(const track_t *t,
     if (*out_end > t->audio_frames) *out_end = t->audio_frames;
 }
 
+/* Maximum samples to scan directly from raw audio in the GET handler.
+ * Visible ranges up to this size are served by raw scan (exact per-sample min/max).
+ * Larger ranges use the precomputed full-file overview to avoid audio-thread stalls.
+ * At 44100 Hz, 524288 samples ≈ 12 seconds — scanning takes <0.5 ms on ARM64. */
+#define RAW_SCAN_THRESHOLD 524288
+
+/*
+ * Raw-scan waveform: compute min/max per column by scanning actual samples.
+ * Only safe to call for small vis_range (see RAW_SCAN_THRESHOLD).
+ * Gives pixel-accurate display at any zoom level.
+ */
+static void compute_waveform_raw_range(track_t *t,
+                                       int16_t *out_min, int16_t *out_max,
+                                       int num_cols, int vis_start, int vis_end) {
+    if (!t->audio_data || t->audio_frames <= 0 || num_cols <= 0) {
+        memset(out_min, 0, (size_t)num_cols * sizeof(int16_t));
+        memset(out_max, 0, (size_t)num_cols * sizeof(int16_t));
+        return;
+    }
+    if (vis_start < 0) vis_start = 0;
+    if (vis_end > t->audio_frames) vis_end = t->audio_frames;
+    int vis_frames = vis_end - vis_start;
+    if (vis_frames <= 0) {
+        memset(out_min, 0, (size_t)num_cols * sizeof(int16_t));
+        memset(out_max, 0, (size_t)num_cols * sizeof(int16_t));
+        return;
+    }
+    for (int col = 0; col < num_cols; col++) {
+        int col_start = vis_start + (int)((long)vis_frames * col       / num_cols);
+        int col_end   = vis_start + (int)((long)vis_frames * (col + 1) / num_cols);
+        if (col_end <= col_start) col_end = col_start + 1;
+        if (col_end > vis_end) col_end = vis_end;
+        int16_t mn = 32767, mx = -32768;
+        for (int i = col_start; i < col_end; i++) {
+            int16_t s = t->audio_data[i * 2]; /* L channel */
+            if (s < mn) mn = s;
+            if (s > mx) mx = s;
+        }
+        out_min[col] = mn;
+        out_max[col] = mx;
+    }
+}
+
 /*
  * Compute full-file waveform overview (min/max per column).
  * Always covers [0, audio_frames] at MAX_WAVEFORM_COLS resolution.
@@ -1289,8 +1332,28 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         char source[16];
         int  extract_frames = 0;
         char path[512];
-        if (sscanf(val, "%15[^,],%d,%511s", source, &extract_frames, path) != 3) return;
-        if (extract_frames <= 0 || extract_frames > RB_FRAMES) extract_frames = RB_FRAMES;
+        /* Manual parse: "%s" in sscanf stops at whitespace, breaking paths with spaces.
+         * Find first comma → source, second comma → frames, remainder → path. */
+        {
+            const char *c1 = strchr(val, ',');
+            if (!c1 || (c1 - val) >= (int)sizeof(source)) return;
+            strncpy(source, val, (size_t)(c1 - val));
+            source[c1 - val] = '\0';
+
+            const char *c2 = strchr(c1 + 1, ',');
+            if (!c2) return;
+            char frames_str[32];
+            int flen = (int)(c2 - (c1 + 1));
+            if (flen <= 0 || flen >= (int)sizeof(frames_str)) return;
+            strncpy(frames_str, c1 + 1, (size_t)flen);
+            frames_str[flen] = '\0';
+            extract_frames = atoi(frames_str);
+
+            strncpy(path, c2 + 1, sizeof(path) - 1);
+            path[sizeof(path) - 1] = '\0';
+        }
+        if (extract_frames <= 0 || path[0] == '\0') return;
+        if (extract_frames > RB_FRAMES) extract_frames = RB_FRAMES;
 
         int16_t *rb = NULL;
         int write_pos = 0;
@@ -2663,14 +2726,22 @@ static int v2_get_param(void *instance, const char *key, char *buf,
             return (n >= 0 && n < buf_len) ? n : -1;
         }
 
-        /* Resample from precomputed full-file waveform — O(128), no raw scan */
         int16_t col_min[MAX_WAVEFORM_COLS], col_max[MAX_WAVEFORM_COLS];
         int vis_start = 0, vis_end = t->audio_frames;
         if (param[8] == ':') {
             sscanf(param + 9, "%d,%d", &vis_start, &vis_end);
         }
-        resample_waveform_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
-                                vis_start, vis_end);
+        /* For small visible ranges, raw scan gives better per-pixel resolution.
+         * For large ranges (whole-file views), use precomputed to avoid stalls. */
+        int vis_range = vis_end - vis_start;
+        if (vis_range < 0) vis_range = 0;
+        if (!t->waveform_valid || vis_range <= RAW_SCAN_THRESHOLD) {
+            compute_waveform_raw_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
+                                      vis_start, vis_end);
+        } else {
+            resample_waveform_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
+                                    vis_start, vis_end);
+        }
 
         /* Build JSON array: [[min,max],[min,max],...] */
         int pos = 0;

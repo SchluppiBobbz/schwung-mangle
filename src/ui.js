@@ -640,7 +640,7 @@ function restoreSceneToGlobals(scene) {
     loopEnabled = scene.loopEnabled;
     var _sgm = (scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER;
     trackStates[activeTrack].gateMode = _sgm;
-    host_module_set_param("gate_mode", String(_sgm));
+    host_module_set_param("t" + activeTrack + ":gate_mode", String(_sgm));
     sliceMode = scene.sliceMode;
     sliceCount = scene.sliceCount;
     sliceBoundaries = (scene.sliceBoundaries || []).slice();
@@ -1132,7 +1132,7 @@ function updateSyncTempoAllTracks() {
                 if (_tpFull > 300) _tpFull = 300;
                 var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
                 var _seA = endSample > 0 ? endSample : _bts.totalFrames;
-                host_module_set_param_blocking("sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
+                host_module_set_param_blocking("t" + activeTrack + ":sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
                 tempoPercent = _tpFull;
             }
             continue;
@@ -1862,20 +1862,6 @@ function getVisibleEnd() {
 }
 
 /**
- * Convert a sample position to a pixel x coordinate in the waveform area.
- * Returns -1 if the sample is outside the visible range.
- */
-function sampleToPixel(sample) {
-    var vStart = getVisibleStart();
-    var vEnd = getVisibleEnd();
-    var range = vEnd - vStart;
-    if (range <= 0) return -1;
-    var x = Math.floor(((sample - vStart) / range) * SCREEN_W);
-    if (x < 0 || x >= SCREEN_W) return -1;
-    return x;
-}
-
-/**
  * Adjust a marker (start=0, end=1) by deltaSamples. Clamps to valid range.
  * Ensures start <= end. Auto-scrolls view to keep the active marker visible.
  */
@@ -1927,7 +1913,7 @@ function syncMarkersToDs() {
         _tsMk.scenes[_tsMk.selectedSceneIdx].endSample   = endSample;
         return;
     }
-    host_module_set_param("markers", startSample + "," + endSample);
+    host_module_set_param("t" + activeTrack + ":markers", startSample + "," + endSample);
 }
 
 /**
@@ -1943,7 +1929,7 @@ function syncSyncModeToDs() {
     /* Non-blocking: sync_tempo is handled atomically in DSP, no need to
      * wait for confirmation. Blocking caused audio glitches during rapid
      * knob turns because it stalls the UI thread waiting for DSP ack. */
-    host_module_set_param("sync_tempo", _tp + "," + startSample + "," + endSample + _el);
+    host_module_set_param("t" + activeTrack + ":sync_tempo", _tp + "," + startSample + "," + endSample + _el);
 }
 
 /**
@@ -2397,8 +2383,11 @@ function drawWaveform() {
         return;
     }
 
-    var vStart = getVisibleStart();
-    var vEnd = getVisibleEnd();
+    /* Use the range the waveform was computed for, not the live viewport.
+     * During the debounce cooldown after a zoom change these differ, and using
+     * the live range would misalign the selection/markers against the waveform bars. */
+    var vStart = (cachedVisStart >= 0) ? cachedVisStart : 0;
+    var vEnd   = (cachedVisEnd > vStart) ? cachedVisEnd : totalFrames;
     var vRange = vEnd - vStart;
 
     /* Compute selection pixel range */
@@ -2451,8 +2440,8 @@ function drawWaveform() {
         }
     }
 
-    /* Draw start marker */
-    var startPx = sampleToPixel(startSample);
+    /* Draw start marker — use cached range so it aligns with the waveform bars */
+    var startPx = (vRange > 0) ? Math.floor(((startSample - vStart) / vRange) * SCREEN_W) : -1;
     if (startPx >= 0 && startPx < SCREEN_W) {
         for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y += 2) {
             set_pixel(startPx, y, 1);
@@ -2460,7 +2449,7 @@ function drawWaveform() {
     }
 
     /* Draw end marker */
-    var endPx = sampleToPixel(endSample);
+    var endPx = (vRange > 0) ? Math.floor(((endSample - vStart) / vRange) * SCREEN_W) : -1;
     if (endPx >= 0 && endPx < SCREEN_W) {
         for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y += 2) {
             set_pixel(endPx, y, 1);
@@ -2469,7 +2458,7 @@ function drawWaveform() {
 
     /* Draw playhead */
     if (playing) {
-        var playPx = sampleToPixel(playPos);
+        var playPx = (vRange > 0) ? Math.floor(((playPos - vStart) / vRange) * SCREEN_W) : -1;
         if (playPx >= 0 && playPx < SCREEN_W) {
             for (var y = WAVE_Y_TOP; y < WAVE_Y_BOT; y++) {
                 if (y % 3 !== 0) {
