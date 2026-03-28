@@ -3117,15 +3117,19 @@ function switchToEditMode() {
  */
 function leaveNonEditView() {
     if (currentView === VIEW_SLICE) {
-        if (savedLoopState) {
-            loopEnabled = true;
-            host_module_set_param("play_loop", "1");
-        }
         startSample = sliceBoundaries[0];
         endSample = sliceBoundaries[sliceCount];
         playPos = startSample;
-        host_module_set_param("slice_state", "");
-        syncMarkersToDs();
+        host_module_set_param("slice_state", "");  /* non-blocking OK — no audio effect */
+        /* Restore outer markers before restoring loop so the DSP adopts the
+         * correct boundaries before it begins looping again.
+         * Use blocking to avoid the single-slot non-blocking race where a
+         * subsequent param send (tempo in switchView) would overwrite this. */
+        setParamBlocking("markers", startSample + "," + endSample, 300);
+        if (savedLoopState) {
+            loopEnabled = true;
+            setParamBlocking("play_loop", "1", 300);
+        }
     }
     /* VIEW_MODE_SELECT and VIEW_LOOP need no special cleanup */
 }
@@ -3255,11 +3259,13 @@ function drawSyncView() {
  * Switch to a given view.
  */
 function switchView(view) {
-    /* Restore global pitch and tempo to DSP when leaving VIEW_SLICE */
+    /* Restore global pitch and tempo to DSP when leaving VIEW_SLICE.
+     * Use blocking to avoid overwriting the markers blocking call in
+     * leaveNonEditView via the single shared-memory param slot. */
     if (currentView === VIEW_SLICE && view !== VIEW_SLICE) {
-        host_module_set_param("pitch", pitchSemitones.toFixed(2));
+        setParamBlocking("pitch", pitchSemitones.toFixed(2), 300);
         tempoPercent = savedTempoPercent;
-        host_module_set_param("tempo", String(tempoPercent));
+        setParamBlocking("tempo", String(tempoPercent), 300);
     }
     currentView = view;
     if (view === VIEW_FREE || view === VIEW_SYNC) editMode = view;
@@ -3876,6 +3882,7 @@ function doFinalize() {
         host_module_set_param("apply_pitch_tempo", "1");
         pitchSemitones = 0.0;
         tempoPercent = 100;
+        exactLoopLen = 0;  /* baked file has new length — drop fractional accumulator */
         refreshState();
     }
 
@@ -3921,6 +3928,8 @@ function doFinalize() {
         autoPlay: playing
     };
 
+    /* Drop stale exact-length so the reloaded file's full length is used */
+    ts.scenes[sceneIdx].exactLen = 0;
     saveSceneState(activeTrack);
     saveProjectJson();
     showStatus("Finalized S" + (sceneIdx + 1), 90);
@@ -6633,7 +6642,8 @@ function handleCC(cc, value) {
             showKnobStatus(7, "Tempo:" + tempoPercent + "% BPM:" + bpm.toFixed(1));
             if (currentView === VIEW_FREE) {
                 knobStatusMsg[0] = "Start:" + formatTime(startSample);
-                knobStatusMsg[1] = "Len:" + formatTime(endSample - startSample);
+                /* Show effective playback duration adjusted for current tempo */
+                knobStatusMsg[1] = "Len:" + formatTime(Math.round((endSample - startSample) * 100 / tempoPercent));
             }
             return;
         }

@@ -91,6 +91,7 @@ typedef struct plugin_api_v2 {
 /* Bungee output accumulator capacity per track (frames).
  * Must hold several Bungee output grains. 8192 frames ≈ 0.19s at 44.1kHz. */
 #define BNG_OUT_BUF_CAPACITY 8192
+#define BNG_LOOP_FADE_SAMPLES 128  /* crossfade length at loop boundaries (~3 ms @ 44100 Hz) */
 
 /* ============================================================================
  * Track structure — per-track audio state
@@ -3188,7 +3189,6 @@ static void do_apply_pitch_tempo(track_t *t) {
  */
 static int render_track(track_t *t, int16_t *out, int frames) {
     if (!t->playing || !t->audio_data || t->audio_frames <= 0) return 0;
-    if (t->muted) return 0;
     if (t->gate_mode == 1 && !t->gate_held) return 0;  /* gate: only play while held */
 
     /* Determine playback boundaries */
@@ -3305,6 +3305,21 @@ static int render_track(track_t *t, int16_t *out, int frames) {
                     double wrapped = (double)play_start +
                         fmod(t->bng_req.position - (double)play_start, wrap_len);
                     if (wrapped < (double)play_start) wrapped = (double)play_start;
+                    /* Fade out the tail of any buffered pre-wrap output so the
+                     * old audio smoothly decays to silence.  The new position's
+                     * first grain is pre-rolled by bng_reset_stretcher (preroll),
+                     * which naturally fades in via Bungee's analysis window —
+                     * together this forms a click-free crossfade at the loop point. */
+                    {
+                        int fade_len = t->bng_out_count < BNG_LOOP_FADE_SAMPLES
+                                       ? t->bng_out_count : BNG_LOOP_FADE_SAMPLES;
+                        int fade_start = t->bng_out_count - fade_len;
+                        for (int _fi = 0; _fi < fade_len; _fi++) {
+                            float _ramp = 1.0f - (float)(_fi + 1) / (float)(fade_len + 1);
+                            t->bng_out_buf[(fade_start + _fi) * 2 + 0] *= _ramp;
+                            t->bng_out_buf[(fade_start + _fi) * 2 + 1] *= _ramp;
+                        }
+                    }
                     bng_reset_stretcher(t, wrapped);
                 } else {
                     t->playing = 0;
@@ -3374,6 +3389,12 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         produced = (avail > 0) ? 1 : 0;
     }
 
+    /* Muted: position has already advanced (for re-sync on unmute), but
+     * silence the output so the mix receives nothing. */
+    if (t->muted) {
+        memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
+        return 0;
+    }
     return produced;
 }
 
