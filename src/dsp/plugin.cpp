@@ -2669,6 +2669,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
+    if (strcmp(key, "project_bpm") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%.1f", inst->project_bpm);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
     if (strcmp(key, "clock_running") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%d", inst->clock_running);
         return (n >= 0 && n < buf_len) ? n : -1;

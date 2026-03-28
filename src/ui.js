@@ -1156,11 +1156,22 @@ function updateSyncTempoAllTracks() {
  * Call before any code that computes sync_tempo from globalBpm.
  */
 function initGlobalBpmFromOverlay() {
-    if (typeof shadow_get_overlay_state !== "function") return;
-    var _ov = shadow_get_overlay_state();
-    if (_ov && typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0) {
-        globalBpm = Math.round(_ov.samplerBpm * 10) / 10;
-        lastProjectBpm = globalBpm;  /* prime dedup so lock-mode doesn't fire immediately */
+    if (typeof shadow_get_overlay_state === "function") {
+        var _ov = shadow_get_overlay_state();
+        if (_ov && typeof _ov.samplerBpm === "number" && _ov.samplerBpm > 0) {
+            globalBpm = Math.round(_ov.samplerBpm * 10) / 10;
+            lastProjectBpm = globalBpm;  /* prime dedup so lock-mode doesn't fire immediately */
+        }
+    }
+    /* Fallback: read project_bpm from DSP (shim pushes sampler_get_bpm on creation).
+     * More reliable for tool modules where the overlay often returns 120 default. */
+    var _dspBpm = host_module_get_param("project_bpm");
+    if (_dspBpm) {
+        var _parsed = parseFloat(_dspBpm);
+        if (!isNaN(_parsed) && _parsed >= 20 && _parsed <= 999 && _parsed !== globalBpm) {
+            globalBpm = Math.round(_parsed * 10) / 10;
+            lastProjectBpm = globalBpm;
+        }
     }
 }
 
@@ -1794,6 +1805,7 @@ function detectBpmFromFilename() {
     var bpmMatch = fileName.match(/(\d+(?:\.\d+)?)\s*bpm/i) ||
                    fileName.match(/\[(\d+(?:\.\d+)?)\]/);
     if (!bpmMatch) return false;
+    exactLoopLen = 0;
     var detectedBpm = parseFloat(bpmMatch[1]);
     if (detectedBpm < 20 || detectedBpm > 999) {
         showStatus("BPM out of range", 60);
@@ -1806,7 +1818,7 @@ function detectBpmFromFilename() {
     syncMarkersToDs();
     syncSyncModeToDs();
     refreshWaveform();
-    showStatus("BPM: " + bpm.toFixed(1), 90);
+    showStatus("BPM: " + bpm.toFixed(1), 50);
     return true;
 }
 
@@ -2012,6 +2024,7 @@ function loadFileIntoEditor(filePath, loadEditMode) {
     host_module_set_param("dirty", "1");
     /* Reset pitch/tempo on new file, enable loop by default */
     pitchSemitones = 0.0;
+    exactLoopLen = 0;
     tempoPercent = 100;
     loopEnabled = true;
     host_module_set_param("play_loop", "1");
@@ -5740,6 +5753,7 @@ function handleCC(cc, value) {
                 if (!detectBpmFromFilename()) showStatus("No BPM in filename", 60);
             } else {
                 /* Up: estimate BPM from selection length */
+                exactLoopLen = 0;
                 var selLen = endSample - startSample;
                 if (selLen <= 0) { showStatus("Empty selection", 60); return; }
                 var div = BEAT_DIVISIONS[beatDivIndex];
@@ -5752,7 +5766,7 @@ function handleCC(cc, value) {
                 syncMode = true;
                 tempoPercent = Math.round(globalBpm / bpm * 100 * 10) / 10;
                 syncSyncModeToDs();
-                showStatus("BPM: " + bpm.toFixed(1), 90);
+                showStatus("BPM: " + bpm.toFixed(1), 50);
             }
             return;
         }
@@ -7069,6 +7083,20 @@ function handleNote(note, velocity) {
 function doReconnectRestore() {
     /* Ensure globalBpm is accurate before any sync_tempo calculations */
     initGlobalBpmFromOverlay();
+    /* Saved project BPM always overrides overlay/DSP for existing projects */
+    if (projectDir && projectDir !== "_no_project" && typeof host_read_file === "function") {
+        var _rcRaw = host_read_file(projectDir + "/project.json");
+        if (_rcRaw && _rcRaw.length >= 2) {
+            try {
+                var _rcD = JSON.parse(_rcRaw);
+                if (typeof _rcD.globalBpm === "number" && _rcD.globalBpm >= 20 && _rcD.globalBpm <= 999) {
+                    globalBpm = _rcD.globalBpm;
+                    lastProjectBpm = globalBpm;
+                }
+                if (typeof _rcD.lockBpmToProject === "boolean") lockBpmToProject = _rcD.lockBpmToProject;
+            } catch (e) {}
+        }
+    }
     /* Restore per-track state from DSP without reloading files.
      * We only READ from DSP here — no file_path is sent, so playback
      * continues uninterrupted in the DSP. */
@@ -7257,6 +7285,7 @@ globalThis.init = function() {
         announce("Resume project? Resume");
     } else {
         /* Fresh session */
+        initGlobalBpmFromOverlay();  /* pick up host BPM before any project loads */
         currentView = editMode;  /* default: VIEW_SYNC */
         selectedField = 0;
         host_module_set_param("mode", "0");
@@ -7474,6 +7503,21 @@ globalThis.tick = function() {
         }
     }
 
+    /* Detect when DSP-queued play has actually started (bar boundary reached).
+     * The DSP sets playing=1 when pending_bar_triggers fires; clear the UI
+     * queue state so the pad LED stops flashing and normal polling resumes. */
+    if (dspQueuedPlayTrack >= 0 && dspQueuedPlayScene >= 0) {
+        var _qpRaw = host_module_get_param("t" + dspQueuedPlayTrack + ":playing");
+        if (_qpRaw === "1" || _qpRaw === "true") {
+            var _qTrack = dspQueuedPlayTrack;
+            dspQueuedPlayTrack = -1;
+            dspQueuedPlayScene = -1;
+            trackStates[_qTrack].playing = true;
+            if (_qTrack === activeTrack) playing = true;
+            updateLeds();
+        }
+    }
+
     /* Flush queued play/stop command — issued here in tick() so it's the
      * last set_param in the frame, after encoder flush has completed.
      * This prevents knob params from overwriting the play command.
@@ -7576,7 +7620,9 @@ globalThis.tick = function() {
          * LED to go dark prematurely. pendingPlay guards the tick where
          * pendingSceneRestore was just processed (nulled) but the play
          * command hasn't been sent yet (next tick). */
-        if (totalFrames > 0 && !pendingSceneRestore && !pendingPlay && (playingRaw === "0" || playingRaw === "false")) {
+        if (totalFrames > 0 && !pendingSceneRestore && !pendingPlay
+            && !(dspQueuedPlayTrack === activeTrack && dspQueuedPlayScene >= 0)
+            && (playingRaw === "0" || playingRaw === "false")) {
             dbg("tick: playing→false (DSP says stopped) frames=" + totalFrames + " pendingRestore=" + (pendingSceneRestore ? "yes" : "no"));
             playing = false;
             trackStates[activeTrack].playing = false;
@@ -7597,7 +7643,8 @@ globalThis.tick = function() {
         if (_pt === activeTrack) continue;
         if (trackStates[_pt].playing) {
             var _pRaw = host_module_get_param("t" + _pt + ":playing");
-            if (_pRaw === "0" || _pRaw === "false") {
+            if ((_pRaw === "0" || _pRaw === "false")
+                && !(_pt === dspQueuedPlayTrack && dspQueuedPlayScene >= 0)) {
                 trackStates[_pt].playing = false;
             } else {
                 var _posRaw = host_module_get_param("t" + _pt + ":play_pos");
