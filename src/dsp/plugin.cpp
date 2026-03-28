@@ -25,6 +25,8 @@
 #include <pwd.h>
 
 #include <bungee/Bungee.h>
+#include "paulxstretch/ProcessedStretch.h"
+#include "paulxstretch/BinauralBeats.h"
 
 extern "C" {
 
@@ -168,6 +170,51 @@ typedef struct {
     char load_error[256];
     char slice_state[2048];     /* JSON blob for UI slice state persistence */
     char scene_state[1024];     /* JSON blob for UI scene state persistence */
+
+    /* PaulXStretch spectral processing state */
+    struct {
+        int enabled;              /* master on/off for PaulXStretch chain */
+        float stretch_amount;     /* 0.1–1024.0 */
+        float fft_size_norm;      /* 0.0–1.0 → maps to 256–65536 */
+        int fft_size;             /* actual power-of-2 FFT size */
+
+        /* Per-effect enables */
+        int stretch_en;
+        int freqshift_en;
+        int spread_en;
+        int ratiomix_en;
+        int binaural_en;
+
+        /* Parameters */
+        float freq_shift_hz;      /* -1000 to +1000 */
+        float spread_bw;          /* 0.0–1.0 */
+        float ratio_levels[8];    /* 0.0–1.0 each */
+        float binaural_power;     /* 0.0–1.0 */
+        int   binaural_mode;      /* 0=LR, 1=RL, 2=Symmetric */
+        float binaural_freq;      /* 0.05–50.0 Hz */
+
+        /* Runtime (allocated on enable, freed on disable) */
+        ProcessedStretch *stretch_l;
+        ProcessedStretch *stretch_r;
+        BinauralBeats *binaural;
+        ProcessParameters proc_pars;
+
+        /* Input ring buffers: accumulate 128-frame blocks until FFT-size ready */
+        float *inbuf_l;
+        float *inbuf_r;
+        int    inbuf_count;
+        int    inbuf_capacity;
+
+        /* Output ring buffer: spectral output drains into render */
+        float *outbuf;            /* stereo interleaved */
+        int    outbuf_count;
+        int    outbuf_capacity;
+        int    outbuf_read;
+        int    outbuf_write;
+
+        int    needs_reinit;      /* flag: rebuild stretchers on next render */
+        int    fill_needed;       /* 1 = initial fill required after reinit */
+    } psx;
 } track_t;
 
 /* ============================================================================
@@ -917,6 +964,400 @@ static void make_edit_filename(const char *original_path, char *out_buf,
  * Track helper — free all track memory
  * ============================================================================ */
 
+/* ============================================================================
+ * PaulXStretch helpers — init, free, reinit, process, param handling
+ * ============================================================================ */
+
+#define PSX_DEFAULT_FFT_SIZE  1024
+#define PSX_DEFAULT_STRETCH   8.0f
+#define PSX_MAX_FFT_SIZE      32768   /* cap at 32k for ARM64 CPU budget */
+#define PSX_OUTBUF_MULT       8       /* output ring = fft_size * this */
+
+static int psx_fft_size_from_norm(float v) {
+    /* 0.0 -> 256 (2^8), 1.0 -> 32768 (2^15) — 8 steps */
+    int exp_val = 8 + (int)(v * 7.0f + 0.5f);
+    if (exp_val < 8) exp_val = 8;
+    if (exp_val > 15) exp_val = 15;
+    return 1 << exp_val;
+}
+
+static void ps_free_buffers(track_t *t) {
+    if (t->psx.stretch_l) { delete t->psx.stretch_l; t->psx.stretch_l = NULL; }
+    if (t->psx.stretch_r) { delete t->psx.stretch_r; t->psx.stretch_r = NULL; }
+    if (t->psx.binaural)  { delete t->psx.binaural;  t->psx.binaural = NULL; }
+    if (t->psx.inbuf_l)   { free(t->psx.inbuf_l);    t->psx.inbuf_l = NULL; }
+    if (t->psx.inbuf_r)   { free(t->psx.inbuf_r);    t->psx.inbuf_r = NULL; }
+    if (t->psx.outbuf)    { free(t->psx.outbuf);      t->psx.outbuf = NULL; }
+    t->psx.inbuf_count = 0;
+    t->psx.outbuf_count = 0;
+    t->psx.outbuf_read = 0;
+    t->psx.outbuf_write = 0;
+}
+
+static void ps_alloc_stretchers(track_t *t) {
+    int fft_sz = t->psx.fft_size;
+    if (fft_sz < 256) fft_sz = 256;
+
+    /* Create L and R stretchers (mono each, stereo_mode 1=left, 2=right) */
+    t->psx.stretch_l = new ProcessedStretch(
+        t->psx.stretch_amount, fft_sz, W_HAMMING, false, (float)MOVE_SAMPLE_RATE, 1);
+    t->psx.stretch_r = new ProcessedStretch(
+        t->psx.stretch_amount, fft_sz, W_HAMMING, false, (float)MOVE_SAMPLE_RATE, 2);
+
+    t->psx.stretch_l->setBufferSize(fft_sz);
+    t->psx.stretch_r->setBufferSize(fft_sz);
+
+    t->psx.stretch_l->set_rap(t->psx.stretch_amount);
+    t->psx.stretch_r->set_rap(t->psx.stretch_amount);
+
+    /* Set up spectrum processing chain */
+    std::vector<SpectrumProcess> chain = {
+        {SPT_FreqShift,    t->psx.freqshift_en != 0},
+        {SPT_Spread,       t->psx.spread_en != 0},
+        {SPT_RatioMix,     t->psx.ratiomix_en != 0},
+        {SPT_Filter,       false},
+        {SPT_Compressor,   false},
+    };
+    t->psx.stretch_l->m_spectrum_processes = chain;
+    t->psx.stretch_r->m_spectrum_processes = chain;
+
+    t->psx.stretch_l->set_parameters(&t->psx.proc_pars);
+    t->psx.stretch_r->set_parameters(&t->psx.proc_pars);
+
+    /* Binaural beats */
+    t->psx.binaural = new BinauralBeats(MOVE_SAMPLE_RATE);
+
+    /* Input ring buffers (mono each) */
+    int max_buf = t->psx.stretch_l->get_max_bufsize();
+    t->psx.inbuf_capacity = max_buf;
+    t->psx.inbuf_l = (float *)calloc(max_buf, sizeof(float));
+    t->psx.inbuf_r = (float *)calloc(max_buf, sizeof(float));
+    t->psx.inbuf_count = 0;
+
+    /* Output ring buffer (stereo interleaved) */
+    int out_cap = fft_sz * PSX_OUTBUF_MULT;
+    if (out_cap < 4096) out_cap = 4096;
+    t->psx.outbuf_capacity = out_cap;
+    t->psx.outbuf = (float *)calloc(out_cap * 2, sizeof(float));
+    t->psx.outbuf_count = 0;
+    t->psx.outbuf_read = 0;
+    t->psx.outbuf_write = 0;
+
+    t->psx.needs_reinit = 0;
+    t->psx.fill_needed = 1;
+}
+
+static void ps_init_track(track_t *t) {
+    memset(&t->psx, 0, sizeof(t->psx));
+    t->psx.stretch_amount = PSX_DEFAULT_STRETCH;
+    t->psx.fft_size_norm = 0.3f;
+    t->psx.fft_size = PSX_DEFAULT_FFT_SIZE;
+    t->psx.binaural_power = 0.5f;
+    t->psx.binaural_freq = 7.0f;
+    /* Default ratio levels: only ratio 3 (1.0x = unison) active */
+    t->psx.ratio_levels[2] = 1.0f;
+}
+
+static void ps_reinit_track(track_t *t) {
+    ps_free_buffers(t);
+    if (t->psx.enabled) {
+        ps_alloc_stretchers(t);
+    }
+}
+
+static void ps_update_chain_enables(track_t *t) {
+    if (!t->psx.stretch_l || !t->psx.stretch_r) return;
+    auto update = [&](std::vector<SpectrumProcess>& chain) {
+        for (auto& e : chain) {
+            switch (e.m_index) {
+                case SPT_FreqShift:  e.m_enabled = t->psx.freqshift_en != 0; break;
+                case SPT_Spread:     e.m_enabled = t->psx.spread_en != 0; break;
+                case SPT_RatioMix:   e.m_enabled = t->psx.ratiomix_en != 0; break;
+                default: break;
+            }
+        }
+    };
+    update(t->psx.stretch_l->m_spectrum_processes);
+    update(t->psx.stretch_r->m_spectrum_processes);
+}
+
+static void ps_update_params(track_t *t) {
+    if (!t->psx.stretch_l || !t->psx.stretch_r) return;
+    t->psx.stretch_l->set_parameters(&t->psx.proc_pars);
+    t->psx.stretch_r->set_parameters(&t->psx.proc_pars);
+    t->psx.stretch_l->set_rap(t->psx.stretch_amount);
+    t->psx.stretch_r->set_rap(t->psx.stretch_amount);
+}
+
+static void ps_update_binaural(track_t *t) {
+    if (!t->psx.binaural) return;
+    t->psx.binaural->pars.mono = t->psx.binaural_power;
+    t->psx.binaural->pars.stereo_mode = (BB_STEREO_MODE)t->psx.binaural_mode;
+    /* Configure binaural frequency via FreeEdit: set a flat curve at the target freq */
+    t->psx.binaural->pars.free_edit.set_enabled(t->psx.binaural_en != 0);
+    if (t->psx.binaural_en) {
+        t->psx.binaural->pars.free_edit.extreme_y.init(0.05f, 50.0f, FE_LOG, true, true);
+        t->psx.binaural->pars.free_edit.set_all_values(t->psx.binaural_freq);
+        t->psx.binaural->pars.free_edit.update_curve(256);
+    }
+}
+
+static void ps_handle_param(track_t *t, const char *param, const char *val) {
+    if (!val) return;
+
+    if (strcmp(param, "psx_enabled") == 0) {
+        int new_en = atoi(val) ? 1 : 0;
+        if (new_en != t->psx.enabled) {
+            t->psx.enabled = new_en;
+            t->psx.needs_reinit = 1;
+        }
+        return;
+    }
+    if (strcmp(param, "psx_stretch") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.1f) v = 0.1f;
+        if (v > 1024.0f) v = 1024.0f;
+        t->psx.stretch_amount = v;
+        if (t->psx.stretch_l) {
+            t->psx.stretch_l->set_rap(v);
+            t->psx.stretch_r->set_rap(v);
+        }
+        return;
+    }
+    if (strcmp(param, "psx_fft_size") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.fft_size_norm = v;
+        int new_sz = psx_fft_size_from_norm(v);
+        if (new_sz != t->psx.fft_size) {
+            t->psx.fft_size = new_sz;
+            if (t->psx.enabled) t->psx.needs_reinit = 1;
+        }
+        return;
+    }
+    if (strcmp(param, "psx_freqshift_en") == 0) {
+        t->psx.freqshift_en = atoi(val) ? 1 : 0;
+        ps_update_chain_enables(t);
+        return;
+    }
+    if (strcmp(param, "psx_freqshift_hz") == 0) {
+        float v = (float)atof(val);
+        if (v < -1000.0f) v = -1000.0f;
+        if (v > 1000.0f) v = 1000.0f;
+        t->psx.freq_shift_hz = v;
+        t->psx.proc_pars.freq_shift.Hz = (int)v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_spread_en") == 0) {
+        t->psx.spread_en = atoi(val) ? 1 : 0;
+        ps_update_chain_enables(t);
+        return;
+    }
+    if (strcmp(param, "psx_spread_bw") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.spread_bw = v;
+        t->psx.proc_pars.spread.bandwidth = v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_ratiomix_en") == 0) {
+        t->psx.ratiomix_en = atoi(val) ? 1 : 0;
+        ps_update_chain_enables(t);
+        return;
+    }
+    /* psx_ratio_1 .. psx_ratio_8 */
+    if (strncmp(param, "psx_ratio_", 10) == 0) {
+        int idx = atoi(param + 10) - 1;
+        if (idx < 0 || idx >= 8) return;
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.ratio_levels[idx] = v;
+        t->psx.proc_pars.ratiomix.ratiolevels[idx] = (double)v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_binaural_en") == 0) {
+        t->psx.binaural_en = atoi(val) ? 1 : 0;
+        ps_update_binaural(t);
+        return;
+    }
+    if (strcmp(param, "psx_binaural_pow") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.binaural_power = v;
+        ps_update_binaural(t);
+        return;
+    }
+    if (strcmp(param, "psx_binaural_mode") == 0) {
+        int v = atoi(val);
+        if (v < 0) v = 0;
+        if (v > 2) v = 2;
+        t->psx.binaural_mode = v;
+        ps_update_binaural(t);
+        return;
+    }
+    if (strcmp(param, "psx_binaural_freq") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.05f) v = 0.05f;
+        if (v > 50.0f) v = 50.0f;
+        t->psx.binaural_freq = v;
+        ps_update_binaural(t);
+        return;
+    }
+}
+
+/* Process audio through PaulXStretch spectral chain (insert effect).
+ * Called from render_track after normal playback produces audio. */
+static void ps_process_track(track_t *t, int16_t *out, int frames) {
+    if (!t->psx.enabled) return;
+
+    /* Lazy reinit on parameter change */
+    if (t->psx.needs_reinit) {
+        ps_reinit_track(t);
+    }
+    if (!t->psx.stretch_l || !t->psx.stretch_r) return;
+
+    /* Convert int16 stereo interleaved → float mono L/R and feed input ring */
+    for (int i = 0; i < frames; i++) {
+        if (t->psx.inbuf_count < t->psx.inbuf_capacity) {
+            t->psx.inbuf_l[t->psx.inbuf_count] = (float)out[i * 2 + 0] / 32768.0f;
+            t->psx.inbuf_r[t->psx.inbuf_count] = (float)out[i * 2 + 1] / 32768.0f;
+            t->psx.inbuf_count++;
+        }
+    }
+
+    /* Initial fill: feed max_bufsize of silence/input on first use */
+    if (t->psx.fill_needed) {
+        int fill_sz = t->psx.stretch_l->get_nsamples_for_fill();
+        if (t->psx.inbuf_count >= fill_sz) {
+            t->psx.stretch_l->process(t->psx.inbuf_l, fill_sz);
+            t->psx.stretch_r->process(t->psx.inbuf_r, fill_sz);
+            /* Shift remaining input */
+            int rem = t->psx.inbuf_count - fill_sz;
+            if (rem > 0) {
+                memmove(t->psx.inbuf_l, t->psx.inbuf_l + fill_sz, rem * sizeof(float));
+                memmove(t->psx.inbuf_r, t->psx.inbuf_r + fill_sz, rem * sizeof(float));
+            }
+            t->psx.inbuf_count = rem;
+            t->psx.fill_needed = 0;
+        } else {
+            /* Not enough input yet — output silence */
+            memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
+            return;
+        }
+    }
+
+    /* Feed stretcher: check how many samples it needs */
+    int bufsize = t->psx.stretch_l->get_bufsize();
+    while (t->psx.inbuf_count >= bufsize) {
+        int need_l = t->psx.stretch_l->get_nsamples(0.5f);
+        int need_r = t->psx.stretch_r->get_nsamples(0.5f);
+
+        if (need_l > 0 && t->psx.inbuf_count >= need_l) {
+            REALTYPE onset_l = t->psx.stretch_l->process(t->psx.inbuf_l, need_l);
+            t->psx.stretch_l->here_is_onset(onset_l);
+
+            /* Copy L output to ring buffer */
+            int out_sz = t->psx.stretch_l->get_bufsize();
+            for (int i = 0; i < out_sz && t->psx.outbuf_count < t->psx.outbuf_capacity; i++) {
+                t->psx.outbuf[t->psx.outbuf_write * 2 + 0] = t->psx.stretch_l->out_buf[i];
+                /* R channel placeholder — filled below */
+                t->psx.outbuf[t->psx.outbuf_write * 2 + 1] = 0.0f;
+                t->psx.outbuf_write = (t->psx.outbuf_write + 1) % t->psx.outbuf_capacity;
+                t->psx.outbuf_count++;
+            }
+        }
+
+        if (need_r > 0 && t->psx.inbuf_count >= need_r) {
+            REALTYPE onset_r = t->psx.stretch_r->process(t->psx.inbuf_r, need_r);
+            t->psx.stretch_r->here_is_onset(onset_r);
+
+            /* Fill R channel in ring buffer — go back and overwrite the R slots */
+            int out_sz = t->psx.stretch_r->get_bufsize();
+            int rpos = (t->psx.outbuf_write - out_sz + t->psx.outbuf_capacity) % t->psx.outbuf_capacity;
+            for (int i = 0; i < out_sz; i++) {
+                t->psx.outbuf[rpos * 2 + 1] = t->psx.stretch_r->out_buf[i];
+                rpos = (rpos + 1) % t->psx.outbuf_capacity;
+            }
+        }
+
+        /* Consume input */
+        int consumed = (need_l > need_r) ? need_l : need_r;
+        if (consumed <= 0) consumed = bufsize;
+        if (consumed > t->psx.inbuf_count) consumed = t->psx.inbuf_count;
+
+        int rem = t->psx.inbuf_count - consumed;
+        if (rem > 0) {
+            memmove(t->psx.inbuf_l, t->psx.inbuf_l + consumed, rem * sizeof(float));
+            memmove(t->psx.inbuf_r, t->psx.inbuf_r + consumed, rem * sizeof(float));
+        }
+        t->psx.inbuf_count = rem;
+
+        /* Also handle skip samples (for stretch ratios < 1) */
+        int skip = t->psx.stretch_l->get_skip_nsamples();
+        if (skip > 0 && skip <= t->psx.inbuf_count) {
+            int rem2 = t->psx.inbuf_count - skip;
+            if (rem2 > 0) {
+                memmove(t->psx.inbuf_l, t->psx.inbuf_l + skip, rem2 * sizeof(float));
+                memmove(t->psx.inbuf_r, t->psx.inbuf_r + skip, rem2 * sizeof(float));
+            }
+            t->psx.inbuf_count = rem2;
+        }
+
+        if (need_l == 0 && need_r == 0) break;
+    }
+
+    /* Apply binaural beats if enabled */
+    if (t->psx.binaural_en && t->psx.binaural && t->psx.outbuf_count > 0) {
+        /* Process in-place on the ring buffer — extract a contiguous chunk */
+        /* For simplicity, process only the frames we'll drain this block */
+        /* (binaural is applied during drain below) */
+    }
+
+    /* Drain output ring buffer into int16 output */
+    if (t->psx.outbuf_count >= frames) {
+        float tmp_l[MOVE_FRAMES_PER_BLOCK];
+        float tmp_r[MOVE_FRAMES_PER_BLOCK];
+
+        for (int i = 0; i < frames; i++) {
+            tmp_l[i] = t->psx.outbuf[t->psx.outbuf_read * 2 + 0];
+            tmp_r[i] = t->psx.outbuf[t->psx.outbuf_read * 2 + 1];
+            t->psx.outbuf_read = (t->psx.outbuf_read + 1) % t->psx.outbuf_capacity;
+        }
+        t->psx.outbuf_count -= frames;
+
+        /* Apply binaural beats on the drained block */
+        if (t->psx.binaural_en && t->psx.binaural) {
+            t->psx.binaural->process(tmp_l, tmp_r, frames, 0.5f);
+        }
+
+        /* Convert float back to int16 */
+        for (int i = 0; i < frames; i++) {
+            float l = tmp_l[i] * 32767.0f;
+            float r = tmp_r[i] * 32767.0f;
+            if (l > 32767.0f) l = 32767.0f;
+            if (l < -32767.0f) l = -32767.0f;
+            if (r > 32767.0f) r = 32767.0f;
+            if (r < -32767.0f) r = -32767.0f;
+            out[i * 2 + 0] = (int16_t)l;
+            out[i * 2 + 1] = (int16_t)r;
+        }
+    } else {
+        /* Not enough output buffered yet — output silence while filling */
+        memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
+    }
+}
+
+/* ============================================================================
+ * Track helper — free all memory for a track
+ * ============================================================================ */
+
 static void free_track(track_t *t) {
     if (t->audio_data) {
         free(t->audio_data);
@@ -942,6 +1383,7 @@ static void free_track(track_t *t) {
         free(t->bng_out_buf);
         t->bng_out_buf = NULL;
     }
+    ps_free_buffers(t);
 }
 
 /* ============================================================================
@@ -978,6 +1420,9 @@ static void init_track(track_t *t) {
     t->bng_req.pitch = 1.0;
     t->bng_req.reset = true;
     t->bng_req.resampleMode = resampleMode_autoOut;
+
+    /* Initialize PaulXStretch defaults */
+    ps_init_track(t);
 }
 
 static void recompute_ratios(track_t *t);
@@ -1405,6 +1850,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (track_idx < 0 || track_idx >= NUM_TRACKS) return;
 
     track_t *t = &inst->tracks[track_idx];
+
+    /* --- PaulXStretch parameters --- */
+    if (strncmp(param, "psx_", 4) == 0) {
+        ps_handle_param(t, param, val);
+        return;
+    }
 
     /* --- File loading --- */
     if (strcmp(param, "file_path") == 0) {
@@ -3464,6 +3915,11 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         t->play_pos_frac = t->bng_req.position;
 
         produced = (avail > 0) ? 1 : 0;
+    }
+
+    /* PaulXStretch spectral processing (insert effect, post-playback) */
+    if (produced && t->psx.enabled) {
+        ps_process_track(t, out, frames);
     }
 
     /* Muted: position has already advanced (for re-sync on unmute), but

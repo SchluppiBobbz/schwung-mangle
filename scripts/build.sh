@@ -85,9 +85,15 @@ echo "Compiling DSP plugin..."
 ${CROSS_PREFIX}g++ -Ofast -shared -fPIC -std=c++20 \
     -march=armv8-a -mtune=cortex-a72 \
     -fomit-frame-pointer -fno-stack-protector \
-    -DNDEBUG \
+    -DNDEBUG -DPS_USE_PFFFT=1 \
     -I"$BUNGEE_DIR" \
+    -I"$BUNGEE_DIR/submodules" \
+    -Isrc/dsp/paulxstretch \
     src/dsp/plugin.cpp \
+    src/dsp/paulxstretch/Stretch.cpp \
+    src/dsp/paulxstretch/ProcessedStretch.cpp \
+    src/dsp/paulxstretch/BinauralBeats.cpp \
+    src/dsp/paulxstretch/FreeEdit.cpp \
     -o build/dsp.so \
     build/bungee/libbungee.a \
     -lm

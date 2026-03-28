@@ -90,6 +90,7 @@ var VIEW_MAIN_MENU = 14; /* MoveMenu button — main project menu */
 var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) */
 var VIEW_CONFIRM_RESUME = 16; /* Resume previous session or start new project */
 var VIEW_MODE_SELECT = 17;    /* Shift+Step1 mini-menu: Sync / Free / Varispeed */
+var VIEW_PAULXSTRETCH = 18;   /* PaulXStretch spectral effects view */
 
 /* ============ Debug Logging ============ */
 /* Set to true to enable debug logging to /tmp/scene_debug.log on device.
@@ -167,9 +168,12 @@ var SCENE_FIELDS = [
     "sliceMode", "sliceCount", "sliceBoundaries", "selectedSlice",
     "slicePadOffset", "sliceRegionStart", "sliceRegionEnd", "sliceThreshold",
     "slicePitches", "sliceTempos", "lazySub",
-    "zoomLevel", "zoomCenter", "vScale"
+    "zoomLevel", "zoomCenter", "vScale",
+    "psxEnabled", "psxEffectEnabled", "psxStretch", "psxFftSize",
+    "psxFreqShiftHz", "psxSpreadBw", "psxRatioLevels",
+    "psxBinauralPower", "psxBinauralMode", "psxBinauralFreq"
 ];
-var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true };
+var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true, psxEffectEnabled: true, psxRatioLevels: true };
 
 /**
  * Copy scene-related fields from src object to dst object.
@@ -419,6 +423,46 @@ var skipbackTargetSlot = -1;  /* which scene slot the in-flight skipback will wr
 
 var pendingSceneRestore = null;  /* scene settings to apply after file loads */
 
+/* PaulXStretch proxy globals (mirrored to/from trackStates on switch) */
+var psxEnabled = false;
+var psxActiveEffect = 0;     /* 0=stretch,1=freqshift,2=spread,3=ratios,4=binaural */
+var psxEffectEnabled = [false, false, false, false, false];
+var psxStretch = 8.0;
+var psxFftSize = 0.3;
+var psxFreqShiftHz = 0.0;
+var psxSpreadBw = 0.3;
+var psxRatioLevels = [0,0,1,0,0,0,0,0];
+var psxBinauralPower = 0.5;
+var psxBinauralMode = 0;
+var psxBinauralFreq = 7.0;
+var PSX_EFFECT_NAMES = ["Stretch", "FreqShift", "Spread", "Ratios", "Binaural"];
+var PSX_BINAURAL_MODES = ["LR", "RL", "Symm"];
+
+/** Send a single psx param to the DSP for the active track */
+function psxSendParam(key, val) {
+    host_module_set_param("t" + activeTrack + ":" + key, String(val));
+}
+
+/** Push all psx params to DSP — called on scene restore / track switch */
+function psxSendAllParams() {
+    var p = "t" + activeTrack + ":";
+    host_module_set_param(p + "psx_enabled", psxEnabled ? "1" : "0");
+    host_module_set_param(p + "psx_stretch", String(psxStretch));
+    host_module_set_param(p + "psx_fft_size", String(psxFftSize));
+    host_module_set_param(p + "psx_stretch_en", psxEffectEnabled[0] ? "1" : "0");
+    host_module_set_param(p + "psx_freqshift_en", psxEffectEnabled[1] ? "1" : "0");
+    host_module_set_param(p + "psx_freqshift_hz", String(psxFreqShiftHz));
+    host_module_set_param(p + "psx_spread_en", psxEffectEnabled[2] ? "1" : "0");
+    host_module_set_param(p + "psx_spread_bw", String(psxSpreadBw));
+    host_module_set_param(p + "psx_ratiomix_en", psxEffectEnabled[3] ? "1" : "0");
+    for (var i = 0; i < 8; i++)
+        host_module_set_param(p + "psx_ratio_" + (i+1), String(psxRatioLevels[i]));
+    host_module_set_param(p + "psx_binaural_en", psxEffectEnabled[4] ? "1" : "0");
+    host_module_set_param(p + "psx_binaural_pow", String(psxBinauralPower));
+    host_module_set_param(p + "psx_binaural_mode", String(psxBinauralMode));
+    host_module_set_param(p + "psx_binaural_freq", String(psxBinauralFreq));
+}
+
 /**
  * Create a default scene state object for a new scene at the given path.
  */
@@ -449,7 +493,18 @@ function makeSceneState(path) {
         zoomLevel:       0,
         zoomCenter:      0,
         vScale:          1.0,
-        exactLen:        0    /* exact musical loop length in input samples (float, 0 = use integer) */
+        exactLen:        0,    /* exact musical loop length in input samples (float, 0 = use integer) */
+        /* PaulXStretch */
+        psxEnabled:      false,
+        psxEffectEnabled: [false, false, false, false, false],
+        psxStretch:      8.0,
+        psxFftSize:      0.3,
+        psxFreqShiftHz:  0.0,
+        psxSpreadBw:     0.3,
+        psxRatioLevels:  [0,0,1,0,0,0,0,0],
+        psxBinauralPower: 0.5,
+        psxBinauralMode: 0,
+        psxBinauralFreq: 7.0
     };
 }
 
@@ -523,7 +578,19 @@ function makeTrackState() {
         scenes: [],           /* array of WAV paths */
         selectedSceneIdx: 0,  /* armed pad — target for new content */
         playingSceneIdx:  -1, /* currently playing scene (-1 = none) */
-        muted: false           /* non-destructive track mute */
+        muted: false,           /* non-destructive track mute */
+        /* PaulXStretch state */
+        psxEnabled: false,
+        psxActiveEffect: 0,     /* 0=stretch,1=freqshift,2=spread,3=ratios,4=binaural */
+        psxEffectEnabled: [false, false, false, false, false],
+        psxStretch: 8.0,
+        psxFftSize: 0.3,
+        psxFreqShiftHz: 0.0,
+        psxSpreadBw: 0.3,
+        psxRatioLevels: [0,0,1,0,0,0,0,0],
+        psxBinauralPower: 0.5,
+        psxBinauralMode: 0,
+        psxBinauralFreq: 7.0
     };
 }
 
@@ -594,6 +661,18 @@ function saveTrackUIState(idx) {
     ts.activePadNote = activePadNote;
     ts.isRecordedFile = isRecordedFile;
     ts.openedFilePath = openedFilePath;
+    /* PaulXStretch */
+    ts.psxEnabled = psxEnabled;
+    ts.psxActiveEffect = psxActiveEffect;
+    ts.psxEffectEnabled = psxEffectEnabled.slice();
+    ts.psxStretch = psxStretch;
+    ts.psxFftSize = psxFftSize;
+    ts.psxFreqShiftHz = psxFreqShiftHz;
+    ts.psxSpreadBw = psxSpreadBw;
+    ts.psxRatioLevels = psxRatioLevels.slice();
+    ts.psxBinauralPower = psxBinauralPower;
+    ts.psxBinauralMode = psxBinauralMode;
+    ts.psxBinauralFreq = psxBinauralFreq;
     /* Scenes — not proxied into globals, stored only in trackStates */
 }
 
@@ -655,6 +734,18 @@ function restoreSceneToGlobals(scene) {
     zoomLevel = scene.zoomLevel;
     zoomCenter = scene.zoomCenter;
     vScale = scene.vScale;
+    /* PaulXStretch */
+    psxEnabled = scene.psxEnabled || false;
+    psxEffectEnabled = (scene.psxEffectEnabled || [false,false,false,false,false]).slice();
+    psxStretch = scene.psxStretch || 8.0;
+    psxFftSize = scene.psxFftSize || 0.3;
+    psxFreqShiftHz = scene.psxFreqShiftHz || 0.0;
+    psxSpreadBw = scene.psxSpreadBw || 0.3;
+    psxRatioLevels = (scene.psxRatioLevels || [0,0,1,0,0,0,0,0]).slice();
+    psxBinauralPower = scene.psxBinauralPower || 0.5;
+    psxBinauralMode = scene.psxBinauralMode || 0;
+    psxBinauralFreq = scene.psxBinauralFreq || 7.0;
+    psxSendAllParams();
 }
 
 /**
@@ -671,7 +762,13 @@ function getGlobalsAsSceneSource() {
         selectedSlice: selectedSlice, slicePadOffset: slicePadOffset,
         sliceRegionStart: sliceRegionStart, sliceRegionEnd: sliceRegionEnd,
         sliceThreshold: sliceThreshold, slicePitches: slicePitches, sliceTempos: sliceTempos,
-        lazySub: lazySub, zoomLevel: zoomLevel, zoomCenter: zoomCenter, vScale: vScale
+        lazySub: lazySub, zoomLevel: zoomLevel, zoomCenter: zoomCenter, vScale: vScale,
+        psxEnabled: psxEnabled, psxEffectEnabled: psxEffectEnabled,
+        psxStretch: psxStretch, psxFftSize: psxFftSize,
+        psxFreqShiftHz: psxFreqShiftHz, psxSpreadBw: psxSpreadBw,
+        psxRatioLevels: psxRatioLevels,
+        psxBinauralPower: psxBinauralPower, psxBinauralMode: psxBinauralMode,
+        psxBinauralFreq: psxBinauralFreq
     };
 }
 
@@ -740,6 +837,18 @@ function restoreTrackUIState(idx) {
     pendingPlay = ts.pendingPlay;
     activePadNote = ts.activePadNote;
     isRecordedFile = ts.isRecordedFile;
+    /* PaulXStretch */
+    psxEnabled = ts.psxEnabled;
+    psxActiveEffect = ts.psxActiveEffect;
+    psxEffectEnabled = ts.psxEffectEnabled.slice();
+    psxStretch = ts.psxStretch;
+    psxFftSize = ts.psxFftSize;
+    psxFreqShiftHz = ts.psxFreqShiftHz;
+    psxSpreadBw = ts.psxSpreadBw;
+    psxRatioLevels = ts.psxRatioLevels.slice();
+    psxBinauralPower = ts.psxBinauralPower;
+    psxBinauralMode = ts.psxBinauralMode;
+    psxBinauralFreq = ts.psxBinauralFreq;
 }
 
 /**
@@ -1421,7 +1530,8 @@ function updateLeds() {
     var isSync   = (currentView === VIEW_SYNC);
     var isSlice = (currentView === VIEW_SLICE);
     var isLoop  = (currentView === VIEW_LOOP);
-    var isEdit  = isFree || isSync || isSlice || isLoop;
+    var isPsx   = (currentView === VIEW_PAULXSTRETCH);
+    var isEdit  = isFree || isSync || isSlice || isLoop || isPsx;
 
     /* Buttons available in all edit views */
     setButtonLED(CC_COPY,    isEdit  ? LED_DIM : LED_OFF);
@@ -1455,7 +1565,7 @@ function updateLeds() {
                     : varispeedEnabled ? VividYellow : Bright;
     setLED(STEP_BASE + 0, _step1Color);
     setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
-    setLED(STEP_BASE + 2, Black);  /* freed */
+    setLED(STEP_BASE + 2, isPsx ? Blue : DarkGrey);  /* Step 3 = PaulXStretch */
 
     /* Step 4: Pad mode LED — DarkGrey=Trigger, BrightRed=Gate, VividYellow=OneShot */
     var _padModeLed = trackStates[activeTrack].gateMode;
@@ -1474,13 +1584,26 @@ function updateLeds() {
     var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
     setLED(STEP_BASE + 7, (isFree || isSync) && hasPitchTempo ? VividYellow : Black);
 
-    /* Step 9/10: fade in/out LEDs (Trim/BPM/Slice) */
-    var hasFade = isFree || isSync || isSlice;
-    setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
-    setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
-
-    /* Step 11: Reverse LED (Trim/BPM/Slice) */
-    setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
+    /* Step 9-13: PaulXStretch effect LEDs or normal fade/reverse LEDs */
+    if (isPsx) {
+        for (var _ei = 0; _ei < 5; _ei++) {
+            var _isActive = (psxActiveEffect === _ei);
+            var _isEnabled = psxEffectEnabled[_ei];
+            var _col = _isActive && _isEnabled ? Bright
+                     : _isActive ? White
+                     : _isEnabled ? Blue
+                     : DarkGrey;
+            setLED(STEP_BASE + 8 + _ei, _col);
+        }
+    } else {
+        var hasFade = isFree || isSync || isSlice;
+        setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
+        setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
+        /* Step 11: Reverse LED (Trim/BPM/Slice) */
+        setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
+        setLED(STEP_BASE + 11, Black);
+        setLED(STEP_BASE + 12, Black);
+    }
 
     /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
     setLED(STEP_BASE + 13, (isFree || isSync || isSlice) ? BrightRed : Black);
@@ -1489,8 +1612,8 @@ function updateLeds() {
     setLED(STEP_BASE + 14, (isFree || isSync) ? BrightGreen : Black);
     setLED(STEP_BASE + 15, (isFree || isSync) ? BrightRed : isSlice ? BrightRed : Black);
 
-    /* Pad LEDs: scene launcher colors in Trim/BPM views */
-    if (isFree || isSync) {
+    /* Pad LEDs: scene launcher colors in Trim/BPM/PSX views */
+    if (isFree || isSync || isPsx) {
         var _ts = trackStates[activeTrack];
         sceneFlashCounter++;
         var _flashOn = (sceneFlashCounter % 12) < 6;
@@ -3255,6 +3378,75 @@ function drawSyncView() {
     if (beatDivPopupOpen) drawBeatDivPopup();
 }
 
+/* ============ PaulXStretch View ============ */
+function drawPaulXStretch() {
+    /* Header: T1 PSX <effect name> */
+    var hdr = "T" + (activeTrack + 1) + " PSX " + PSX_EFFECT_NAMES[psxActiveEffect];
+    fill_rect(0, 0, SCREEN_W, SCREEN_H, 0);
+    print(0, 0, hdr, 1);
+    /* Master on/off indicator */
+    var masterStr = psxEnabled ? "ON" : "OFF";
+    print(SCREEN_W - masterStr.length * 6, 0, masterStr, 1);
+
+    /* Effect-specific parameter display */
+    var y = 14;
+    if (psxActiveEffect === 0) {
+        /* Stretch */
+        var enStr = psxEffectEnabled[0] ? "[ON]" : "[off]";
+        print(0, y, "Stretch " + enStr, 1);
+        y += 11;
+        print(0, y, "Amount: " + psxStretch.toFixed(1) + "x", 1);
+        y += 11;
+        var fftApprox = Math.round(Math.pow(2, 8 + psxFftSize * 7));
+        print(0, y, "FFT: " + fftApprox, 1);
+    } else if (psxActiveEffect === 1) {
+        /* Freq Shift */
+        var enStr = psxEffectEnabled[1] ? "[ON]" : "[off]";
+        print(0, y, "FreqShift " + enStr, 1);
+        y += 11;
+        print(0, y, "Shift: " + psxFreqShiftHz.toFixed(0) + " Hz", 1);
+    } else if (psxActiveEffect === 2) {
+        /* Spread */
+        var enStr = psxEffectEnabled[2] ? "[ON]" : "[off]";
+        print(0, y, "Spread " + enStr, 1);
+        y += 11;
+        print(0, y, "BW: " + (psxSpreadBw * 100).toFixed(0) + "%", 1);
+    } else if (psxActiveEffect === 3) {
+        /* Ratios */
+        var enStr = psxEffectEnabled[3] ? "[ON]" : "[off]";
+        print(0, y, "Ratios " + enStr, 1);
+        y += 11;
+        /* Draw 8 ratio bars */
+        var barW = Math.floor((SCREEN_W - 16) / 8);
+        var barMaxH = 30;
+        var barY = y + barMaxH;
+        for (var i = 0; i < 8; i++) {
+            var bx = 8 + i * barW;
+            var bh = Math.round(psxRatioLevels[i] * barMaxH);
+            if (bh > 0) fill_rect(bx + 1, barY - bh, barW - 2, bh, 1);
+            /* Label */
+            print(bx + Math.floor(barW / 2) - 3, barY + 2, String(i + 1), 1);
+        }
+    } else if (psxActiveEffect === 4) {
+        /* Binaural */
+        var enStr = psxEffectEnabled[4] ? "[ON]" : "[off]";
+        print(0, y, "Binaural " + enStr, 1);
+        y += 11;
+        print(0, y, "Power: " + (psxBinauralPower * 100).toFixed(0) + "%", 1);
+        y += 11;
+        print(0, y, "Mode: " + PSX_BINAURAL_MODES[psxBinauralMode], 1);
+        y += 11;
+        print(0, y, "Freq: " + psxBinauralFreq.toFixed(1) + " Hz", 1);
+    }
+
+    /* Status bar at bottom */
+    var status = getActiveStatus();
+    if (status !== "") {
+        fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
+        print(0, SCREEN_H - 9, status, 1);
+    }
+}
+
 /* ============ Navigation & Actions ============ */
 
 /**
@@ -3371,6 +3563,10 @@ function switchView(view) {
         announce("Close project? " + closeDialogItems[closeDialogIndex]);
     } else if (view === VIEW_CONFIRM_RESUME) {
         announce("Resume project? " + resumeItems[resumeDialogIndex]);
+    } else if (view === VIEW_PAULXSTRETCH) {
+        psxSendAllParams();
+        updateLeds();
+        announce("PSX " + PSX_EFFECT_NAMES[psxActiveEffect]);
     }
 }
 
@@ -6232,6 +6428,93 @@ function handleCC(cc, value) {
         return;
     }
 
+    /* PaulXStretch encoder handling */
+    if (currentView === VIEW_PAULXSTRETCH) {
+        var delta = decodeDelta(value);
+        if (delta === 0) return;
+        if (psxActiveEffect === 0) {
+            /* Stretch page: E1=stretch amount (log), E2=FFT size */
+            if (cc === CC_E1) {
+                var logVal = Math.log(psxStretch) / Math.log(10);
+                logVal += delta * 0.05;
+                psxStretch = Math.pow(10, logVal);
+                if (psxStretch < 0.1) psxStretch = 0.1;
+                if (psxStretch > 1024) psxStretch = 1024;
+                psxStretch = Math.round(psxStretch * 100) / 100;
+                psxSendParam("psx_stretch", psxStretch);
+                showKnobStatus(0, "Str:" + psxStretch.toFixed(1));
+            } else if (cc === CC_E2) {
+                psxFftSize += delta * 0.02;
+                if (psxFftSize < 0) psxFftSize = 0;
+                if (psxFftSize > 1) psxFftSize = 1;
+                psxSendParam("psx_fft_size", psxFftSize);
+                /* Show approximate FFT size */
+                var fftApprox = Math.round(Math.pow(2, 8 + psxFftSize * 7));
+                showKnobStatus(1, "FFT:" + fftApprox);
+            }
+        } else if (psxActiveEffect === 1) {
+            /* FreqShift page: E1=freq shift Hz */
+            if (cc === CC_E1) {
+                var step = shiftHeld ? 1 : 10;
+                psxFreqShiftHz += delta * step;
+                if (psxFreqShiftHz < -1000) psxFreqShiftHz = -1000;
+                if (psxFreqShiftHz > 1000) psxFreqShiftHz = 1000;
+                psxSendParam("psx_freqshift_hz", psxFreqShiftHz);
+                showKnobStatus(0, "Shift:" + psxFreqShiftHz.toFixed(0) + "Hz");
+            }
+        } else if (psxActiveEffect === 2) {
+            /* Spread page: E1=bandwidth */
+            if (cc === CC_E1) {
+                psxSpreadBw += delta * 0.02;
+                if (psxSpreadBw < 0) psxSpreadBw = 0;
+                if (psxSpreadBw > 1) psxSpreadBw = 1;
+                psxSendParam("psx_spread_bw", psxSpreadBw);
+                showKnobStatus(0, "BW:" + (psxSpreadBw * 100).toFixed(0) + "%");
+            }
+        } else if (psxActiveEffect === 3) {
+            /* Ratios page: E1-E8 = ratio levels */
+            var knobIdx = -1;
+            if (cc === CC_E1) knobIdx = 0;
+            else if (cc === CC_E2) knobIdx = 1;
+            else if (cc === CC_E3) knobIdx = 2;
+            else if (cc === CC_E4) knobIdx = 3;
+            else if (cc === CC_E5) knobIdx = 4;
+            else if (cc === CC_E6) knobIdx = 5;
+            else if (cc === CC_E7) knobIdx = 6;
+            else if (cc === CC_E8) knobIdx = 7;
+            if (knobIdx >= 0) {
+                psxRatioLevels[knobIdx] += delta * 0.05;
+                if (psxRatioLevels[knobIdx] < 0) psxRatioLevels[knobIdx] = 0;
+                if (psxRatioLevels[knobIdx] > 1) psxRatioLevels[knobIdx] = 1;
+                psxSendParam("psx_ratio_" + (knobIdx + 1), psxRatioLevels[knobIdx]);
+                showKnobStatus(knobIdx, "R" + (knobIdx+1) + ":" + (psxRatioLevels[knobIdx] * 100).toFixed(0) + "%");
+            }
+        } else if (psxActiveEffect === 4) {
+            /* Binaural page: E1=power, E2=mode (cycle), E3=freq */
+            if (cc === CC_E1) {
+                psxBinauralPower += delta * 0.05;
+                if (psxBinauralPower < 0) psxBinauralPower = 0;
+                if (psxBinauralPower > 1) psxBinauralPower = 1;
+                psxSendParam("psx_binaural_pow", psxBinauralPower);
+                showKnobStatus(0, "Pow:" + (psxBinauralPower * 100).toFixed(0) + "%");
+            } else if (cc === CC_E2) {
+                psxBinauralMode += (delta > 0 ? 1 : -1);
+                if (psxBinauralMode < 0) psxBinauralMode = 2;
+                if (psxBinauralMode > 2) psxBinauralMode = 0;
+                psxSendParam("psx_binaural_mode", psxBinauralMode);
+                showKnobStatus(1, "Mode:" + PSX_BINAURAL_MODES[psxBinauralMode]);
+            } else if (cc === CC_E3) {
+                var step = shiftHeld ? 0.05 : 0.5;
+                psxBinauralFreq += delta * step;
+                if (psxBinauralFreq < 0.05) psxBinauralFreq = 0.05;
+                if (psxBinauralFreq > 50) psxBinauralFreq = 50;
+                psxSendParam("psx_binaural_freq", psxBinauralFreq);
+                showKnobStatus(2, "Freq:" + psxBinauralFreq.toFixed(1) + "Hz");
+            }
+        }
+        return;
+    }
+
     /* E1 turn: adjust start marker */
     if (cc === CC_E1) {
         var delta = decodeDelta(value);
@@ -6800,7 +7083,7 @@ function handleNote(note, velocity) {
 
     /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 = mode select mini-menu */
     if (velocity > 0 && note === STEP_BASE) {
-        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH];
         if (editViews.indexOf(currentView) >= 0 || currentView === VIEW_MODE_SELECT) {
             if (shiftHeld) {
                 /* Shift+Step1: open mini-menu or advance to next entry */
@@ -6836,16 +7119,51 @@ function handleNote(note, velocity) {
 
     /* Step 2: enter SLICE mode */
     if (velocity > 0 && note === STEP_BASE + 1) {
-        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP];
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH];
         if (editViews.indexOf(currentView) >= 0 && currentView !== VIEW_SLICE) {
             switchView(VIEW_SLICE);
         }
         return;
     }
 
-    /* Pad press/release: scene launcher in Trim/BPM, audition in Loop/Slice. */
+    /* Step 3: enter PaulXStretch view; press again to toggle master enable */
+    if (velocity > 0 && note === STEP_BASE + 2) {
+        var editViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH];
+        if (editViews.indexOf(currentView) >= 0) {
+            if (currentView === VIEW_PAULXSTRETCH) {
+                /* Already in PSX — toggle master enable */
+                psxEnabled = !psxEnabled;
+                psxSendParam("psx_enabled", psxEnabled ? "1" : "0");
+                showStatus(psxEnabled ? "PSX ON" : "PSX OFF", 20);
+                updateLeds();
+            } else {
+                switchView(VIEW_PAULXSTRETCH);
+            }
+        }
+        return;
+    }
+
+    /* PaulXStretch Steps 9-13: toggle effect + select knob page */
+    if (velocity > 0 && currentView === VIEW_PAULXSTRETCH
+            && note >= STEP_BASE + 8 && note <= STEP_BASE + 12) {
+        var effIdx = note - STEP_BASE - 8;
+        if (psxActiveEffect === effIdx) {
+            /* Already selected — toggle enable */
+            psxEffectEnabled[effIdx] = !psxEffectEnabled[effIdx];
+        } else {
+            /* Select this effect page */
+            psxActiveEffect = effIdx;
+        }
+        /* Send enable states to DSP */
+        var enKeys = ["psx_stretch_en", "psx_freqshift_en", "psx_spread_en", "psx_ratiomix_en", "psx_binaural_en"];
+        psxSendParam(enKeys[effIdx], psxEffectEnabled[effIdx] ? "1" : "0");
+        updateLeds();
+        return;
+    }
+
+    /* Pad press/release: scene launcher in Trim/BPM/PSX, audition in Loop/Slice. */
     if (note >= PAD_NOTE_MIN && note <= PAD_NOTE_MAX) {
-        if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_PAULXSTRETCH) {
             var padIdx = note - PAD_NOTE_MIN;
 
             if (velocity > 0) {
@@ -7751,6 +8069,9 @@ globalThis.tick = function() {
             break;
         case VIEW_MODE_SELECT:
             drawModeSelect();
+            break;
+        case VIEW_PAULXSTRETCH:
+            drawPaulXStretch();
             break;
     }
 };
