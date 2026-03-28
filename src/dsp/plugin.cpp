@@ -72,6 +72,7 @@ typedef struct plugin_api_v2 {
  * ============================================================================ */
 
 #define MAX_WAVEFORM_COLS 256
+#define WAVEFORM_GET_COLS 128   /* must match UI SCREEN_W */
 #define NORMALIZE_TARGET_DB (-0.3f)
 
 /* Maximum audio duration per track: 5 minutes at 44100 Hz */
@@ -2726,7 +2727,7 @@ static int v2_get_param(void *instance, const char *key, char *buf,
             return (n >= 0 && n < buf_len) ? n : -1;
         }
 
-        int16_t col_min[MAX_WAVEFORM_COLS], col_max[MAX_WAVEFORM_COLS];
+        int16_t col_min[WAVEFORM_GET_COLS], col_max[WAVEFORM_GET_COLS];
         int vis_start = 0, vis_end = t->audio_frames;
         if (param[8] == ':') {
             sscanf(param + 9, "%d,%d", &vis_start, &vis_end);
@@ -2736,10 +2737,10 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         int vis_range = vis_end - vis_start;
         if (vis_range < 0) vis_range = 0;
         if (!t->waveform_valid || vis_range <= RAW_SCAN_THRESHOLD) {
-            compute_waveform_raw_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
+            compute_waveform_raw_range(t, col_min, col_max, WAVEFORM_GET_COLS,
                                       vis_start, vis_end);
         } else {
-            resample_waveform_range(t, col_min, col_max, MAX_WAVEFORM_COLS,
+            resample_waveform_range(t, col_min, col_max, WAVEFORM_GET_COLS,
                                     vis_start, vis_end);
         }
 
@@ -2751,7 +2752,7 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         buf[pos++] = '[';
         remaining--;
 
-        for (int i = 0; i < MAX_WAVEFORM_COLS; i++) {
+        for (int i = 0; i < WAVEFORM_GET_COLS; i++) {
             float mn = (float)col_min[i] / 32768.0f;
             float mx = (float)col_max[i] / 32768.0f;
 
