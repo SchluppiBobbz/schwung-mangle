@@ -1396,10 +1396,12 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
             /* Drain R stretcher's skip counter to keep in sync */
             t->psx.stretch_r->get_skip_nsamples();
         } else {
-            /* rap > 1.0: stretcher doesn't need new input — advance state machine.
-             * Produces output via resynthesis from existing FFT data. */
-            t->psx.stretch_l->process(NULL, 0);
-            t->psx.stretch_r->process(NULL, 0);
+            /* No new input needed this iteration — re-synthesize from existing FFT
+             * spectral data. Must pass the inbuf pointer (not NULL) so process()
+             * actually updates out_buf; with NULL it leaves out_buf unchanged,
+             * causing the same frame to loop until new input arrives. */
+            t->psx.stretch_l->process(t->psx.inbuf_l, 0);
+            t->psx.stretch_r->process(t->psx.inbuf_r, 0);
         }
 
         /* Copy L+R output to ring buffer */
