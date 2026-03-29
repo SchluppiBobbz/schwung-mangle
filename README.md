@@ -17,6 +17,7 @@ A 4-track sample mangler running directly on Ableton Move via the [Schwung](http
 - **Three edit/playback modes:** FREE (by time), STRETCH (time-stretch, pitch preserved), VARISPEED (tape-style: pitch+speed together)
 - **Three pad modes per scene:** Trigger (toggle), Gate (hold), One Shot (always restarts)
 - **Quantized scene launch:** FREE, BEAT, 1BAR, 2BAR, 4BAR, SAMPLE END
+- **PaulXStretch spectral engine** (Step 3): FFT-based time-stretching post-effect with 7 effect pages — Ratios, Spread, FreqShift, Binaural beats, Filter, Compressor
 
 ## Prerequisites
 
@@ -52,6 +53,7 @@ cd schwung-mangle
 | Step 1 | Enter last-used edit mode (FREE or SYNC). LED: PaleGreen=FREE, BrightOrange=STRETCH, VividYellow=VARISPEED |
 | Shift+Step 1 | Cycle edit mode: FREE → VARISPEED → STRETCH → FREE |
 | Step 2 | Enter Slice mode |
+| Step 3 | Enter PaulXStretch view (press again to toggle PSX master on/off) |
 | Step 4 | Cycle pad mode: Trigger → Gate → One Shot (per active track) |
 | Step 5 | Toggle Clock Sync on/off |
 | Shift+Step 5 | Cycle quantize mode: FREE → BEAT → 1BAR → 2BAR → 4BAR → SAMPLE END |
@@ -144,6 +146,24 @@ Pad mode is saved **per scene**.
 | Step 16 | Shuffle all slices randomly |
 | Pads | Audition slice |
 | Sample | Save slices / Drum Preset / REX Loop |
+
+### PaulXStretch View (Step 3)
+
+Spectral time-stretching and processing post-effect. Press Step 3 to enter, press again to toggle master on/off.
+
+**Steps 9–15** select the effect page (press same step again to toggle that effect on/off):
+
+| Step | Page | Knobs |
+|------|------|-------|
+| Step 9 | Main | E1: Stretch amount (0.1–1024×, log), E2: FFT size, E8: Volume (−24 to +6 dB) |
+| Step 10 | Ratios | E1–E8: Ratio mix levels for 8 pitch-shifted copies |
+| Step 11 | Spread | E1: Spectral spread bandwidth (0–100%) |
+| Step 12 | FreqShift | E1: Frequency shift in Hz (−1000 to +1000, Shift = fine) |
+| Step 13 | Binaural | E1: Power, E2: Mode (LR/RL/Symm), E3: Beat freq (0.05–50 Hz) |
+| Step 14 | Filter | E1: Low cutoff (20–20000 Hz, log), E2: High cutoff (log) |
+| Step 15 | Compress | E1: Spectral compressor power (0–100%) |
+
+LED colors: **Bright** = active+enabled, **White** = active page, **Blue** = enabled, **DarkGrey** = off.
 
 ## Header Indicators
 

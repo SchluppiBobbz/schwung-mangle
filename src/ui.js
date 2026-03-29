@@ -373,7 +373,7 @@ var sliceMenuEditing = false;
 var slicePadOffset = 0;  /* pad bank offset (multiples of 32) */
 
 /* Scratch file — all recordings go here, user "Save As" to keep */
-var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Move Everything/Recordings";
+var SCRATCH_DIR = "/data/UserData/UserLibrary/Samples/Schwung/Recordings/Projects";
 var SCRATCH_PATH = SCRATCH_DIR + "/.mangle-scratch.wav";
 var SAVE_DIR = SCRATCH_DIR;  /* default destination for saved files */
 
@@ -425,8 +425,8 @@ var pendingSceneRestore = null;  /* scene settings to apply after file loads */
 
 /* PaulXStretch proxy globals (mirrored to/from trackStates on switch) */
 var psxEnabled = false;
-var psxActiveEffect = 0;     /* 0=stretch,1=freqshift,2=spread,3=ratios,4=binaural */
-var psxEffectEnabled = [false, false, false, false, false];
+var psxActiveEffect = 0;     /* 0=Main,1=Ratios,2=Spread,3=FreqShift,4=Binaural,5=Filter,6=Compress */
+var psxEffectEnabled = [false, false, false, false, false, false, false];
 var psxStretch = 8.0;
 var psxFftSize = 0.3;
 var psxFreqShiftHz = 0.0;
@@ -435,7 +435,11 @@ var psxRatioLevels = [0,0,1,0,0,0,0,0];
 var psxBinauralPower = 0.5;
 var psxBinauralMode = 0;
 var psxBinauralFreq = 7.0;
-var PSX_EFFECT_NAMES = ["Stretch", "FreqShift", "Spread", "Ratios", "Binaural"];
+var psxFilterLow = 20.0;
+var psxFilterHigh = 20000.0;
+var psxCompressPower = 0.0;
+var psxVolume = 0.0;
+var PSX_EFFECT_NAMES = ["Main", "Ratios", "Spread", "FreqShift", "Binaural", "Filter", "Compress"];
 var PSX_BINAURAL_MODES = ["LR", "RL", "Symm"];
 
 /** Send a single psx param to the DSP for the active track */
@@ -443,24 +447,31 @@ function psxSendParam(key, val) {
     host_module_set_param("t" + activeTrack + ":" + key, String(val));
 }
 
-/** Push all psx params to DSP — called on scene restore / track switch */
+/** Push all psx params to DSP — called on scene restore / track switch.
+ * Page order: 0=Main, 1=Ratios, 2=Spread, 3=FreqShift, 4=Binaural, 5=Filter, 6=Compress */
 function psxSendAllParams() {
     var p = "t" + activeTrack + ":";
     host_module_set_param(p + "psx_enabled", psxEnabled ? "1" : "0");
     host_module_set_param(p + "psx_stretch", String(psxStretch));
     host_module_set_param(p + "psx_fft_size", String(psxFftSize));
-    host_module_set_param(p + "psx_stretch_en", psxEffectEnabled[0] ? "1" : "0");
-    host_module_set_param(p + "psx_freqshift_en", psxEffectEnabled[1] ? "1" : "0");
-    host_module_set_param(p + "psx_freqshift_hz", String(psxFreqShiftHz));
-    host_module_set_param(p + "psx_spread_en", psxEffectEnabled[2] ? "1" : "0");
-    host_module_set_param(p + "psx_spread_bw", String(psxSpreadBw));
-    host_module_set_param(p + "psx_ratiomix_en", psxEffectEnabled[3] ? "1" : "0");
+    host_module_set_param(p + "psx_volume", String(psxVolume));
+    host_module_set_param(p + "psx_stretch_en",    psxEffectEnabled[0] ? "1" : "0");
+    host_module_set_param(p + "psx_ratiomix_en",   psxEffectEnabled[1] ? "1" : "0");
     for (var i = 0; i < 8; i++)
         host_module_set_param(p + "psx_ratio_" + (i+1), String(psxRatioLevels[i]));
-    host_module_set_param(p + "psx_binaural_en", psxEffectEnabled[4] ? "1" : "0");
+    host_module_set_param(p + "psx_spread_en",     psxEffectEnabled[2] ? "1" : "0");
+    host_module_set_param(p + "psx_spread_bw", String(psxSpreadBw));
+    host_module_set_param(p + "psx_freqshift_en",  psxEffectEnabled[3] ? "1" : "0");
+    host_module_set_param(p + "psx_freqshift_hz", String(psxFreqShiftHz));
+    host_module_set_param(p + "psx_binaural_en",   psxEffectEnabled[4] ? "1" : "0");
     host_module_set_param(p + "psx_binaural_pow", String(psxBinauralPower));
     host_module_set_param(p + "psx_binaural_mode", String(psxBinauralMode));
     host_module_set_param(p + "psx_binaural_freq", String(psxBinauralFreq));
+    host_module_set_param(p + "psx_filter_en",     psxEffectEnabled[5] ? "1" : "0");
+    host_module_set_param(p + "psx_filter_low", String(psxFilterLow));
+    host_module_set_param(p + "psx_filter_high", String(psxFilterHigh));
+    host_module_set_param(p + "psx_compressor_en", psxEffectEnabled[6] ? "1" : "0");
+    host_module_set_param(p + "psx_compressor_pow", String(psxCompressPower));
 }
 
 /**
@@ -496,7 +507,7 @@ function makeSceneState(path) {
         exactLen:        0,    /* exact musical loop length in input samples (float, 0 = use integer) */
         /* PaulXStretch */
         psxEnabled:      false,
-        psxEffectEnabled: [false, false, false, false, false],
+        psxEffectEnabled: [false, false, false, false, false, false, false],
         psxStretch:      8.0,
         psxFftSize:      0.3,
         psxFreqShiftHz:  0.0,
@@ -504,7 +515,11 @@ function makeSceneState(path) {
         psxRatioLevels:  [0,0,1,0,0,0,0,0],
         psxBinauralPower: 0.5,
         psxBinauralMode: 0,
-        psxBinauralFreq: 7.0
+        psxBinauralFreq: 7.0,
+        psxFilterLow:    20.0,
+        psxFilterHigh:   20000.0,
+        psxCompressPower: 0.0,
+        psxVolume:       0.0
     };
 }
 
@@ -581,8 +596,8 @@ function makeTrackState() {
         muted: false,           /* non-destructive track mute */
         /* PaulXStretch state */
         psxEnabled: false,
-        psxActiveEffect: 0,     /* 0=stretch,1=freqshift,2=spread,3=ratios,4=binaural */
-        psxEffectEnabled: [false, false, false, false, false],
+        psxActiveEffect: 0,     /* 0=Main,1=Ratios,2=Spread,3=FreqShift,4=Binaural,5=Filter,6=Compress */
+        psxEffectEnabled: [false, false, false, false, false, false, false],
         psxStretch: 8.0,
         psxFftSize: 0.3,
         psxFreqShiftHz: 0.0,
@@ -590,7 +605,11 @@ function makeTrackState() {
         psxRatioLevels: [0,0,1,0,0,0,0,0],
         psxBinauralPower: 0.5,
         psxBinauralMode: 0,
-        psxBinauralFreq: 7.0
+        psxBinauralFreq: 7.0,
+        psxFilterLow: 20.0,
+        psxFilterHigh: 20000.0,
+        psxCompressPower: 0.0,
+        psxVolume: 0.0
     };
 }
 
@@ -673,6 +692,10 @@ function saveTrackUIState(idx) {
     ts.psxBinauralPower = psxBinauralPower;
     ts.psxBinauralMode = psxBinauralMode;
     ts.psxBinauralFreq = psxBinauralFreq;
+    ts.psxFilterLow = psxFilterLow;
+    ts.psxFilterHigh = psxFilterHigh;
+    ts.psxCompressPower = psxCompressPower;
+    ts.psxVolume = psxVolume;
     /* Scenes — not proxied into globals, stored only in trackStates */
 }
 
@@ -734,9 +757,11 @@ function restoreSceneToGlobals(scene) {
     zoomLevel = scene.zoomLevel;
     zoomCenter = scene.zoomCenter;
     vScale = scene.vScale;
-    /* PaulXStretch */
+    /* PaulXStretch — pad psxEffectEnabled to 7 for backward compat with old 5-element saves */
     psxEnabled = scene.psxEnabled || false;
-    psxEffectEnabled = (scene.psxEffectEnabled || [false,false,false,false,false]).slice();
+    var _psxEn = (scene.psxEffectEnabled || []).slice();
+    while (_psxEn.length < 7) _psxEn.push(false);
+    psxEffectEnabled = _psxEn;
     psxStretch = scene.psxStretch || 8.0;
     psxFftSize = scene.psxFftSize || 0.3;
     psxFreqShiftHz = scene.psxFreqShiftHz || 0.0;
@@ -745,6 +770,10 @@ function restoreSceneToGlobals(scene) {
     psxBinauralPower = scene.psxBinauralPower || 0.5;
     psxBinauralMode = scene.psxBinauralMode || 0;
     psxBinauralFreq = scene.psxBinauralFreq || 7.0;
+    psxFilterLow = scene.psxFilterLow || 20.0;
+    psxFilterHigh = scene.psxFilterHigh || 20000.0;
+    psxCompressPower = scene.psxCompressPower || 0.0;
+    psxVolume = scene.psxVolume || 0.0;
     psxSendAllParams();
 }
 
@@ -768,7 +797,9 @@ function getGlobalsAsSceneSource() {
         psxFreqShiftHz: psxFreqShiftHz, psxSpreadBw: psxSpreadBw,
         psxRatioLevels: psxRatioLevels,
         psxBinauralPower: psxBinauralPower, psxBinauralMode: psxBinauralMode,
-        psxBinauralFreq: psxBinauralFreq
+        psxBinauralFreq: psxBinauralFreq,
+        psxFilterLow: psxFilterLow, psxFilterHigh: psxFilterHigh,
+        psxCompressPower: psxCompressPower, psxVolume: psxVolume
     };
 }
 
@@ -849,6 +880,10 @@ function restoreTrackUIState(idx) {
     psxBinauralPower = ts.psxBinauralPower;
     psxBinauralMode = ts.psxBinauralMode;
     psxBinauralFreq = ts.psxBinauralFreq;
+    psxFilterLow = ts.psxFilterLow;
+    psxFilterHigh = ts.psxFilterHigh;
+    psxCompressPower = ts.psxCompressPower;
+    psxVolume = ts.psxVolume;
 }
 
 /**
@@ -1584,9 +1619,9 @@ function updateLeds() {
     var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
     setLED(STEP_BASE + 7, (isFree || isSync) && hasPitchTempo ? VividYellow : Black);
 
-    /* Step 9-13: PaulXStretch effect LEDs or normal fade/reverse LEDs */
+    /* Step 9-15: PaulXStretch effect LEDs (7 pages) or normal fade/reverse/reset LEDs */
     if (isPsx) {
-        for (var _ei = 0; _ei < 5; _ei++) {
+        for (var _ei = 0; _ei < 7; _ei++) {
             var _isActive = (psxActiveEffect === _ei);
             var _isEnabled = psxEffectEnabled[_ei];
             var _col = _isActive && _isEnabled ? Bright
@@ -1603,14 +1638,12 @@ function updateLeds() {
         setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
         setLED(STEP_BASE + 11, Black);
         setLED(STEP_BASE + 12, Black);
+        /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
+        setLED(STEP_BASE + 13, (isFree || isSync || isSlice) ? BrightRed : Black);
+        /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
+        setLED(STEP_BASE + 14, (isFree || isSync) ? BrightGreen : Black);
+        setLED(STEP_BASE + 15, (isFree || isSync) ? BrightRed : isSlice ? BrightRed : Black);
     }
-
-    /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
-    setLED(STEP_BASE + 13, (isFree || isSync || isSlice) ? BrightRed : Black);
-
-    /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
-    setLED(STEP_BASE + 14, (isFree || isSync) ? BrightGreen : Black);
-    setLED(STEP_BASE + 15, (isFree || isSync) ? BrightRed : isSlice ? BrightRed : Black);
 
     /* Pad LEDs: scene launcher colors in Trim/BPM/PSX views */
     if (isFree || isSync || isPsx) {
@@ -3388,10 +3421,11 @@ function drawPaulXStretch() {
     var masterStr = psxEnabled ? "ON" : "OFF";
     print(SCREEN_W - masterStr.length * 6, 0, masterStr, 1);
 
-    /* Effect-specific parameter display */
+    /* Effect-specific parameter display
+     * Page order: 0=Main, 1=Ratios, 2=Spread, 3=FreqShift, 4=Binaural, 5=Filter, 6=Compress */
     var y = 14;
     if (psxActiveEffect === 0) {
-        /* Stretch */
+        /* Main */
         var enStr = psxEffectEnabled[0] ? "[ON]" : "[off]";
         print(0, y, "Stretch " + enStr, 1);
         y += 11;
@@ -3399,21 +3433,12 @@ function drawPaulXStretch() {
         y += 11;
         var fftApprox = Math.round(Math.pow(2, 8 + psxFftSize * 7));
         print(0, y, "FFT: " + fftApprox, 1);
+        y += 11;
+        var volStr = (psxVolume >= 0 ? "+" : "") + psxVolume.toFixed(1) + "dB";
+        print(0, y, "Vol: " + volStr, 1);
     } else if (psxActiveEffect === 1) {
-        /* Freq Shift */
-        var enStr = psxEffectEnabled[1] ? "[ON]" : "[off]";
-        print(0, y, "FreqShift " + enStr, 1);
-        y += 11;
-        print(0, y, "Shift: " + psxFreqShiftHz.toFixed(0) + " Hz", 1);
-    } else if (psxActiveEffect === 2) {
-        /* Spread */
-        var enStr = psxEffectEnabled[2] ? "[ON]" : "[off]";
-        print(0, y, "Spread " + enStr, 1);
-        y += 11;
-        print(0, y, "BW: " + (psxSpreadBw * 100).toFixed(0) + "%", 1);
-    } else if (psxActiveEffect === 3) {
         /* Ratios */
-        var enStr = psxEffectEnabled[3] ? "[ON]" : "[off]";
+        var enStr = psxEffectEnabled[1] ? "[ON]" : "[off]";
         print(0, y, "Ratios " + enStr, 1);
         y += 11;
         /* Draw 8 ratio bars */
@@ -3424,9 +3449,20 @@ function drawPaulXStretch() {
             var bx = 8 + i * barW;
             var bh = Math.round(psxRatioLevels[i] * barMaxH);
             if (bh > 0) fill_rect(bx + 1, barY - bh, barW - 2, bh, 1);
-            /* Label */
             print(bx + Math.floor(barW / 2) - 3, barY + 2, String(i + 1), 1);
         }
+    } else if (psxActiveEffect === 2) {
+        /* Spread */
+        var enStr = psxEffectEnabled[2] ? "[ON]" : "[off]";
+        print(0, y, "Spread " + enStr, 1);
+        y += 11;
+        print(0, y, "BW: " + (psxSpreadBw * 100).toFixed(0) + "%", 1);
+    } else if (psxActiveEffect === 3) {
+        /* FreqShift */
+        var enStr = psxEffectEnabled[3] ? "[ON]" : "[off]";
+        print(0, y, "FreqShift " + enStr, 1);
+        y += 11;
+        print(0, y, "Shift: " + psxFreqShiftHz.toFixed(0) + " Hz", 1);
     } else if (psxActiveEffect === 4) {
         /* Binaural */
         var enStr = psxEffectEnabled[4] ? "[ON]" : "[off]";
@@ -3437,6 +3473,20 @@ function drawPaulXStretch() {
         print(0, y, "Mode: " + PSX_BINAURAL_MODES[psxBinauralMode], 1);
         y += 11;
         print(0, y, "Freq: " + psxBinauralFreq.toFixed(1) + " Hz", 1);
+    } else if (psxActiveEffect === 5) {
+        /* Filter */
+        var enStr = psxEffectEnabled[5] ? "[ON]" : "[off]";
+        print(0, y, "Filter " + enStr, 1);
+        y += 11;
+        print(0, y, "Low:  " + psxFilterLow.toFixed(0) + " Hz", 1);
+        y += 11;
+        print(0, y, "High: " + psxFilterHigh.toFixed(0) + " Hz", 1);
+    } else if (psxActiveEffect === 6) {
+        /* Compress */
+        var enStr = psxEffectEnabled[6] ? "[ON]" : "[off]";
+        print(0, y, "Compress " + enStr, 1);
+        y += 11;
+        print(0, y, "Power: " + (psxCompressPower * 100).toFixed(0) + "%", 1);
     }
 
     /* Status bar at bottom */
@@ -6428,12 +6478,13 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* PaulXStretch encoder handling */
+    /* PaulXStretch encoder handling
+     * Page order: 0=Main, 1=Ratios, 2=Spread, 3=FreqShift, 4=Binaural, 5=Filter, 6=Compress */
     if (currentView === VIEW_PAULXSTRETCH) {
         var delta = decodeDelta(value);
         if (delta === 0) return;
         if (psxActiveEffect === 0) {
-            /* Stretch page: E1=stretch amount (log), E2=FFT size */
+            /* Main page: E1=stretch amount (log), E2=FFT size, E8=Volume */
             if (cc === CC_E1) {
                 var logVal = Math.log(psxStretch) / Math.log(10);
                 logVal += delta * 0.05;
@@ -6448,30 +6499,17 @@ function handleCC(cc, value) {
                 if (psxFftSize < 0) psxFftSize = 0;
                 if (psxFftSize > 1) psxFftSize = 1;
                 psxSendParam("psx_fft_size", psxFftSize);
-                /* Show approximate FFT size */
                 var fftApprox = Math.round(Math.pow(2, 8 + psxFftSize * 7));
                 showKnobStatus(1, "FFT:" + fftApprox);
+            } else if (cc === CC_E8) {
+                psxVolume += delta * 0.5;
+                if (psxVolume < -24) psxVolume = -24;
+                if (psxVolume > 6) psxVolume = 6;
+                psxVolume = Math.round(psxVolume * 10) / 10;
+                psxSendParam("psx_volume", psxVolume);
+                showKnobStatus(7, "Vol:" + (psxVolume >= 0 ? "+" : "") + psxVolume.toFixed(1) + "dB");
             }
         } else if (psxActiveEffect === 1) {
-            /* FreqShift page: E1=freq shift Hz */
-            if (cc === CC_E1) {
-                var step = shiftHeld ? 1 : 10;
-                psxFreqShiftHz += delta * step;
-                if (psxFreqShiftHz < -1000) psxFreqShiftHz = -1000;
-                if (psxFreqShiftHz > 1000) psxFreqShiftHz = 1000;
-                psxSendParam("psx_freqshift_hz", psxFreqShiftHz);
-                showKnobStatus(0, "Shift:" + psxFreqShiftHz.toFixed(0) + "Hz");
-            }
-        } else if (psxActiveEffect === 2) {
-            /* Spread page: E1=bandwidth */
-            if (cc === CC_E1) {
-                psxSpreadBw += delta * 0.02;
-                if (psxSpreadBw < 0) psxSpreadBw = 0;
-                if (psxSpreadBw > 1) psxSpreadBw = 1;
-                psxSendParam("psx_spread_bw", psxSpreadBw);
-                showKnobStatus(0, "BW:" + (psxSpreadBw * 100).toFixed(0) + "%");
-            }
-        } else if (psxActiveEffect === 3) {
             /* Ratios page: E1-E8 = ratio levels */
             var knobIdx = -1;
             if (cc === CC_E1) knobIdx = 0;
@@ -6488,6 +6526,25 @@ function handleCC(cc, value) {
                 if (psxRatioLevels[knobIdx] > 1) psxRatioLevels[knobIdx] = 1;
                 psxSendParam("psx_ratio_" + (knobIdx + 1), psxRatioLevels[knobIdx]);
                 showKnobStatus(knobIdx, "R" + (knobIdx+1) + ":" + (psxRatioLevels[knobIdx] * 100).toFixed(0) + "%");
+            }
+        } else if (psxActiveEffect === 2) {
+            /* Spread page: E1=bandwidth */
+            if (cc === CC_E1) {
+                psxSpreadBw += delta * 0.02;
+                if (psxSpreadBw < 0) psxSpreadBw = 0;
+                if (psxSpreadBw > 1) psxSpreadBw = 1;
+                psxSendParam("psx_spread_bw", psxSpreadBw);
+                showKnobStatus(0, "BW:" + (psxSpreadBw * 100).toFixed(0) + "%");
+            }
+        } else if (psxActiveEffect === 3) {
+            /* FreqShift page: E1=freq shift Hz */
+            if (cc === CC_E1) {
+                var step = shiftHeld ? 1 : 10;
+                psxFreqShiftHz += delta * step;
+                if (psxFreqShiftHz < -1000) psxFreqShiftHz = -1000;
+                if (psxFreqShiftHz > 1000) psxFreqShiftHz = 1000;
+                psxSendParam("psx_freqshift_hz", psxFreqShiftHz);
+                showKnobStatus(0, "Shift:" + psxFreqShiftHz.toFixed(0) + "Hz");
             }
         } else if (psxActiveEffect === 4) {
             /* Binaural page: E1=power, E2=mode (cycle), E3=freq */
@@ -6510,6 +6567,36 @@ function handleCC(cc, value) {
                 if (psxBinauralFreq > 50) psxBinauralFreq = 50;
                 psxSendParam("psx_binaural_freq", psxBinauralFreq);
                 showKnobStatus(2, "Freq:" + psxBinauralFreq.toFixed(1) + "Hz");
+            }
+        } else if (psxActiveEffect === 5) {
+            /* Filter page: E1=Low cutoff (log), E2=High cutoff (log) */
+            if (cc === CC_E1) {
+                var logLow = Math.log(psxFilterLow) / Math.log(10);
+                logLow += delta * 0.05;
+                psxFilterLow = Math.pow(10, logLow);
+                if (psxFilterLow < 20) psxFilterLow = 20;
+                if (psxFilterLow > psxFilterHigh) psxFilterLow = psxFilterHigh;
+                psxFilterLow = Math.round(psxFilterLow);
+                psxSendParam("psx_filter_low", psxFilterLow);
+                showKnobStatus(0, "Lo:" + psxFilterLow.toFixed(0) + "Hz");
+            } else if (cc === CC_E2) {
+                var logHigh = Math.log(psxFilterHigh) / Math.log(10);
+                logHigh += delta * 0.05;
+                psxFilterHigh = Math.pow(10, logHigh);
+                if (psxFilterHigh < psxFilterLow) psxFilterHigh = psxFilterLow;
+                if (psxFilterHigh > 20000) psxFilterHigh = 20000;
+                psxFilterHigh = Math.round(psxFilterHigh);
+                psxSendParam("psx_filter_high", psxFilterHigh);
+                showKnobStatus(1, "Hi:" + psxFilterHigh.toFixed(0) + "Hz");
+            }
+        } else if (psxActiveEffect === 6) {
+            /* Compress page: E1=compress power */
+            if (cc === CC_E1) {
+                psxCompressPower += delta * 0.05;
+                if (psxCompressPower < 0) psxCompressPower = 0;
+                if (psxCompressPower > 1) psxCompressPower = 1;
+                psxSendParam("psx_compressor_pow", psxCompressPower);
+                showKnobStatus(0, "Cmp:" + (psxCompressPower * 100).toFixed(0) + "%");
             }
         }
         return;
@@ -7023,9 +7110,9 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 9/10: fade in/out (Trim/BPM/Slice) */
+    /* Step 9/10: fade in/out (Trim/BPM/Slice — not PSX view) */
     if (velocity > 0 && (note === STEP_BASE + 8 || note === STEP_BASE + 9)) {
-        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) && currentView !== VIEW_PAULXSTRETCH) {
             if (note === STEP_BASE + 8) {
                 doFadeIn();
             } else {
@@ -7035,9 +7122,9 @@ function handleNote(note, velocity) {
         }
     }
 
-    /* Step 11: reverse selection (Trim/BPM/Slice) */
+    /* Step 11: reverse selection (Trim/BPM/Slice — not PSX view) */
     if (velocity > 0 && note === STEP_BASE + 10) {
-        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) && currentView !== VIEW_PAULXSTRETCH) {
             doReverse();
             return;
         }
@@ -7057,8 +7144,8 @@ function handleNote(note, velocity) {
         }
     }
 
-    /* Step 15/16: set start/end marker at playback position */
-    if (velocity > 0 && (note === STEP_BASE + 14 || note === STEP_BASE + 15)) {
+    /* Step 15/16: set start/end marker at playback position (not PSX view) */
+    if (velocity > 0 && (note === STEP_BASE + 14 || note === STEP_BASE + 15) && currentView !== VIEW_PAULXSTRETCH) {
         if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) && playing) {
             if (note === STEP_BASE + 14) {
                 /* Step 15: set start marker at play position */
@@ -7143,9 +7230,9 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* PaulXStretch Steps 9-13: toggle effect + select knob page */
+    /* PaulXStretch Steps 9-16: toggle effect + select knob page (7 pages) */
     if (velocity > 0 && currentView === VIEW_PAULXSTRETCH
-            && note >= STEP_BASE + 8 && note <= STEP_BASE + 12) {
+            && note >= STEP_BASE + 8 && note <= STEP_BASE + 15) {
         var effIdx = note - STEP_BASE - 8;
         if (psxActiveEffect === effIdx) {
             /* Already selected — toggle enable */
@@ -7154,8 +7241,8 @@ function handleNote(note, velocity) {
             /* Select this effect page */
             psxActiveEffect = effIdx;
         }
-        /* Send enable states to DSP */
-        var enKeys = ["psx_stretch_en", "psx_freqshift_en", "psx_spread_en", "psx_ratiomix_en", "psx_binaural_en"];
+        /* Send enable state to DSP — page order: 0=Main,1=Ratios,2=Spread,3=FreqShift,4=Binaural,5=Filter,6=Compress */
+        var enKeys = ["psx_stretch_en", "psx_ratiomix_en", "psx_spread_en", "psx_freqshift_en", "psx_binaural_en", "psx_filter_en", "psx_compressor_en"];
         psxSendParam(enKeys[effIdx], psxEffectEnabled[effIdx] ? "1" : "0");
         updateLeds();
         return;

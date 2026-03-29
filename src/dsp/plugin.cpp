@@ -21,6 +21,7 @@
 #include <cmath>
 #include <ctime>
 #include <algorithm>
+#include <new>
 #include <unistd.h>
 #include <pwd.h>
 
@@ -184,6 +185,8 @@ typedef struct {
         int spread_en;
         int ratiomix_en;
         int binaural_en;
+        int filter_en;
+        int compressor_en;
 
         /* Parameters */
         float freq_shift_hz;      /* -1000 to +1000 */
@@ -192,6 +195,9 @@ typedef struct {
         float binaural_power;     /* 0.0–1.0 */
         int   binaural_mode;      /* 0=LR, 1=RL, 2=Symmetric */
         float binaural_freq;      /* 0.05–50.0 Hz */
+        float filter_low;         /* 20–20000 Hz */
+        float filter_high;        /* 20–20000 Hz */
+        float volume_db;          /* -24 to +6 dB */
 
         /* Runtime (allocated on enable, freed on disable) */
         ProcessedStretch *stretch_l;
@@ -1049,13 +1055,20 @@ static void ps_alloc_stretchers(track_t *t) {
 
 static void ps_init_track(track_t *t) {
     memset(&t->psx, 0, sizeof(t->psx));
+    /* Reconstruct proc_pars to restore constructor defaults (ratios, filter bounds, etc.)
+     * that were zeroed by memset above */
+    new (&t->psx.proc_pars) ProcessParameters();
     t->psx.stretch_amount = PSX_DEFAULT_STRETCH;
     t->psx.fft_size_norm = 0.3f;
     t->psx.fft_size = PSX_DEFAULT_FFT_SIZE;
     t->psx.binaural_power = 0.5f;
     t->psx.binaural_freq = 7.0f;
+    t->psx.filter_low = 20.0f;
+    t->psx.filter_high = 20000.0f;
+    t->psx.volume_db = 0.0f;
     /* Default ratio levels: only ratio 3 (1.0x = unison) active */
     t->psx.ratio_levels[2] = 1.0f;
+    t->psx.proc_pars.ratiomix.ratiolevels[2] = 1.0;
 }
 
 static void ps_reinit_track(track_t *t) {
@@ -1073,6 +1086,8 @@ static void ps_update_chain_enables(track_t *t) {
                 case SPT_FreqShift:  e.m_enabled = t->psx.freqshift_en != 0; break;
                 case SPT_Spread:     e.m_enabled = t->psx.spread_en != 0; break;
                 case SPT_RatioMix:   e.m_enabled = t->psx.ratiomix_en != 0; break;
+                case SPT_Filter:     e.m_enabled = t->psx.filter_en != 0; break;
+                case SPT_Compressor: e.m_enabled = t->psx.compressor_en != 0; break;
                 default: break;
             }
         }
@@ -1210,6 +1225,53 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         ps_update_binaural(t);
         return;
     }
+    if (strcmp(param, "psx_stretch_en") == 0) {
+        t->psx.stretch_en = atoi(val) ? 1 : 0;
+        return;
+    }
+    if (strcmp(param, "psx_filter_en") == 0) {
+        t->psx.filter_en = atoi(val) ? 1 : 0;
+        ps_update_chain_enables(t);
+        return;
+    }
+    if (strcmp(param, "psx_filter_low") == 0) {
+        float v = (float)atof(val);
+        if (v < 20.0f) v = 20.0f;
+        if (v > 20000.0f) v = 20000.0f;
+        t->psx.filter_low = v;
+        t->psx.proc_pars.filter.low = v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_filter_high") == 0) {
+        float v = (float)atof(val);
+        if (v < 20.0f) v = 20.0f;
+        if (v > 20000.0f) v = 20000.0f;
+        t->psx.filter_high = v;
+        t->psx.proc_pars.filter.high = v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_compressor_en") == 0) {
+        t->psx.compressor_en = atoi(val) ? 1 : 0;
+        ps_update_chain_enables(t);
+        return;
+    }
+    if (strcmp(param, "psx_compressor_pow") == 0) {
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.proc_pars.compressor.power = (double)v;
+        ps_update_params(t);
+        return;
+    }
+    if (strcmp(param, "psx_volume") == 0) {
+        float v = (float)atof(val);
+        if (v < -24.0f) v = -24.0f;
+        if (v > 6.0f) v = 6.0f;
+        t->psx.volume_db = v;
+        return;
+    }
 }
 
 /* Process audio through PaulXStretch spectral chain (insert effect).
@@ -1253,64 +1315,64 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
         }
     }
 
-    /* Feed stretcher: check how many samples it needs */
+    /* Feed stretcher: unified loop handles both "needs input" and "no input needed" cases.
+     * When rap > 1.0, get_nsamples() returns 0 between calls — we must call process(NULL,0)
+     * to advance remained_samples and produce output from existing FFT data. */
     int bufsize = t->psx.stretch_l->get_bufsize();
-    while (t->psx.inbuf_count >= bufsize) {
+    int max_iters = 32;
+    while (max_iters-- > 0) {
+        int out_sz = t->psx.stretch_l->get_bufsize();
+        if (t->psx.outbuf_count + out_sz > t->psx.outbuf_capacity) break;
+
         int need_l = t->psx.stretch_l->get_nsamples(0.5f);
         int need_r = t->psx.stretch_r->get_nsamples(0.5f);
 
         if (need_l > 0 && t->psx.inbuf_count >= need_l) {
+            /* Feed real input to both stretchers */
             REALTYPE onset_l = t->psx.stretch_l->process(t->psx.inbuf_l, need_l);
             t->psx.stretch_l->here_is_onset(onset_l);
 
-            /* Copy L output to ring buffer */
-            int out_sz = t->psx.stretch_l->get_bufsize();
-            for (int i = 0; i < out_sz && t->psx.outbuf_count < t->psx.outbuf_capacity; i++) {
-                t->psx.outbuf[t->psx.outbuf_write * 2 + 0] = t->psx.stretch_l->out_buf[i];
-                /* R channel placeholder — filled below */
-                t->psx.outbuf[t->psx.outbuf_write * 2 + 1] = 0.0f;
-                t->psx.outbuf_write = (t->psx.outbuf_write + 1) % t->psx.outbuf_capacity;
-                t->psx.outbuf_count++;
-            }
-        }
-
-        if (need_r > 0 && t->psx.inbuf_count >= need_r) {
-            REALTYPE onset_r = t->psx.stretch_r->process(t->psx.inbuf_r, need_r);
+            int need_r_actual = (need_r > 0) ? need_r : need_l;
+            REALTYPE onset_r = t->psx.stretch_r->process(t->psx.inbuf_r, need_r_actual);
             t->psx.stretch_r->here_is_onset(onset_r);
 
-            /* Fill R channel in ring buffer — go back and overwrite the R slots */
-            int out_sz = t->psx.stretch_r->get_bufsize();
-            int rpos = (t->psx.outbuf_write - out_sz + t->psx.outbuf_capacity) % t->psx.outbuf_capacity;
-            for (int i = 0; i < out_sz; i++) {
-                t->psx.outbuf[rpos * 2 + 1] = t->psx.stretch_r->out_buf[i];
-                rpos = (rpos + 1) % t->psx.outbuf_capacity;
+            /* Consume input */
+            int consumed = need_l;
+            if (need_r > consumed) consumed = need_r;
+            int rem = t->psx.inbuf_count - consumed;
+            if (rem > 0) {
+                memmove(t->psx.inbuf_l, t->psx.inbuf_l + consumed, rem * sizeof(float));
+                memmove(t->psx.inbuf_r, t->psx.inbuf_r + consumed, rem * sizeof(float));
             }
-        }
+            t->psx.inbuf_count = (rem > 0) ? rem : 0;
 
-        /* Consume input */
-        int consumed = (need_l > need_r) ? need_l : need_r;
-        if (consumed <= 0) consumed = bufsize;
-        if (consumed > t->psx.inbuf_count) consumed = t->psx.inbuf_count;
-
-        int rem = t->psx.inbuf_count - consumed;
-        if (rem > 0) {
-            memmove(t->psx.inbuf_l, t->psx.inbuf_l + consumed, rem * sizeof(float));
-            memmove(t->psx.inbuf_r, t->psx.inbuf_r + consumed, rem * sizeof(float));
-        }
-        t->psx.inbuf_count = rem;
-
-        /* Also handle skip samples (for stretch ratios < 1) */
-        int skip = t->psx.stretch_l->get_skip_nsamples();
-        if (skip > 0 && skip <= t->psx.inbuf_count) {
-            int rem2 = t->psx.inbuf_count - skip;
-            if (rem2 > 0) {
-                memmove(t->psx.inbuf_l, t->psx.inbuf_l + skip, rem2 * sizeof(float));
-                memmove(t->psx.inbuf_r, t->psx.inbuf_r + skip, rem2 * sizeof(float));
+            /* Handle skip samples (for stretch ratios < 1) */
+            int skip = t->psx.stretch_l->get_skip_nsamples();
+            if (skip > 0 && skip <= t->psx.inbuf_count) {
+                int rem2 = t->psx.inbuf_count - skip;
+                if (rem2 > 0) {
+                    memmove(t->psx.inbuf_l, t->psx.inbuf_l + skip, rem2 * sizeof(float));
+                    memmove(t->psx.inbuf_r, t->psx.inbuf_r + skip, rem2 * sizeof(float));
+                }
+                t->psx.inbuf_count = (rem2 > 0) ? rem2 : 0;
             }
-            t->psx.inbuf_count = rem2;
+        } else if (need_l == 0) {
+            /* Stretcher doesn't need new input — advance state machine (rap > 1.0 case).
+             * Produces output via resynthesis from existing FFT data with new random phases. */
+            t->psx.stretch_l->process(NULL, 0);
+            t->psx.stretch_r->process(NULL, 0);
+        } else {
+            /* Need input but don't have enough yet — wait for more */
+            break;
         }
 
-        if (need_l == 0 && need_r == 0) break;
+        /* Copy L+R output to ring buffer */
+        for (int i = 0; i < out_sz && t->psx.outbuf_count < t->psx.outbuf_capacity; i++) {
+            t->psx.outbuf[t->psx.outbuf_write * 2 + 0] = t->psx.stretch_l->out_buf[i];
+            t->psx.outbuf[t->psx.outbuf_write * 2 + 1] = t->psx.stretch_r->out_buf[i];
+            t->psx.outbuf_write = (t->psx.outbuf_write + 1) % t->psx.outbuf_capacity;
+            t->psx.outbuf_count++;
+        }
     }
 
     /* Apply binaural beats if enabled */
@@ -1335,6 +1397,15 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
         /* Apply binaural beats on the drained block */
         if (t->psx.binaural_en && t->psx.binaural) {
             t->psx.binaural->process(tmp_l, tmp_r, frames, 0.5f);
+        }
+
+        /* Apply volume gain */
+        if (t->psx.volume_db != 0.0f) {
+            float vol_gain = powf(10.0f, t->psx.volume_db / 20.0f);
+            for (int i = 0; i < frames; i++) {
+                tmp_l[i] *= vol_gain;
+                tmp_r[i] *= vol_gain;
+            }
         }
 
         /* Convert float back to int16 */
