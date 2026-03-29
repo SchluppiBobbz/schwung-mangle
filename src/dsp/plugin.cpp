@@ -220,6 +220,9 @@ typedef struct {
 
         int    needs_reinit;      /* flag: rebuild stretchers on next render */
         int    fill_needed;       /* 1 = initial fill required after reinit */
+
+        /* Direct audio_data reading position (bypasses render_track) */
+        double read_pos;          /* fractional sample position in audio_data */
     } psx;
 } track_t;
 
@@ -1125,6 +1128,10 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         if (new_en != t->psx.enabled) {
             t->psx.enabled = new_en;
             t->psx.needs_reinit = 1;
+            /* Sync PSX read position from current playback position */
+            if (new_en) {
+                t->psx.read_pos = t->play_pos_frac;
+            }
         }
         return;
     }
@@ -1274,96 +1281,125 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
     }
 }
 
-/* Process audio through PaulXStretch spectral chain (insert effect).
- * Called from render_track after normal playback produces audio. */
-static void ps_process_track(track_t *t, int16_t *out, int frames) {
-    if (!t->psx.enabled) return;
+/* Read N samples from audio_data at psx.read_pos into float L/R buffers.
+ * Advances read_pos, handles loop wrapping and sample-rate conversion.
+ * This is the core change: PSX reads directly from the source audio at its
+ * own pace, controlled by the stretcher's remained_samples mechanism. */
+static void ps_read_audio(track_t *t, float *buf_l, float *buf_r, int count,
+                           int play_start, int play_end) {
+    int region_len = play_end - play_start;
+    double rate_inc = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
 
-    /* Lazy reinit on parameter change */
-    if (t->psx.needs_reinit) {
-        ps_reinit_track(t);
+    float linear_gain = 1.0f;
+    if (t->gain_db != 0.0f) {
+        linear_gain = powf(10.0f, t->gain_db / 20.0f);
     }
+
+    for (int i = 0; i < count; i++) {
+        int pos = (int)t->psx.read_pos;
+
+        /* Wrap within region */
+        if (region_len > 0) {
+            while (pos >= play_end) pos -= region_len;
+            while (pos < play_start) pos += region_len;
+        }
+
+        if (pos >= 0 && pos < t->audio_frames) {
+            buf_l[i] = (float)t->audio_data[pos * 2 + 0] / 32768.0f * linear_gain;
+            buf_r[i] = (float)t->audio_data[pos * 2 + 1] / 32768.0f * linear_gain;
+        } else {
+            buf_l[i] = 0.0f;
+            buf_r[i] = 0.0f;
+        }
+
+        t->psx.read_pos += rate_inc;
+
+        /* Loop wrap */
+        if (t->psx.read_pos >= (double)play_end && region_len > 0) {
+            if (t->play_loop) {
+                t->psx.read_pos -= (double)region_len;
+            }
+            /* Non-looping: read_pos stays past end, will produce zeros */
+        }
+    }
+}
+
+/* PaulXStretch spectral processing — reads directly from audio_data.
+ * Bypasses render_track: PSX controls its own read position and playback rate.
+ * The stretcher's remained_samples mechanism controls how often new input
+ * is consumed, achieving spectral time-stretch without input overflow. */
+static void ps_process_track(track_t *t, int16_t *out, int frames) {
+    /* Note: needs_reinit is handled by render_track before calling us */
     if (!t->psx.stretch_l || !t->psx.stretch_r) return;
 
-    /* Convert int16 stereo interleaved → float mono L/R and feed input ring */
-    for (int i = 0; i < frames; i++) {
-        if (t->psx.inbuf_count < t->psx.inbuf_capacity) {
-            t->psx.inbuf_l[t->psx.inbuf_count] = (float)out[i * 2 + 0] / 32768.0f;
-            t->psx.inbuf_r[t->psx.inbuf_count] = (float)out[i * 2 + 1] / 32768.0f;
-            t->psx.inbuf_count++;
-        }
+    /* Determine loop boundaries */
+    int play_start, play_end;
+    if (t->play_whole) {
+        play_start = 0;
+        play_end = t->audio_frames;
+    } else {
+        play_start = t->start_sample;
+        play_end = t->end_sample;
+        if (play_start < 0) play_start = 0;
+        if (play_end > t->audio_frames) play_end = t->audio_frames;
+    }
+    int region_len = play_end - play_start;
+    if (region_len <= 0) {
+        memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
+        return;
     }
 
-    /* Initial fill: feed max_bufsize of silence/input on first use */
+    /* Initial fill: feed fill_sz samples from audio_data on first use */
     if (t->psx.fill_needed) {
         int fill_sz = t->psx.stretch_l->get_nsamples_for_fill();
-        if (t->psx.inbuf_count >= fill_sz) {
-            t->psx.stretch_l->process(t->psx.inbuf_l, fill_sz);
-            t->psx.stretch_r->process(t->psx.inbuf_r, fill_sz);
-            /* Shift remaining input */
-            int rem = t->psx.inbuf_count - fill_sz;
-            if (rem > 0) {
-                memmove(t->psx.inbuf_l, t->psx.inbuf_l + fill_sz, rem * sizeof(float));
-                memmove(t->psx.inbuf_r, t->psx.inbuf_r + fill_sz, rem * sizeof(float));
-            }
-            t->psx.inbuf_count = rem;
-            t->psx.fill_needed = 0;
-        } else {
-            /* Not enough input yet — output silence */
-            memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
-            return;
-        }
+        if (fill_sz > t->psx.inbuf_capacity) fill_sz = t->psx.inbuf_capacity;
+        ps_read_audio(t, t->psx.inbuf_l, t->psx.inbuf_r, fill_sz, play_start, play_end);
+        t->psx.stretch_l->process(t->psx.inbuf_l, fill_sz);
+        t->psx.stretch_r->process(t->psx.inbuf_r, fill_sz);
+        t->psx.fill_needed = 0;
     }
 
-    /* Feed stretcher: unified loop handles both "needs input" and "no input needed" cases.
-     * When rap > 1.0, get_nsamples() returns 0 between calls — we must call process(NULL,0)
-     * to advance remained_samples and produce output from existing FFT data. */
+    /* Feed stretcher and produce output.
+     * When rap > 1.0, get_nsamples() returns 0 between calls — process(NULL,0)
+     * advances remained_samples and resynthesizes from existing FFT data.
+     * When rap < 1.0, get_nsamples() returns bufsize every call, plus
+     * get_skip_nsamples() > 0 to advance read_pos faster. */
     int bufsize = t->psx.stretch_l->get_bufsize();
-    int max_iters = 32;
+    int max_iters = 64;
     while (max_iters-- > 0) {
-        int out_sz = t->psx.stretch_l->get_bufsize();
+        int out_sz = bufsize;
         if (t->psx.outbuf_count + out_sz > t->psx.outbuf_capacity) break;
 
-        int need_l = t->psx.stretch_l->get_nsamples(0.5f);
-        int need_r = t->psx.stretch_r->get_nsamples(0.5f);
+        int need = t->psx.stretch_l->get_nsamples(0.5f);
 
-        if (need_l > 0 && t->psx.inbuf_count >= need_l) {
-            /* Feed real input to both stretchers */
-            REALTYPE onset_l = t->psx.stretch_l->process(t->psx.inbuf_l, need_l);
+        if (need > 0) {
+            /* Read from audio_data at read_pos (both L+R channels) */
+            if (need > t->psx.inbuf_capacity) need = t->psx.inbuf_capacity;
+            ps_read_audio(t, t->psx.inbuf_l, t->psx.inbuf_r, need, play_start, play_end);
+
+            REALTYPE onset_l = t->psx.stretch_l->process(t->psx.inbuf_l, need);
             t->psx.stretch_l->here_is_onset(onset_l);
-
-            int need_r_actual = (need_r > 0) ? need_r : need_l;
-            REALTYPE onset_r = t->psx.stretch_r->process(t->psx.inbuf_r, need_r_actual);
+            REALTYPE onset_r = t->psx.stretch_r->process(t->psx.inbuf_r, need);
             t->psx.stretch_r->here_is_onset(onset_r);
 
-            /* Consume input */
-            int consumed = need_l;
-            if (need_r > consumed) consumed = need_r;
-            int rem = t->psx.inbuf_count - consumed;
-            if (rem > 0) {
-                memmove(t->psx.inbuf_l, t->psx.inbuf_l + consumed, rem * sizeof(float));
-                memmove(t->psx.inbuf_r, t->psx.inbuf_r + consumed, rem * sizeof(float));
-            }
-            t->psx.inbuf_count = (rem > 0) ? rem : 0;
-
-            /* Handle skip samples (for stretch ratios < 1) */
+            /* Handle skip samples (for stretch ratios < 1.0) */
             int skip = t->psx.stretch_l->get_skip_nsamples();
-            if (skip > 0 && skip <= t->psx.inbuf_count) {
-                int rem2 = t->psx.inbuf_count - skip;
-                if (rem2 > 0) {
-                    memmove(t->psx.inbuf_l, t->psx.inbuf_l + skip, rem2 * sizeof(float));
-                    memmove(t->psx.inbuf_r, t->psx.inbuf_r + skip, rem2 * sizeof(float));
+            if (skip > 0) {
+                double rate_inc = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+                t->psx.read_pos += (double)skip * rate_inc;
+                /* Wrap after skip */
+                if (t->play_loop && region_len > 0) {
+                    while (t->psx.read_pos >= (double)play_end)
+                        t->psx.read_pos -= (double)region_len;
                 }
-                t->psx.inbuf_count = (rem2 > 0) ? rem2 : 0;
             }
-        } else if (need_l == 0) {
-            /* Stretcher doesn't need new input — advance state machine (rap > 1.0 case).
-             * Produces output via resynthesis from existing FFT data with new random phases. */
+            /* Drain R stretcher's skip counter to keep in sync */
+            t->psx.stretch_r->get_skip_nsamples();
+        } else {
+            /* rap > 1.0: stretcher doesn't need new input — advance state machine.
+             * Produces output via resynthesis from existing FFT data. */
             t->psx.stretch_l->process(NULL, 0);
             t->psx.stretch_r->process(NULL, 0);
-        } else {
-            /* Need input but don't have enough yet — wait for more */
-            break;
         }
 
         /* Copy L+R output to ring buffer */
@@ -1375,12 +1411,11 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
         }
     }
 
-    /* Apply binaural beats if enabled */
-    if (t->psx.binaural_en && t->psx.binaural && t->psx.outbuf_count > 0) {
-        /* Process in-place on the ring buffer — extract a contiguous chunk */
-        /* For simplicity, process only the frames we'll drain this block */
-        /* (binaural is applied during drain below) */
-    }
+    /* Update play_pos from PSX read position for UI cursor */
+    t->play_pos = (int)t->psx.read_pos;
+    if (t->play_pos < 0) t->play_pos = 0;
+    if (t->play_pos >= t->audio_frames) t->play_pos = t->audio_frames - 1;
+    t->play_pos_frac = t->psx.read_pos;
 
     /* Drain output ring buffer into int16 output */
     if (t->psx.outbuf_count >= frames) {
@@ -1399,7 +1434,7 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
             t->psx.binaural->process(tmp_l, tmp_r, frames, 0.5f);
         }
 
-        /* Apply volume gain */
+        /* Apply PSX volume gain */
         if (t->psx.volume_db != 0.0f) {
             float vol_gain = powf(10.0f, t->psx.volume_db / 20.0f);
             for (int i = 0; i < frames; i++) {
@@ -1756,10 +1791,12 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                         t->playing = 1;
                         t->play_pos = t->start_sample;
                         t->play_pos_frac = (double)t->start_sample;
+                        t->psx.read_pos = (double)t->start_sample;
                         t->bng_out_count = 0;
                         t->bng_play_start = t->start_sample;
                         t->bng_play_end = t->end_sample;
                         bng_reset_stretcher(t, (double)t->start_sample);
+                        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
                     }
                 }
             } else {
@@ -2133,6 +2170,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (whole) {
             t->play_pos = 0;
             t->play_pos_frac = 0.0;
+            t->psx.read_pos = 0.0;
             t->bng_play_start = 0;
             t->bng_play_end = t->audio_frames;
             t->bng_out_count = 0;
@@ -2140,11 +2178,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         } else {
             t->play_pos = t->start_sample;
             t->play_pos_frac = (double)t->start_sample;
+            t->psx.read_pos = (double)t->start_sample;
             t->bng_play_start = t->start_sample;
             t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
             t->bng_out_count = 0;
             bng_reset_stretcher(t, (double)t->start_sample);
         }
+        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
         {
             char dbg[256];
             snprintf(dbg, sizeof(dbg), "PLAY t%d: whole=%d start=%d end=%d pos=%d total=%d",
@@ -2172,6 +2212,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (whole) {
             t->play_pos = 0;
             t->play_pos_frac = 0.0;
+            t->psx.read_pos = 0.0;
             t->bng_play_start = 0;
             t->bng_play_end = t->audio_frames;
             t->bng_out_count = 0;
@@ -2179,11 +2220,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         } else {
             t->play_pos = t->start_sample;
             t->play_pos_frac = (double)t->start_sample;
+            t->psx.read_pos = (double)t->start_sample;
             t->bng_play_start = t->start_sample;
             t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
             t->bng_out_count = 0;
             bng_reset_stretcher(t, (double)t->start_sample);
         }
+        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
         return;
     }
 
@@ -2199,11 +2242,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->playing = 1;
         t->play_pos = pos;
         t->play_pos_frac = (double)pos;
+        t->psx.read_pos = (double)pos;
         /* Reset Bungee state */
         t->bng_play_start = t->start_sample;
         t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
         t->bng_out_count = 0;
         bng_reset_stretcher(t, (double)pos);
+        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
         return;
     }
 
@@ -2487,7 +2532,9 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             }
             t->play_pos_frac = new_pos;
             t->play_pos = (int)new_pos;
+            t->psx.read_pos = new_pos;
             t->playing = 1;
+            if (t->psx.enabled) { t->psx.needs_reinit = 1; }
         }
 
         /* Recompute */
@@ -3768,7 +3815,9 @@ static void do_apply_pitch_tempo(track_t *t) {
         if (new_pos >= (double)new_total) new_pos = 0;
         t->play_pos_frac = new_pos;
         t->play_pos = (int)new_pos;
+        t->psx.read_pos = new_pos;
         t->playing = 1;
+        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
     }
 
     {
@@ -3790,6 +3839,24 @@ static int render_track(track_t *t, int16_t *out, int frames) {
     if (!t->playing || !t->audio_data || t->audio_frames <= 0) return 0;
     if (t->gate_mode == 1 && !t->gate_held) return 0;  /* gate: only play while held */
 
+    /* PaulXStretch: bypass normal playback — PSX reads directly from audio_data
+     * at its own pace, controlled by the spectral stretcher's state machine. */
+    if (t->psx.enabled) {
+        /* Lazy reinit must happen here, before the NULL-pointer guard,
+         * so stretchers get allocated on the first render after enable. */
+        if (t->psx.needs_reinit) {
+            ps_reinit_track(t);
+        }
+        if (!t->psx.stretch_l || !t->psx.stretch_r) goto normal_playback;
+        ps_process_track(t, out, frames);
+        if (t->muted) {
+            memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
+            return 0;
+        }
+        return 1;
+    }
+
+normal_playback:
     /* Determine playback boundaries */
     int play_start, play_end;
     if (t->play_whole) {
@@ -3988,11 +4055,6 @@ static int render_track(track_t *t, int16_t *out, int frames) {
         produced = (avail > 0) ? 1 : 0;
     }
 
-    /* PaulXStretch spectral processing (insert effect, post-playback) */
-    if (produced && t->psx.enabled) {
-        ps_process_track(t, out, frames);
-    }
-
     /* Muted: position has already advanced (for re-sync on unmute), but
      * silence the output so the mix receives nothing. */
     if (t->muted) {
@@ -4054,16 +4116,19 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
                 if (t->queued_whole) {
                     t->play_pos = 0;
                     t->play_pos_frac = 0.0;
+                    t->psx.read_pos = 0.0;
                     t->bng_play_start = 0;
                     t->bng_play_end = t->audio_frames;
                 } else {
                     t->play_pos = t->start_sample;
                     t->play_pos_frac = (double)t->start_sample;
+                    t->psx.read_pos = (double)t->start_sample;
                     t->bng_play_start = t->start_sample;
                     t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
                 }
                 t->bng_out_count = 0;
                 bng_reset_stretcher(t, t->play_pos_frac);
+                if (t->psx.enabled) { t->psx.needs_reinit = 1; }
             }
         }
     }
