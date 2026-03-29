@@ -192,6 +192,7 @@ typedef struct {
         float freq_shift_hz;      /* -1000 to +1000 */
         float spread_bw;          /* 0.0–1.0 */
         float ratio_levels[8];    /* 0.0–1.0 each */
+        float ratio_values[8];    /* 0.125–8.0 (frequency ratio multiplier) */
         float binaural_power;     /* 0.0–1.0 */
         int   binaural_mode;      /* 0=LR, 1=RL, 2=Symmetric */
         float binaural_freq;      /* 0.05–50.0 Hz */
@@ -1072,6 +1073,14 @@ static void ps_init_track(track_t *t) {
     /* Default ratio levels: only ratio 3 (1.0x = unison) active */
     t->psx.ratio_levels[2] = 1.0f;
     t->psx.proc_pars.ratiomix.ratiolevels[2] = 1.0;
+    /* Default ratio values mirror ProcessParameters constructor defaults */
+    static const float DEFAULT_RATIO_VALUES[8] = {
+        0.25f, 0.5f, 1.0f, 2.0f, 3.0f, 4.0f, 1.5f, 1.0f/1.5f
+    };
+    for (int i = 0; i < 8; i++) {
+        t->psx.ratio_values[i] = DEFAULT_RATIO_VALUES[i];
+        /* proc_pars.ratiomix.ratios already set by ProcessParameters() constructor */
+    }
 }
 
 static void ps_reinit_track(track_t *t) {
@@ -1200,6 +1209,18 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         if (v > 1.0f) v = 1.0f;
         t->psx.ratio_levels[idx] = v;
         t->psx.proc_pars.ratiomix.ratiolevels[idx] = (double)v;
+        ps_update_params(t);
+        return;
+    }
+    /* psx_ratio_val_1 .. psx_ratio_val_8 — frequency ratio multipliers */
+    if (strncmp(param, "psx_ratio_val_", 14) == 0) {
+        int idx = atoi(param + 14) - 1;
+        if (idx < 0 || idx >= 8) return;
+        float v = (float)atof(val);
+        if (v < 0.125f) v = 0.125f;
+        if (v > 8.0f) v = 8.0f;
+        t->psx.ratio_values[idx] = v;
+        t->psx.proc_pars.ratiomix.ratios[idx] = (double)v;
         ps_update_params(t);
         return;
     }

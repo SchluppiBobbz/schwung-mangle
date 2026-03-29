@@ -156,7 +156,7 @@ Spectral time-stretching and processing post-effect. Press Step 3 to enter, pres
 | Step | Page | Knobs |
 |------|------|-------|
 | Step 9 | Main | E1: Stretch amount (0.1–1024×, log), E2: FFT size, E8: Volume (−24 to +6 dB) |
-| Step 10 | Ratios | E1–E8: Ratio mix levels for 8 pitch-shifted copies |
+| Step 10 | Ratios | E1–E8: Mix level of 8 pitch-shifted copies. Shift+E1–E8: frequency ratio (0.125–8.0). Delete+Step10: reset to defaults |
 | Step 11 | Spread | E1: Spectral spread bandwidth (0–100%) |
 | Step 12 | FreqShift | E1: Frequency shift in Hz (−1000 to +1000, Shift = fine) |
 | Step 13 | Binaural | E1: Power, E2: Mode (LR/RL/Symm), E3: Beat freq (0.05–50 Hz) |

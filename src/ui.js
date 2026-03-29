@@ -173,7 +173,7 @@ var SCENE_FIELDS = [
     "psxFreqShiftHz", "psxSpreadBw", "psxRatioLevels",
     "psxBinauralPower", "psxBinauralMode", "psxBinauralFreq"
 ];
-var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true, psxEffectEnabled: true, psxRatioLevels: true };
+var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true, psxEffectEnabled: true, psxRatioLevels: true, psxRatioValues: true };
 
 /**
  * Copy scene-related fields from src object to dst object.
@@ -432,6 +432,8 @@ var psxFftSize = 0.3;
 var psxFreqShiftHz = 0.0;
 var psxSpreadBw = 0.3;
 var psxRatioLevels = [0,0,1,0,0,0,0,0];
+var PSX_RATIO_DEFAULTS = [0.250, 0.500, 1.000, 2.000, 3.000, 4.000, 1.500, 0.667];
+var psxRatioValues = [0.250, 0.500, 1.000, 2.000, 3.000, 4.000, 1.500, 0.667];
 var psxBinauralPower = 0.5;
 var psxBinauralMode = 0;
 var psxBinauralFreq = 7.0;
@@ -457,8 +459,10 @@ function psxSendAllParams() {
     host_module_set_param(p + "psx_volume", String(psxVolume));
     host_module_set_param(p + "psx_stretch_en",    psxEffectEnabled[0] ? "1" : "0");
     host_module_set_param(p + "psx_ratiomix_en",   psxEffectEnabled[1] ? "1" : "0");
-    for (var i = 0; i < 8; i++)
+    for (var i = 0; i < 8; i++) {
         host_module_set_param(p + "psx_ratio_" + (i+1), String(psxRatioLevels[i]));
+        host_module_set_param(p + "psx_ratio_val_" + (i+1), String(psxRatioValues[i]));
+    }
     host_module_set_param(p + "psx_spread_en",     psxEffectEnabled[2] ? "1" : "0");
     host_module_set_param(p + "psx_spread_bw", String(psxSpreadBw));
     host_module_set_param(p + "psx_freqshift_en",  psxEffectEnabled[3] ? "1" : "0");
@@ -513,6 +517,7 @@ function makeSceneState(path) {
         psxFreqShiftHz:  0.0,
         psxSpreadBw:     0.3,
         psxRatioLevels:  [0,0,1,0,0,0,0,0],
+        psxRatioValues:  [0.250, 0.500, 1.000, 2.000, 3.000, 4.000, 1.500, 0.667],
         psxBinauralPower: 0.5,
         psxBinauralMode: 0,
         psxBinauralFreq: 7.0,
@@ -603,6 +608,7 @@ function makeTrackState() {
         psxFreqShiftHz: 0.0,
         psxSpreadBw: 0.3,
         psxRatioLevels: [0,0,1,0,0,0,0,0],
+        psxRatioValues: [0.250, 0.500, 1.000, 2.000, 3.000, 4.000, 1.500, 0.667],
         psxBinauralPower: 0.5,
         psxBinauralMode: 0,
         psxBinauralFreq: 7.0,
@@ -689,6 +695,7 @@ function saveTrackUIState(idx) {
     ts.psxFreqShiftHz = psxFreqShiftHz;
     ts.psxSpreadBw = psxSpreadBw;
     ts.psxRatioLevels = psxRatioLevels.slice();
+    ts.psxRatioValues = psxRatioValues.slice();
     ts.psxBinauralPower = psxBinauralPower;
     ts.psxBinauralMode = psxBinauralMode;
     ts.psxBinauralFreq = psxBinauralFreq;
@@ -767,6 +774,7 @@ function restoreSceneToGlobals(scene) {
     psxFreqShiftHz = scene.psxFreqShiftHz || 0.0;
     psxSpreadBw = scene.psxSpreadBw || 0.3;
     psxRatioLevels = (scene.psxRatioLevels || [0,0,1,0,0,0,0,0]).slice();
+    psxRatioValues = (scene.psxRatioValues || PSX_RATIO_DEFAULTS.slice()).slice();
     psxBinauralPower = scene.psxBinauralPower || 0.5;
     psxBinauralMode = scene.psxBinauralMode || 0;
     psxBinauralFreq = scene.psxBinauralFreq || 7.0;
@@ -795,7 +803,7 @@ function getGlobalsAsSceneSource() {
         psxEnabled: psxEnabled, psxEffectEnabled: psxEffectEnabled,
         psxStretch: psxStretch, psxFftSize: psxFftSize,
         psxFreqShiftHz: psxFreqShiftHz, psxSpreadBw: psxSpreadBw,
-        psxRatioLevels: psxRatioLevels,
+        psxRatioLevels: psxRatioLevels, psxRatioValues: psxRatioValues,
         psxBinauralPower: psxBinauralPower, psxBinauralMode: psxBinauralMode,
         psxBinauralFreq: psxBinauralFreq,
         psxFilterLow: psxFilterLow, psxFilterHigh: psxFilterHigh,
@@ -877,6 +885,7 @@ function restoreTrackUIState(idx) {
     psxFreqShiftHz = ts.psxFreqShiftHz;
     psxSpreadBw = ts.psxSpreadBw;
     psxRatioLevels = ts.psxRatioLevels.slice();
+    psxRatioValues = (ts.psxRatioValues || PSX_RATIO_DEFAULTS.slice()).slice();
     psxBinauralPower = ts.psxBinauralPower;
     psxBinauralMode = ts.psxBinauralMode;
     psxBinauralFreq = ts.psxBinauralFreq;
@@ -3441,15 +3450,19 @@ function drawPaulXStretch() {
         var enStr = psxEffectEnabled[1] ? "[ON]" : "[off]";
         print(0, y, "Ratios " + enStr, 1);
         y += 11;
-        /* Draw 8 ratio bars */
-        var barW = Math.floor((SCREEN_W - 16) / 8);
-        var barMaxH = 30;
+        /* Draw 8 ratio bars — height = level, label = ratio value */
+        var barW = Math.floor((SCREEN_W - 4) / 8);
+        var barMaxH = 28;
         var barY = y + barMaxH;
         for (var i = 0; i < 8; i++) {
-            var bx = 8 + i * barW;
+            var bx = 2 + i * barW;
             var bh = Math.round(psxRatioLevels[i] * barMaxH);
             if (bh > 0) fill_rect(bx + 1, barY - bh, barW - 2, bh, 1);
-            print(bx + Math.floor(barW / 2) - 3, barY + 2, String(i + 1), 1);
+            /* Show ratio value below bar */
+            var rv = psxRatioValues[i];
+            var rvStr = rv < 1.0 ? rv.toFixed(2) : rv.toFixed(1);
+            /* Trim trailing zero for single-char fit: "1.0"->"1.0", "0.50"->"0.5" */
+            print(bx, barY + 2, rvStr, 1);
         }
     } else if (psxActiveEffect === 2) {
         /* Spread */
@@ -6510,7 +6523,7 @@ function handleCC(cc, value) {
                 showKnobStatus(7, "Vol:" + (psxVolume >= 0 ? "+" : "") + psxVolume.toFixed(1) + "dB");
             }
         } else if (psxActiveEffect === 1) {
-            /* Ratios page: E1-E8 = ratio levels */
+            /* Ratios page: E1-E8 = ratio levels; Shift+E1-E8 = ratio values */
             var knobIdx = -1;
             if (cc === CC_E1) knobIdx = 0;
             else if (cc === CC_E2) knobIdx = 1;
@@ -6521,11 +6534,27 @@ function handleCC(cc, value) {
             else if (cc === CC_E7) knobIdx = 6;
             else if (cc === CC_E8) knobIdx = 7;
             if (knobIdx >= 0) {
-                psxRatioLevels[knobIdx] += delta * 0.05;
-                if (psxRatioLevels[knobIdx] < 0) psxRatioLevels[knobIdx] = 0;
-                if (psxRatioLevels[knobIdx] > 1) psxRatioLevels[knobIdx] = 1;
-                psxSendParam("psx_ratio_" + (knobIdx + 1), psxRatioLevels[knobIdx]);
-                showKnobStatus(knobIdx, "R" + (knobIdx+1) + ":" + (psxRatioLevels[knobIdx] * 100).toFixed(0) + "%");
+                if (shiftHeld) {
+                    /* Shift+knob: adjust ratio value (0.125–8.0) */
+                    var rv = psxRatioValues[knobIdx];
+                    /* Finer resolution near 1.0, coarser at extremes */
+                    var step = rv < 1.0 ? 0.01 : 0.05;
+                    rv += delta * step;
+                    if (rv < 0.125) rv = 0.125;
+                    if (rv > 8.0) rv = 8.0;
+                    rv = Math.round(rv * 1000) / 1000;
+                    psxRatioValues[knobIdx] = rv;
+                    psxSendParam("psx_ratio_val_" + (knobIdx + 1), rv);
+                    var rvStr = rv < 1.0 ? rv.toFixed(3) : rv.toFixed(3);
+                    showKnobStatus(knobIdx, "R" + (knobIdx+1) + "x" + rvStr);
+                } else {
+                    /* Knob: adjust level (0–100%) */
+                    psxRatioLevels[knobIdx] += delta * 0.05;
+                    if (psxRatioLevels[knobIdx] < 0) psxRatioLevels[knobIdx] = 0;
+                    if (psxRatioLevels[knobIdx] > 1) psxRatioLevels[knobIdx] = 1;
+                    psxSendParam("psx_ratio_" + (knobIdx + 1), psxRatioLevels[knobIdx]);
+                    showKnobStatus(knobIdx, "R" + (knobIdx+1) + ":" + (psxRatioLevels[knobIdx] * 100).toFixed(0) + "%");
+                }
             }
         } else if (psxActiveEffect === 2) {
             /* Spread page: E1=bandwidth */
@@ -7227,6 +7256,20 @@ function handleNote(note, velocity) {
                 switchView(VIEW_PAULXSTRETCH);
             }
         }
+        return;
+    }
+
+    /* DELETE+Step10: reset Ratios to defaults (levels: only pos 3 at 100%, values: defaults) */
+    if (velocity > 0 && deleteHeld && note === STEP_BASE + 9
+            && currentView === VIEW_PAULXSTRETCH) {
+        psxRatioLevels = [0, 0, 1, 0, 0, 0, 0, 0];
+        psxRatioValues = PSX_RATIO_DEFAULTS.slice();
+        for (var _ri = 0; _ri < 8; _ri++) {
+            psxSendParam("psx_ratio_" + (_ri + 1), psxRatioLevels[_ri]);
+            psxSendParam("psx_ratio_val_" + (_ri + 1), psxRatioValues[_ri]);
+        }
+        deletePendingCut = false;
+        showStatus("Ratios reset", 40);
         return;
     }
 
