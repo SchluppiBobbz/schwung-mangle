@@ -170,7 +170,7 @@ var SCENE_FIELDS = [
     "slicePitches", "sliceTempos", "lazySub",
     "zoomLevel", "zoomCenter", "vScale",
     "psxEnabled", "psxEffectEnabled", "psxStretch", "psxFftSize",
-    "psxFreqShiftHz", "psxSpreadBw", "psxRatioLevels",
+    "psxFreqShiftHz", "psxSpreadBw", "psxRatioLevels", "psxRatioValues",
     "psxBinauralPower", "psxBinauralMode", "psxBinauralFreq"
 ];
 var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true, psxEffectEnabled: true, psxRatioLevels: true, psxRatioValues: true };

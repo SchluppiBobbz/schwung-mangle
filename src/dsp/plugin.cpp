@@ -1200,19 +1200,7 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         ps_update_chain_enables(t);
         return;
     }
-    /* psx_ratio_1 .. psx_ratio_8 */
-    if (strncmp(param, "psx_ratio_", 10) == 0) {
-        int idx = atoi(param + 10) - 1;
-        if (idx < 0 || idx >= 8) return;
-        float v = (float)atof(val);
-        if (v < 0.0f) v = 0.0f;
-        if (v > 1.0f) v = 1.0f;
-        t->psx.ratio_levels[idx] = v;
-        t->psx.proc_pars.ratiomix.ratiolevels[idx] = (double)v;
-        ps_update_params(t);
-        return;
-    }
-    /* psx_ratio_val_1 .. psx_ratio_val_8 — frequency ratio multipliers */
+    /* psx_ratio_val_1 .. psx_ratio_val_8 — frequency ratio multipliers (must come before psx_ratio_) */
     if (strncmp(param, "psx_ratio_val_", 14) == 0) {
         int idx = atoi(param + 14) - 1;
         if (idx < 0 || idx >= 8) return;
@@ -1221,6 +1209,18 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         if (v > 8.0f) v = 8.0f;
         t->psx.ratio_values[idx] = v;
         t->psx.proc_pars.ratiomix.ratios[idx] = (double)v;
+        ps_update_params(t);
+        return;
+    }
+    /* psx_ratio_1 .. psx_ratio_8 — mix levels */
+    if (strncmp(param, "psx_ratio_", 10) == 0) {
+        int idx = atoi(param + 10) - 1;
+        if (idx < 0 || idx >= 8) return;
+        float v = (float)atof(val);
+        if (v < 0.0f) v = 0.0f;
+        if (v > 1.0f) v = 1.0f;
+        t->psx.ratio_levels[idx] = v;
+        t->psx.proc_pars.ratiomix.ratiolevels[idx] = (double)v;
         ps_update_params(t);
         return;
     }
