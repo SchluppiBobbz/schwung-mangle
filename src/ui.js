@@ -441,6 +441,7 @@ var psxFilterLow = 20.0;
 var psxFilterHigh = 20000.0;
 var psxCompressPower = 0.0;
 var psxVolume = 0.0;
+var psxCpuPercent = 0.0;
 var PSX_EFFECT_NAMES = ["Main", "Ratios", "Spread", "FreqShift", "Binaural", "Filter", "Compress"];
 var PSX_BINAURAL_MODES = ["LR", "RL", "Symm"];
 
@@ -3426,9 +3427,15 @@ function drawPaulXStretch() {
     var hdr = "T" + (activeTrack + 1) + " PSX " + PSX_EFFECT_NAMES[psxActiveEffect];
     fill_rect(0, 0, SCREEN_W, SCREEN_H, 0);
     print(0, 0, hdr, 1);
-    /* Master on/off indicator */
+    /* Poll PSX CPU usage from DSP */
+    var cpuRaw = host_module_get_param("t" + activeTrack + ":psx_cpu");
+    if (cpuRaw) { var cv = parseFloat(cpuRaw); if (!isNaN(cv)) psxCpuPercent = cv; }
+
+    /* Master on/off + CPU indicator in header */
+    var cpuStr = psxCpuPercent.toFixed(0) + "%";
     var masterStr = psxEnabled ? "ON" : "OFF";
-    print(SCREEN_W - masterStr.length * 6, 0, masterStr, 1);
+    var rightStr = cpuStr + " " + masterStr;
+    print(SCREEN_W - rightStr.length * 6, 0, rightStr, 1);
 
     /* Effect-specific parameter display
      * Page order: 0=Main, 1=Ratios, 2=Spread, 3=FreqShift, 4=Binaural, 5=Filter, 6=Compress */
@@ -3445,6 +3452,9 @@ function drawPaulXStretch() {
         y += 11;
         var volStr = (psxVolume >= 0 ? "+" : "") + psxVolume.toFixed(1) + "dB";
         print(0, y, "Vol: " + volStr, 1);
+        y += 11;
+        var cpuDisplay = psxCpuPercent.toFixed(1) + "%";
+        print(0, y, "CPU: " + cpuDisplay, 1);
     } else if (psxActiveEffect === 1) {
         /* Ratios */
         var enStr = psxEffectEnabled[1] ? "[ON]" : "[off]";

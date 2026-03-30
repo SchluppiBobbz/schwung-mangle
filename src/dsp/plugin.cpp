@@ -224,6 +224,9 @@ typedef struct {
 
         /* Direct audio_data reading position (bypasses render_track) */
         double read_pos;          /* fractional sample position in audio_data */
+
+        /* Performance monitor — smoothed CPU usage of PSX processing */
+        float cpu_percent;        /* 0–100+, EMA-smoothed */
     } psx;
 } track_t;
 
@@ -1384,12 +1387,18 @@ static void ps_process_track(track_t *t, int16_t *out, int frames) {
      * When rap > 1.0, get_nsamples() returns 0 between calls — process(NULL,0)
      * advances remained_samples and resynthesizes from existing FFT data.
      * When rap < 1.0, get_nsamples() returns bufsize every call, plus
-     * get_skip_nsamples() > 0 to advance read_pos faster. */
+     * get_skip_nsamples() > 0 to advance read_pos faster.
+     *
+     * Rate-limit: produce at most ~2 FFT frames worth of output per render
+     * block to spread CPU load evenly instead of burst-filling the ring
+     * buffer (which causes audible pumping at large FFT sizes). */
     int bufsize = t->psx.stretch_l->get_bufsize();
+    int target = frames + bufsize;  /* enough for this block + 1 frame headroom */
     int max_iters = 64;
     while (max_iters-- > 0) {
         int out_sz = bufsize;
         if (t->psx.outbuf_count + out_sz > t->psx.outbuf_capacity) break;
+        if (t->psx.outbuf_count >= target) break;  /* enough buffered */
 
         int need = t->psx.stretch_l->get_nsamples(0.5f);
 
@@ -3499,6 +3508,11 @@ static int v2_get_param(void *instance, const char *key, char *buf,
         return (n >= 0 && n < buf_len) ? n : -1;
     }
 
+    if (strcmp(param, "psx_cpu") == 0) {
+        int n = snprintf(buf, (size_t)buf_len, "%.1f", t->psx.cpu_percent);
+        return (n >= 0 && n < buf_len) ? n : -1;
+    }
+
     if (strcmp(param, "peak_db") == 0) {
         int n = snprintf(buf, (size_t)buf_len, "%.1f", t->peak_db);
         return (n >= 0 && n < buf_len) ? n : -1;
@@ -3871,7 +3885,18 @@ static int render_track(track_t *t, int16_t *out, int frames) {
             ps_reinit_track(t);
         }
         if (!t->psx.stretch_l || !t->psx.stretch_r) goto normal_playback;
-        ps_process_track(t, out, frames);
+        {
+            struct timespec _t0, _t1;
+            clock_gettime(CLOCK_MONOTONIC, &_t0);
+            ps_process_track(t, out, frames);
+            clock_gettime(CLOCK_MONOTONIC, &_t1);
+            float elapsed_us = (float)(_t1.tv_sec - _t0.tv_sec) * 1e6f
+                             + (float)(_t1.tv_nsec - _t0.tv_nsec) / 1e3f;
+            float budget_us = (float)frames / (float)MOVE_SAMPLE_RATE * 1e6f;
+            float pct = (budget_us > 0.0f) ? (elapsed_us / budget_us * 100.0f) : 0.0f;
+            /* EMA smoothing: ~100 blocks → ~0.3s time constant */
+            t->psx.cpu_percent = t->psx.cpu_percent * 0.97f + pct * 0.03f;
+        }
         if (t->muted) {
             memset(out, 0, (size_t)frames * 2 * sizeof(int16_t));
             return 0;
