@@ -872,6 +872,10 @@ function restoreTrackUIState(idx) {
     syncMode = ts.syncMode || false;
     /* Sync play_mode to DSP for restored track */
     host_module_set_param("t" + idx + ":play_mode", varispeedEnabled ? "1" : "0");
+    /* syncEnabled follows gateMode: Trigger = sync on, Gate/OneShot = sync off */
+    syncEnabled = (trackStates[idx].gateMode === PAD_MODE_TRIGGER);
+    setParamBlocking("sync_clock", syncEnabled ? "1" : "0", 500);
+    if (syncEnabled) sendBeatsPerBarForQuantize();
     /* Flags — these will be refreshed from DSP in tick() */
     dirty = ts.dirty;
     hasUndo = ts.hasUndo;
@@ -1608,8 +1612,8 @@ function updateLeds() {
     setButtonLED(CC_CAPTURE, (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
 
     /* Left/Right: Trim, BPM, Slice */
-    setButtonLED(CC_LEFT,  (isFree || isSlice) ? LED_DIM : LED_OFF);
-    setButtonLED(CC_RIGHT, (isFree || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_LEFT,  (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
+    setButtonLED(CC_RIGHT, (isFree || isSync || isSlice) ? LED_DIM : LED_OFF);
 
     /* Up/Down: BPM, Slice */
     setButtonLED(CC_UP,   (isSync || isSlice) ? LED_DIM : LED_OFF);
@@ -1623,25 +1627,22 @@ function updateLeds() {
     setLED(STEP_BASE + 1, isSlice ? OrangeRed : DarkGrey);  /* Step 2 = Slice mode */
     setLED(STEP_BASE + 2, isPsx ? Blue : DarkGrey);  /* Step 3 = PaulXStretch */
 
-    /* Step 4: Pad mode LED — DarkGrey=Trigger, BrightRed=Gate, VividYellow=OneShot */
-    var _padModeLed = trackStates[activeTrack].gateMode;
-    setLED(STEP_BASE + 3, isEdit ? (_padModeLed === PAD_MODE_GATE ? BrightRed : _padModeLed === PAD_MODE_ONESHOT ? VividYellow : DarkGrey) : Black);
+    /* Step 4: reserved for FX-View — always dark */
+    setLED(STEP_BASE + 3, Black);
 
-    /* Step 5: Clock Sync LED; dim dot when quantize != BAR */
-    var _qColor = syncEnabled ? BrightGreen : DarkGrey;
-    if (syncEnabled && quantizeMode !== QUANT_BAR) _qColor = VividYellow; /* yellow = non-default quantize */
-    setLED(STEP_BASE + 4, isEdit ? _qColor : Black);
+    /* Step 5: Mixer view — VividYellow when active, DarkGrey otherwise */
+    setLED(STEP_BASE + 4, isMixer ? VividYellow : (isEdit ? DarkGrey : Black));
 
     /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
     var _hasScenes = (trackStates[activeTrack].scenes.length > 0);
     setLED(STEP_BASE + 5, isEdit ? (_hasScenes ? VividYellow : DarkGrey) : Black);
 
-    /* Step 7: Mixer view — VividYellow when active, DarkGrey otherwise */
-    setLED(STEP_BASE + 6, isMixer ? VividYellow : (isEdit ? DarkGrey : Black));
+    /* Step 7: freed — dark */
+    setLED(STEP_BASE + 6, Black);
 
-    /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
-    var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
-    setLED(STEP_BASE + 7, (isFree || isSync) && hasPitchTempo ? VividYellow : Black);
+    /* Step 8: Pad mode LED — DarkGrey=Trigger, BrightRed=Gate, VividYellow=OneShot */
+    var _padModeLed = trackStates[activeTrack].gateMode;
+    setLED(STEP_BASE + 7, isEdit ? (_padModeLed === PAD_MODE_GATE ? BrightRed : _padModeLed === PAD_MODE_ONESHOT ? VividYellow : DarkGrey) : Black);
 
     /* Step 9-15: PaulXStretch effect LEDs (7 pages) or normal fade/reverse/reset LEDs */
     if (isPsx) {
@@ -1655,18 +1656,29 @@ function updateLeds() {
             setLED(STEP_BASE + 8 + _ei, _col);
         }
     } else {
+        /* Step 9: Fade In LED; Step 10: Reverse LED */
         var hasFade = isFree || isSync || isSlice;
         setLED(STEP_BASE + 8,  hasFade ? VividYellow : Black);
-        setLED(STEP_BASE + 9,  hasFade ? Blue   : Black);
-        /* Step 11: Reverse LED (Trim/BPM/Slice) */
-        setLED(STEP_BASE + 10, hasFade ? VividYellow : Black);
+        setLED(STEP_BASE + 9,  hasFade ? VividYellow : Black);
+
+        /* Steps 11-13: freed — dark */
+        setLED(STEP_BASE + 10, Black);
         setLED(STEP_BASE + 11, Black);
         setLED(STEP_BASE + 12, Black);
-        /* Step 14: Reset/Reload LED (Trim/BPM/Slice) */
-        setLED(STEP_BASE + 13, (isFree || isSync || isSlice) ? BrightRed : Black);
-        /* Step 15/16: marker-set LEDs (Trim/BPM), shuffle LED (Slice) */
-        setLED(STEP_BASE + 14, (isFree || isSync) ? BrightGreen : Black);
-        setLED(STEP_BASE + 15, (isFree || isSync) ? BrightRed : isSlice ? BrightRed : Black);
+
+        /* Step 14/15: marker-set LEDs (playing only) */
+        setLED(STEP_BASE + 13, (isFree || isSync) && playing ? BrightGreen : Black);
+        setLED(STEP_BASE + 14, (isFree || isSync) && playing ? BrightRed : Black);
+
+        /* Step 16: Reset Scene */
+        setLED(STEP_BASE + 15, (isFree || isSync || isSlice) ? BrightRed : Black);
+
+        /* Mixer Steps 9-12: Mute T1-T4 */
+        if (isMixer) {
+            for (var _mli = 0; _mli < NUM_TRACKS; _mli++) {
+                setLED(STEP_BASE + 8 + _mli, trackStates[_mli].muted ? BrightRed : DarkGrey);
+            }
+        }
     }
 
     /* Pad LEDs: scene launcher colors in Trim/BPM/PSX views */
@@ -1896,6 +1908,27 @@ function resetVScale() {
  * Returns true if handled (caller should cancel deletePendingCut).
  */
 function handleDeleteKnob(cc) {
+    /* Mixer view: Delete+K1-4 = reset track level; Delete+Shift+K1-4 = reset pan */
+    if (currentView === VIEW_MIXER) {
+        var _dmIdx = -1;
+        if      (cc === CC_E1) _dmIdx = 0;
+        else if (cc === CC_E2) _dmIdx = 1;
+        else if (cc === CC_E3) _dmIdx = 2;
+        else if (cc === CC_E4) _dmIdx = 3;
+        if (_dmIdx >= 0) {
+            if (shiftHeld) {
+                trackStates[_dmIdx].pan = 0.0;
+                host_module_set_param("t" + _dmIdx + ":pan", "0.00");
+                showStatus("T" + (_dmIdx + 1) + " Pan:C", 60);
+            } else {
+                trackStates[_dmIdx].gainDb = 0.0;
+                if (_dmIdx === activeTrack) gainDb = 0.0;
+                host_module_set_param("t" + _dmIdx + ":gain_db", "0.0");
+                showStatus("T" + (_dmIdx + 1) + " Vol:0dB", 60);
+            }
+            return true;
+        }
+    }
     if (cc === CC_E3) { resetZoom(); return true; }
     if (cc === CC_E4) { resetVScale(); return true; }
     if (cc === CC_E5 && (currentView === VIEW_FREE || currentView === VIEW_LOOP)) {
@@ -3421,9 +3454,6 @@ function drawMixerView() {
 
     /* Header: "MIX" left, master volume right */
     print(0, 0, "MIX", 1);
-    var _mvSign = masterVolumeDb >= 0 ? "+" : "";
-    var _mvStr = "M:" + _mvSign + masterVolumeDb.toFixed(1);
-    print(SCREEN_W - _mvStr.length * 6, 0, _mvStr, 1);
 
     for (var _mi = 0; _mi < NUM_TRACKS; _mi++) {
         var _cx  = _mi * COL_W;
@@ -3475,6 +3505,28 @@ function drawMixerView() {
         if (_panCX > _cx + COL_W - 3) _panCX = _cx + COL_W - 3;
         fill_rect(_panCX - 1, _panY - 2, 3, 5, 1);
     }
+
+    /* 5th bar: Master Volume (offset from track bars) */
+    var _mvBarX = NUM_TRACKS * COL_W + 4;  /* 4px gap after track 4 */
+    var _mvBarW = 10;
+    var _mvLbl = "M";
+    print(_mvBarX + Math.floor((_mvBarW - _mvLbl.length * 6) / 2), 10, _mvLbl, 1);
+    /* Bar outline */
+    draw_line(_mvBarX,           BAR_TOP, _mvBarX,           BAR_BOT, 1);
+    draw_line(_mvBarX + _mvBarW, BAR_TOP, _mvBarX + _mvBarW, BAR_BOT, 1);
+    /* 0dB marker */
+    draw_line(_mvBarX, ZERO_Y, _mvBarX + _mvBarW, ZERO_Y, 1);
+    /* Fill bar — masterVolumeDb range -60..+6 */
+    var _mvRange = 66.0; /* 60 + 6 */
+    var _mvNorm = (masterVolumeDb + 60.0) / _mvRange;
+    if (_mvNorm < 0) _mvNorm = 0; if (_mvNorm > 1) _mvNorm = 1;
+    var _mvFillH = Math.round(_mvNorm * BAR_H);
+    if (_mvFillH > 0) fill_rect(_mvBarX + 1, BAR_BOT - _mvFillH + 1, _mvBarW - 1, _mvFillH, 1);
+    /* dB value */
+    var _mvSign = masterVolumeDb >= 0 ? "+" : "";
+    var _mvDbStr = _mvSign + masterVolumeDb.toFixed(1);
+    if (_mvDbStr.length > 4) _mvDbStr = _mvDbStr.substring(0, 4);
+    print(_mvBarX + Math.floor((_mvBarW - _mvDbStr.length * 6) / 2), 54, _mvDbStr, 1);
 
     /* Active status (knob hint) if no timed status */
     if (getActiveStatus() === "") {
@@ -5737,6 +5789,9 @@ function handleCC(cc, value) {
                 break;
             case VIEW_SYNC:
                 break;
+            case VIEW_MIXER:
+                switchView(editMode);
+                break;
             case VIEW_MODE_SELECT:
                 /* Back = cancel, return to previous view */
                 switchView(modeSelectReturnView);
@@ -6031,7 +6086,7 @@ function handleCC(cc, value) {
         return;
     }
 
-    /* Left/Right arrows — nudge selection or jump by selection length */
+    /* Left/Right arrows — nudge/jump selection */
     if ((cc === CC_LEFT || cc === CC_RIGHT) && value > 0) {
         if (currentView === VIEW_FREE) {
             var selLen = endSample - startSample;
@@ -6040,7 +6095,6 @@ function handleCC(cc, value) {
             if (shiftHeld) {
                 /* Shift: jump by exactly one selection length */
                 if (dir > 0) {
-                    /* Right: next region starts where current ends */
                     startSample = endSample;
                     endSample = startSample + selLen;
                     if (endSample > totalFrames) {
@@ -6049,7 +6103,6 @@ function handleCC(cc, value) {
                         if (startSample < 0) startSample = 0;
                     }
                 } else {
-                    /* Left: previous region ends where current starts */
                     endSample = startSample;
                     startSample = endSample - selLen;
                     if (startSample < 0) {
@@ -6063,14 +6116,8 @@ function handleCC(cc, value) {
                 var step = getCoarseStep() * dir;
                 var newStart = startSample + step;
                 var newEnd = endSample + step;
-                if (newStart < 0) {
-                    newStart = 0;
-                    newEnd = newStart + selLen;
-                }
-                if (newEnd > totalFrames) {
-                    newEnd = totalFrames;
-                    newStart = newEnd - selLen;
-                }
+                if (newStart < 0) { newStart = 0; newEnd = newStart + selLen; }
+                if (newEnd > totalFrames) { newEnd = totalFrames; newStart = newEnd - selLen; }
                 if (newStart < 0) newStart = 0;
                 startSample = newStart;
                 endSample = newEnd;
@@ -6078,6 +6125,25 @@ function handleCC(cc, value) {
             syncMarkersToDs();
             refreshWaveform();
             announce("Start:" + formatTime(startSample));
+        } else if (currentView === VIEW_SYNC || (currentView === VIEW_FREE && varispeedEnabled)) {
+            /* Sync/Varispeed: LEFT/RIGHT = shift by one beat division; Shift = jump by full selection */
+            var _lrSelLen = endSample - startSample;
+            var _lrDir = (cc === CC_LEFT) ? -1 : 1;
+            var _lrStep;
+            if (shiftHeld) {
+                _lrStep = _lrSelLen * _lrDir;
+            } else {
+                _lrStep = getBeatStepSamples() * _lrDir;
+            }
+            var _lrNewStart = startSample + _lrStep;
+            var _lrNewEnd   = endSample   + _lrStep;
+            if (_lrNewStart < 0) { _lrNewStart = 0; _lrNewEnd = _lrSelLen; }
+            if (_lrNewEnd > totalFrames) { _lrNewEnd = totalFrames; _lrNewStart = _lrNewEnd - _lrSelLen; if (_lrNewStart < 0) _lrNewStart = 0; }
+            startSample = _lrNewStart;
+            endSample   = _lrNewEnd;
+            syncMarkersToDs();
+            refreshWaveform();
+            announce("Start:" + formatBarsBeats(startSample));
         } else if (currentView === VIEW_SLICE) {
             if (shiftHeld) {
                 /* Shift+Left/Right: move selected slice one position (swap with neighbour) */
@@ -7209,7 +7275,11 @@ function handleNote(note, velocity) {
      * Remove+Pad can remove scenes in Trim/BPM view. */
     if (velocity > 0 && deleteHeld) {
         var knobCc = null;
-        if      (note === MoveKnob5Touch) knobCc = CC_E5;
+        if      (note === MoveKnob1Touch) knobCc = CC_E1;
+        else if (note === MoveKnob2Touch) knobCc = CC_E2;
+        else if (note === MoveKnob3Touch) knobCc = CC_E3;
+        else if (note === MoveKnob4Touch) knobCc = CC_E4;
+        else if (note === MoveKnob5Touch) knobCc = CC_E5;
         else if (note === MoveKnob6Touch) knobCc = CC_E6;
         else if (note === MoveKnob7Touch) knobCc = CC_E7;
         else if (note === MoveKnob8Touch) knobCc = CC_E8;
@@ -7219,20 +7289,8 @@ function handleNote(note, velocity) {
         }
         /* Not a knob touch — fall through to pad/step handling below */
     }
-    /* Step 4: Cycle pad mode — Trigger → Gate → OneShot → Trigger */
+    /* Step 4: reserved for FX-View (not yet implemented) */
     if (velocity > 0 && note === STEP_BASE + 3) {
-        trackStates[activeTrack].gateMode = (trackStates[activeTrack].gateMode + 1) % 3;
-        var _newPadMode = trackStates[activeTrack].gateMode;
-        host_module_set_param("t" + activeTrack + ":gate_mode", String(_newPadMode));
-        /* Persist into the active scene so it's saved with the scene */
-        var _ts4 = trackStates[activeTrack];
-        if (_ts4.playingSceneIdx >= 0 && _ts4.playingSceneIdx < _ts4.scenes.length) {
-            _ts4.scenes[_ts4.playingSceneIdx].gateMode = _newPadMode;
-        }
-        var _pmLabel = _newPadMode === PAD_MODE_GATE ? "Gate Mode" : _newPadMode === PAD_MODE_ONESHOT ? "One Shot" : "Trigger";
-        announce(_pmLabel);
-        showStatus(_newPadMode === PAD_MODE_GATE ? "Gate" : _newPadMode === PAD_MODE_ONESHOT ? "1Shot" : "Trig", 60);
-        updateLeds();
         return;
     }
 
@@ -7247,33 +7305,10 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 5: Toggle Clock Sync; Shift+Step5 = cycle quantize mode */
+    /* Step 5: Toggle Mixer view */
     if (velocity > 0 && note === STEP_BASE + 4) {
-        if (shiftHeld) {
-            quantizeMode = (quantizeMode + 1) % QUANT_LABELS.length;
-            showStatus("Q:" + QUANT_LABELS[quantizeMode], 90);
-            announce("Quantize " + QUANT_LABELS[quantizeMode]);
-            /* Push new granularity to DSP so clock grid realigns */
-            if (syncEnabled) sendBeatsPerBarForQuantize();
-            updateLeds();
-        } else {
-            syncEnabled = !syncEnabled;
-            /* MUST be blocking — sendBeatsPerBarForQuantize() below sends
-             * another param immediately; non-blocking would be overwritten
-             * in the single shared-memory slot before DSP processes it. */
-            setParamBlocking("sync_clock", syncEnabled ? "1" : "0", 500);
-            if (syncEnabled) sendBeatsPerBarForQuantize();
-            announce(syncEnabled ? "Sync On" : "Sync Off");
-            showStatus(syncEnabled ? "Sync On" : "Sync Off", 60);
-            updateLeds();
-        }
-        return;
-    }
-
-    /* Step 7: Toggle Mixer view */
-    if (velocity > 0 && note === STEP_BASE + 6) {
-        var _mixerEditViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH, VIEW_MIXER];
-        if (_mixerEditViews.indexOf(currentView) >= 0) {
+        var _mixerEditViews5 = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH, VIEW_MIXER];
+        if (_mixerEditViews5.indexOf(currentView) >= 0) {
             if (currentView === VIEW_MIXER) {
                 switchView(editMode);
             } else {
@@ -7283,75 +7318,110 @@ function handleNote(note, velocity) {
         return;
     }
 
-    /* Step 8: Apply Pitch/Tempo to selection (Trim/BPM view) */
-    if (velocity > 0 && note === STEP_BASE + 7) {
-        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) &&
-            (pitchSemitones !== 0.0 || tempoPercent !== 100)) {
-            host_module_set_param("apply_pitch_tempo", "1");
-            pitchSemitones = 0.0;
-            tempoPercent = 100;
-            showStatus("Applied P/T", 90);
-            updateLeds();
-        }
+    /* Step 7: freed */
+    if (velocity > 0 && note === STEP_BASE + 6) {
         return;
     }
 
-    /* Step 9/10: fade in/out (Trim/BPM/Slice — not PSX view) */
-    if (velocity > 0 && (note === STEP_BASE + 8 || note === STEP_BASE + 9)) {
-        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) && currentView !== VIEW_PAULXSTRETCH) {
-            if (note === STEP_BASE + 8) {
-                doFadeIn();
-            } else {
-                doFadeOut();
-            }
+    /* Step 8: Gate ↔ OneShot toggle; Shift+Step8 = Trigger mode.
+     * Trigger couples to syncEnabled (clock sync); Gate/OneShot disable clock sync. */
+    if (velocity > 0 && note === STEP_BASE + 7) {
+        var _ts8 = trackStates[activeTrack];
+        var _newPadMode8;
+        if (shiftHeld) {
+            _newPadMode8 = PAD_MODE_TRIGGER;
+        } else {
+            _newPadMode8 = (_ts8.gateMode === PAD_MODE_GATE) ? PAD_MODE_ONESHOT : PAD_MODE_GATE;
+        }
+        _ts8.gateMode = _newPadMode8;
+        host_module_set_param("t" + activeTrack + ":gate_mode", String(_newPadMode8));
+        /* Sync coupling: Trigger → syncEnabled on, Gate/OneShot → sync off */
+        var _newSyncEnabled8 = (_newPadMode8 === PAD_MODE_TRIGGER);
+        if (syncEnabled !== _newSyncEnabled8) {
+            syncEnabled = _newSyncEnabled8;
+            setParamBlocking("sync_clock", syncEnabled ? "1" : "0", 500);
+            if (syncEnabled) sendBeatsPerBarForQuantize();
+        }
+        /* Persist gateMode into active scene */
+        var _s8Idx = (_ts8.playingSceneIdx >= 0 && _ts8.playingSceneIdx < _ts8.scenes.length)
+            ? _ts8.playingSceneIdx
+            : (_ts8.selectedSceneIdx >= 0 && _ts8.selectedSceneIdx < _ts8.scenes.length ? _ts8.selectedSceneIdx : -1);
+        if (_s8Idx >= 0) _ts8.scenes[_s8Idx].gateMode = _newPadMode8;
+        var _pmLabel8 = _newPadMode8 === PAD_MODE_GATE ? "Gate Mode" : _newPadMode8 === PAD_MODE_ONESHOT ? "One Shot" : "Trigger";
+        announce(_pmLabel8);
+        showStatus(_newPadMode8 === PAD_MODE_GATE ? "Gate" : _newPadMode8 === PAD_MODE_ONESHOT ? "1Shot" : "Trig", 60);
+        saveProjectJson();
+        updateLeds();
+        return;
+    }
+
+    /* Step 9: Fade In; Shift+Step9: Fade Out */
+    if (velocity > 0 && note === STEP_BASE + 8) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+            if (shiftHeld) { doFadeOut(); } else { doFadeIn(); }
             return;
         }
     }
 
-    /* Step 11: reverse selection (Trim/BPM/Slice — not PSX view) */
-    if (velocity > 0 && note === STEP_BASE + 10) {
-        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) && currentView !== VIEW_PAULXSTRETCH) {
+    /* Step 10: Reverse selection */
+    if (velocity > 0 && note === STEP_BASE + 9) {
+        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
             doReverse();
             return;
         }
     }
 
-    /* Step 16: shuffle slices (Slice view only) */
-    if (velocity > 0 && note === STEP_BASE + 15 && currentView === VIEW_SLICE) {
-        doSliceShuffle();
+    /* Step 14: set start marker at playback position */
+    if (velocity > 0 && note === STEP_BASE + 13) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) && playing) {
+            startSample = playPos;
+            if (startSample >= endSample) endSample = startSample + 1;
+            if (endSample > totalFrames) { endSample = totalFrames; startSample = endSample - 1; }
+            syncMarkersToDs();
+            refreshWaveform();
+            showStatus("Start \u2192 " + formatTime(startSample), 60);
+        }
         return;
     }
 
-    /* Step 14: reset/reload file (Trim/BPM/Slice) */
-    if (velocity > 0 && note === STEP_BASE + 13) {
-        if (currentView === VIEW_FREE || currentView === VIEW_SYNC || currentView === VIEW_SLICE) {
+    /* Step 15: set end marker at playback position */
+    if (velocity > 0 && note === STEP_BASE + 14) {
+        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) && playing) {
+            endSample = playPos;
+            if (endSample <= startSample) endSample = startSample + 1;
+            if (endSample > totalFrames) endSample = totalFrames;
+            syncMarkersToDs();
+            refreshWaveform();
+            showStatus("End \u2192 " + formatTime(endSample), 60);
+        }
+        return;
+    }
+
+    /* Step 16: Reset Scene / Shuffle Slices */
+    if (velocity > 0 && note === STEP_BASE + 15) {
+        if (currentView === VIEW_SLICE) {
+            doSliceShuffle();
+        } else if (currentView === VIEW_FREE || currentView === VIEW_SYNC) {
             doResetFile();
+        }
+        return;
+    }
+
+    /* Mixer Steps 9-12: Mute/Unmute Track 1-4 */
+    if (velocity > 0 && currentView === VIEW_MIXER) {
+        var _mxMuteIdx = -1;
+        if      (note === STEP_BASE + 8)  _mxMuteIdx = 0;
+        else if (note === STEP_BASE + 9)  _mxMuteIdx = 1;
+        else if (note === STEP_BASE + 10) _mxMuteIdx = 2;
+        else if (note === STEP_BASE + 11) _mxMuteIdx = 3;
+        if (_mxMuteIdx >= 0) {
+            var _mxMTs = trackStates[_mxMuteIdx];
+            _mxMTs.muted = !_mxMTs.muted;
+            host_module_set_param("t" + _mxMuteIdx + ":muted", _mxMTs.muted ? "1" : "0");
+            showStatus("T" + (_mxMuteIdx + 1) + (_mxMTs.muted ? " Mute" : " Unmute"), 60);
+            updateLeds();
             return;
         }
-    }
-
-    /* Step 15/16: set start/end marker at playback position (not PSX view) */
-    if (velocity > 0 && (note === STEP_BASE + 14 || note === STEP_BASE + 15) && currentView !== VIEW_PAULXSTRETCH) {
-        if ((currentView === VIEW_FREE || currentView === VIEW_SYNC) && playing) {
-            if (note === STEP_BASE + 14) {
-                /* Step 15: set start marker at play position */
-                startSample = playPos;
-                if (startSample >= endSample) endSample = startSample + 1;
-                if (endSample > totalFrames) { endSample = totalFrames; startSample = endSample - 1; }
-                syncMarkersToDs();
-                refreshWaveform();
-                showStatus("Start \u2192 " + formatTime(startSample), 60);
-            } else {
-                /* Step 16: set end marker at play position */
-                endSample = playPos;
-                if (endSample <= startSample) endSample = startSample + 1;
-                if (endSample > totalFrames) endSample = totalFrames;
-                syncMarkersToDs();
-                refreshWaveform();
-                showStatus("End \u2192 " + formatTime(endSample), 60);
-            }
-        }
-        return;
     }
 
     /* Step 1: enter editMode (FREE/SYNC); Shift+Step1 = mode select mini-menu */
