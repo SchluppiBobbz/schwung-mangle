@@ -981,15 +981,15 @@ static void make_edit_filename(const char *original_path, char *out_buf,
  * PaulXStretch helpers — init, free, reinit, process, param handling
  * ============================================================================ */
 
-#define PSX_DEFAULT_FFT_SIZE  1024
+#define PSX_DEFAULT_FFT_SIZE  8192
 #define PSX_DEFAULT_STRETCH   8.0f
 #define PSX_MAX_FFT_SIZE      32768   /* cap at 32k for ARM64 CPU budget */
 #define PSX_OUTBUF_MULT       8       /* output ring = fft_size * this */
 
 static int psx_fft_size_from_norm(float v) {
-    /* 0.0 -> 256 (2^8), 1.0 -> 32768 (2^15) — 8 steps */
-    int exp_val = 8 + (int)(v * 7.0f + 0.5f);
-    if (exp_val < 8) exp_val = 8;
+    /* 0.0 -> 128 (2^7), 1.0 -> 32768 (2^15) — 9 steps */
+    int exp_val = 7 + (int)(v * 8.0f + 0.5f);
+    if (exp_val < 7) exp_val = 7;
     if (exp_val > 15) exp_val = 15;
     return 1 << exp_val;
 }
@@ -1009,7 +1009,7 @@ static void ps_free_buffers(track_t *t) {
 
 static void ps_alloc_stretchers(track_t *t) {
     int fft_sz = t->psx.fft_size;
-    if (fft_sz < 256) fft_sz = 256;
+    if (fft_sz < 128) fft_sz = 128;
 
     /* Create L and R stretchers (mono each, stereo_mode 1=left, 2=right) */
     t->psx.stretch_l = new ProcessedStretch(
@@ -1066,7 +1066,7 @@ static void ps_init_track(track_t *t) {
      * that were zeroed by memset above */
     new (&t->psx.proc_pars) ProcessParameters();
     t->psx.stretch_amount = PSX_DEFAULT_STRETCH;
-    t->psx.fft_size_norm = 0.3f;
+    t->psx.fft_size_norm = 0.75f;  /* maps to 8192 with new scale: 2^(7 + round(0.75*8)) = 2^13 */
     t->psx.fft_size = PSX_DEFAULT_FFT_SIZE;
     t->psx.binaural_power = 0.5f;
     t->psx.binaural_freq = 7.0f;
@@ -1320,17 +1320,25 @@ static void ps_read_audio(track_t *t, float *buf_l, float *buf_r, int count,
     }
 
     for (int i = 0; i < count; i++) {
-        int pos = (int)t->psx.read_pos;
+        double rp = t->psx.read_pos;
+        int pos0 = (int)rp;
+        float frac = (float)(rp - pos0);
 
-        /* Wrap within region */
+        /* Wrap pos0 within region */
         if (region_len > 0) {
-            while (pos >= play_end) pos -= region_len;
-            while (pos < play_start) pos += region_len;
+            while (pos0 >= play_end) pos0 -= region_len;
+            while (pos0 < play_start) pos0 += region_len;
         }
+        int pos1 = pos0 + 1;
+        if (region_len > 0 && pos1 >= play_end) pos1 -= region_len;
 
-        if (pos >= 0 && pos < t->audio_frames) {
-            buf_l[i] = (float)t->audio_data[pos * 2 + 0] / 32768.0f * linear_gain;
-            buf_r[i] = (float)t->audio_data[pos * 2 + 1] / 32768.0f * linear_gain;
+        if (pos0 >= 0 && pos0 < t->audio_frames) {
+            float l0 = (float)t->audio_data[pos0 * 2 + 0] / 32768.0f;
+            float r0 = (float)t->audio_data[pos0 * 2 + 1] / 32768.0f;
+            float l1 = (pos1 >= 0 && pos1 < t->audio_frames) ? (float)t->audio_data[pos1 * 2 + 0] / 32768.0f : l0;
+            float r1 = (pos1 >= 0 && pos1 < t->audio_frames) ? (float)t->audio_data[pos1 * 2 + 1] / 32768.0f : r0;
+            buf_l[i] = (l0 + frac * (l1 - l0)) * linear_gain;
+            buf_r[i] = (r0 + frac * (r1 - r0)) * linear_gain;
         } else {
             buf_l[i] = 0.0f;
             buf_r[i] = 0.0f;
