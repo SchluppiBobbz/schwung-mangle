@@ -266,6 +266,10 @@ typedef struct {
     int      track_rb_write[NUM_TRACKS];
     char     skipback_result[512];   /* path of last successfully written skipback WAV */
     char     project_dir[512];       /* current project dir, persisted for UI reconnect */
+
+    /* Per-track output buffers for FX routing (filled each render_block) */
+    int16_t  track_out[NUM_TRACKS][MOVE_FRAMES_PER_BLOCK * 2];
+    int      track_out_frames;       /* frames rendered in current block */
 } instance_t;
 
 /* ============================================================================
@@ -4235,6 +4239,12 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
             }
         }
 
+        /* Store per-track output for FX routing (panned, pre-master-volume) */
+        if (produced)
+            memcpy(inst->track_out[ti], tmp, (size_t)frames * 2 * sizeof(int16_t));
+        else
+            memset(inst->track_out[ti], 0, (size_t)frames * 2 * sizeof(int16_t));
+
         /* Write per-track output to skipback ring buffer (silence if not playing) */
         if (inst->track_rb[ti]) {
             int wp = inst->track_rb_write[ti];
@@ -4279,6 +4289,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
         inst->master_rb_write = (mwp + frames) % RB_FRAMES;
     }
 
+    inst->track_out_frames = frames;
     (void)any_audio;
 }
 
@@ -4303,4 +4314,17 @@ void *move_plugin_init_v2(const host_api_v1_t *host_api) {
     g_host = host_api;
     plugin_log("Plugin initialized (V2 4-track stereo, Bungee)");
     return &s_plugin_api;
+}
+
+/* Per-track audio output for FX routing.
+ * Returns pointer to stereo interleaved int16_t buffer (panned, pre-master-volume)
+ * for the given track from the most recent render_block call.
+ * Returns NULL if track_idx is out of range or instance is NULL.
+ * *out_frames receives the number of frames in the buffer. */
+extern "C" __attribute__((visibility("default")))
+int16_t *mangle_get_track_output(void *instance, int track_idx, int *out_frames) {
+    instance_t *inst = (instance_t *)instance;
+    if (!inst || track_idx < 0 || track_idx >= NUM_TRACKS) return NULL;
+    if (out_frames) *out_frames = inst->track_out_frames;
+    return inst->track_out[track_idx];
 }
