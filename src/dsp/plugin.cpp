@@ -138,6 +138,7 @@ typedef struct {
 
     float gain_db;
     float peak_db;
+    float pan;              /* stereo pan: -1.0=left, 0.0=center, +1.0=right */
 
     int mode;                   /* 0=trim, 1=gain */
 
@@ -239,6 +240,7 @@ typedef struct {
     int active_track;           /* 0-3, which track is being edited */
     int sync_to_clock;          /* 1 = MIDI clock sync enabled */
     float project_bpm;          /* global project BPM (used for internal bar timing) */
+    float master_volume_db;     /* global output gain in dB (-60..+6) */
 
     /* Clock sync state — SYNC_CLOCK path (mirrors SuperArp pattern) */
     int clock_running;          /* 1 if MIDI transport is running */
@@ -1887,6 +1889,14 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         return;
     }
 
+    if (strcmp(key, "master_volume_db") == 0) {
+        if (!val) return;
+        inst->master_volume_db = (float)atof(val);
+        if (inst->master_volume_db < -60.0f) inst->master_volume_db = -60.0f;
+        if (inst->master_volume_db > 6.0f) inst->master_volume_db = 6.0f;
+        return;
+    }
+
     if (strcmp(key, "beats_per_bar") == 0) {
         if (!val) return;
         int bpb = atoi(val);
@@ -2503,6 +2513,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         /* Clamp to reasonable range */
         if (t->gain_db < -60.0f) t->gain_db = -60.0f;
         if (t->gain_db > 24.0f) t->gain_db = 24.0f;
+        return;
+    }
+
+    /* --- Pan --- */
+    if (strcmp(param, "pan") == 0) {
+        if (!val) return;
+        t->pan = (float)atof(val);
+        if (t->pan < -1.0f) t->pan = -1.0f;
+        if (t->pan > 1.0f) t->pan = 1.0f;
         return;
     }
 
@@ -4200,6 +4219,22 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
         int produced = render_track(t, tmp, frames);
         if (produced) any_audio = 1;
 
+        /* Apply stereo pan (balance law: center = both at 1.0, hard pan cuts one side) */
+        if (produced && t->pan != 0.0f) {
+            float pan_l = (t->pan <= 0.0f) ? 1.0f : 1.0f - t->pan;
+            float pan_r = (t->pan >= 0.0f) ? 1.0f : 1.0f + t->pan;
+            for (int f = 0; f < frames; f++) {
+                float sl = (float)tmp[f * 2]     * pan_l;
+                float sr = (float)tmp[f * 2 + 1] * pan_r;
+                if (sl >  32767.0f) sl =  32767.0f;
+                if (sl < -32768.0f) sl = -32768.0f;
+                if (sr >  32767.0f) sr =  32767.0f;
+                if (sr < -32768.0f) sr = -32768.0f;
+                tmp[f * 2]     = (int16_t)sl;
+                tmp[f * 2 + 1] = (int16_t)sr;
+            }
+        }
+
         /* Write per-track output to skipback ring buffer (silence if not playing) */
         if (inst->track_rb[ti]) {
             int wp = inst->track_rb_write[ti];
@@ -4219,6 +4254,17 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
             if (sum > 32767) sum = 32767;
             if (sum < -32768) sum = -32768;
             out_interleaved_lr[i] = (int16_t)sum;
+        }
+    }
+
+    /* Apply master volume */
+    if (inst->master_volume_db != 0.0f) {
+        float master_gain = powf(10.0f, inst->master_volume_db / 20.0f);
+        for (int i = 0; i < frames * 2; i++) {
+            float s = (float)out_interleaved_lr[i] * master_gain;
+            if (s >  32767.0f) s =  32767.0f;
+            if (s < -32768.0f) s = -32768.0f;
+            out_interleaved_lr[i] = (int16_t)s;
         }
     }
 

@@ -91,6 +91,7 @@ var VIEW_CONFIRM_CLOSE = 15; /* Save/Discard/Cancel before closing (Shift+Back) 
 var VIEW_CONFIRM_RESUME = 16; /* Resume previous session or start new project */
 var VIEW_MODE_SELECT = 17;    /* Shift+Step1 mini-menu: Sync / Free / Varispeed */
 var VIEW_PAULXSTRETCH = 18;   /* PaulXStretch spectral effects view */
+var VIEW_MIXER = 19;          /* Mixer view: per-track volume/pan + master volume */
 
 /* ============ Debug Logging ============ */
 /* Set to true to enable debug logging to /tmp/scene_debug.log on device.
@@ -334,6 +335,7 @@ var globalBpm = 120;       /* project BPM from host, default 120 */
 var syncMode = false;      /* true when active scene/file uses BPM sync */
 var lastProjectBpm = 0;     /* dedup: last overlay BPM applied — only used when lockBpmToProject=true */
 var lockBpmToProject = false; /* if true, tick block follows overlay samplerBpm; default: Mangle owns BPM */
+var masterVolumeDb = 0.0;   /* global output gain in dB (-60..+6) */
 /* MIDI inject queue — drain 1 packet per tick, 50ms minimum between packets */
 var injectQueue = [];
 var lastInjectTime = 0;
@@ -565,6 +567,7 @@ function makeTrackState() {
         zoomLevel: 0, zoomCenter: 0, vScale: 1.0,
         playing: false, playPos: 0,
         gainDb: 0.0, peakDb: -96,
+        pan: 0.0,               /* stereo pan: -1.0=left, 0.0=center, +1.0=right */
         gateMode: PAD_MODE_TRIGGER,
         varispeedMode: false,  /* true = varispeed (repitch), false = stretch (Bungee) */
         loopEnabled: false,
@@ -1223,14 +1226,15 @@ function saveProjectJson() {
     /* Flush active track's current editor state into trackStates and scene */
     saveTrackUIState(activeTrack);
     saveCurrentSceneState(activeTrack);
-    var d = { version: 1, activeTrack: activeTrack, globalBpm: globalBpm, lockBpmToProject: lockBpmToProject, tracks: [] };
+    var d = { version: 1, activeTrack: activeTrack, globalBpm: globalBpm, lockBpmToProject: lockBpmToProject, masterVolumeDb: masterVolumeDb, tracks: [] };
     for (var _st = 0; _st < NUM_TRACKS; _st++) {
         d.tracks.push({
             scenes:           trackStates[_st].scenes,
             selectedSceneIdx: trackStates[_st].selectedSceneIdx,
             playingSceneIdx:  trackStates[_st].playingSceneIdx,
             muted:            !!trackStates[_st].muted,
-            gateMode:         trackStates[_st].gateMode | 0
+            gateMode:         trackStates[_st].gateMode | 0,
+            pan:              trackStates[_st].pan || 0.0
         });
     }
     if (typeof host_write_file === "function") {
@@ -1344,6 +1348,10 @@ function loadProjectJson() {
         if (typeof d.lockBpmToProject === "boolean") {
             lockBpmToProject = d.lockBpmToProject;
         }
+        if (typeof d.masterVolumeDb === "number") {
+            masterVolumeDb = d.masterVolumeDb;
+            host_module_set_param("master_volume_db", masterVolumeDb.toFixed(1));
+        }
         var _savedActiveTrack = (d.activeTrack !== undefined && d.activeTrack >= 0 && d.activeTrack < NUM_TRACKS)
             ? d.activeTrack : 0;
 
@@ -1369,11 +1377,13 @@ function loadProjectJson() {
             ts.selectedSceneIdx = ts.scenes.length;
             if (ts.selectedSceneIdx >= MAX_SCENES) ts.selectedSceneIdx = MAX_SCENES - 1;
 
-            /* Restore muted / gateMode */
+            /* Restore muted / gateMode / pan */
             ts.muted    = !!td.muted;
             ts.gateMode = (td.gateMode >= 0 && td.gateMode <= 2) ? td.gateMode : PAD_MODE_TRIGGER;
+            ts.pan      = (typeof td.pan === "number") ? Math.max(-1.0, Math.min(1.0, td.pan)) : 0.0;
             host_module_set_param("t" + _lt + ":muted",     ts.muted ? "1" : "0");
             host_module_set_param("t" + _lt + ":gate_mode", String(ts.gateMode));
+            host_module_set_param("t" + _lt + ":pan",       ts.pan.toFixed(2));
 
             /* Find the scene to load (playing scene, or first available) */
             var _ltPlayIdx = ts.playingSceneIdx;
@@ -1576,7 +1586,8 @@ function updateLeds() {
     var isSlice = (currentView === VIEW_SLICE);
     var isLoop  = (currentView === VIEW_LOOP);
     var isPsx   = (currentView === VIEW_PAULXSTRETCH);
-    var isEdit  = isFree || isSync || isSlice || isLoop || isPsx;
+    var isMixer = (currentView === VIEW_MIXER);
+    var isEdit  = isFree || isSync || isSlice || isLoop || isPsx || isMixer;
 
     /* Buttons available in all edit views */
     setButtonLED(CC_COPY,    isEdit  ? LED_DIM : LED_OFF);
@@ -1624,6 +1635,9 @@ function updateLeds() {
     /* Step 6: Skipback bar indicator — VividYellow if track has scenes, DarkGrey otherwise */
     var _hasScenes = (trackStates[activeTrack].scenes.length > 0);
     setLED(STEP_BASE + 5, isEdit ? (_hasScenes ? VividYellow : DarkGrey) : Black);
+
+    /* Step 7: Mixer view — VividYellow when active, DarkGrey otherwise */
+    setLED(STEP_BASE + 6, isMixer ? VividYellow : (isEdit ? DarkGrey : Black));
 
     /* Step 8: Apply Pitch/Tempo LED — lights up when pitch/tempo are non-default */
     var hasPitchTempo = (pitchSemitones !== 0.0 || tempoPercent !== 100);
@@ -3393,6 +3407,82 @@ function drawBeatDivPopup() {
     print(px + 2, py + 2, label, 1);
 }
 
+/* ============ Mixer View ============ */
+function drawMixerView() {
+    var BAR_TOP  = 18;
+    var BAR_BOT  = 52;
+    var BAR_H    = BAR_BOT - BAR_TOP + 1;   /* 35 px */
+    var COL_W    = 32;
+    var BAR_W    = 14;
+    var GAIN_RANGE = GAIN_MAX - GAIN_MIN;    /* 84 dB */
+    var ZERO_Y   = BAR_TOP + Math.round((GAIN_MAX / GAIN_RANGE) * BAR_H); /* y of 0dB mark */
+
+    fill_rect(0, 0, SCREEN_W, SCREEN_H, 0);
+
+    /* Header: "MIX" left, master volume right */
+    print(0, 0, "MIX", 1);
+    var _mvSign = masterVolumeDb >= 0 ? "+" : "";
+    var _mvStr = "M:" + _mvSign + masterVolumeDb.toFixed(1);
+    print(SCREEN_W - _mvStr.length * 6, 0, _mvStr, 1);
+
+    for (var _mi = 0; _mi < NUM_TRACKS; _mi++) {
+        var _cx  = _mi * COL_W;
+        var _ts  = trackStates[_mi];
+        var _g   = (_mi === activeTrack) ? gainDb : _ts.gainDb;
+        var _p   = _ts.pan || 0.0;
+        var _barX = _cx + Math.floor((COL_W - BAR_W) / 2); /* 9 */
+
+        /* Track label */
+        var _lbl = "T" + (_mi + 1);
+        print(_cx + Math.floor((COL_W - _lbl.length * 6) / 2), 10, _lbl, 1);
+
+        /* Bar outline */
+        draw_line(_barX,          BAR_TOP, _barX,          BAR_BOT, 1);
+        draw_line(_barX + BAR_W,  BAR_TOP, _barX + BAR_W,  BAR_BOT, 1);
+
+        /* 0 dB marker */
+        draw_line(_barX, ZERO_Y, _barX + BAR_W, ZERO_Y, 1);
+
+        /* Fill bar from bottom up */
+        var _gainNorm = (_g - GAIN_MIN) / GAIN_RANGE;
+        if (_gainNorm < 0) _gainNorm = 0;
+        if (_gainNorm > 1) _gainNorm = 1;
+        var _fillH = Math.round(_gainNorm * BAR_H);
+        if (_fillH > 0) {
+            fill_rect(_barX + 1, BAR_BOT - _fillH + 1, BAR_W - 1, _fillH, 1);
+        }
+
+        /* Mute: clear bar area and show "M" */
+        if (_ts.muted) {
+            fill_rect(_barX, BAR_TOP, BAR_W + 1, BAR_H + 1, 0);
+            print(_barX + 4, BAR_TOP + 12, "M", 1);
+        }
+
+        /* dB value (4 chars max) */
+        var _dbStr = (_g === 0) ? " 0.0" : ((_g > 0 ? "+" : "") + _g.toFixed(1));
+        if (_dbStr.length > 4) _dbStr = _dbStr.substring(0, 4);
+        print(_cx + Math.floor((COL_W - _dbStr.length * 6) / 2), 54, _dbStr, 1);
+
+        /* Pan indicator — horizontal line with cursor */
+        var _panY    = 61;
+        var _panHalf = Math.floor(COL_W / 2) - 1; /* 15 px */
+        draw_line(_cx, _panY, _cx + COL_W - 2, _panY, 1);
+        /* Center tick */
+        draw_line(_cx + COL_W / 2, _panY - 1, _cx + COL_W / 2, _panY + 1, 1);
+        /* Pan cursor (3px wide) */
+        var _panCX = _cx + Math.floor(COL_W / 2) + Math.round(_p * _panHalf);
+        if (_panCX < _cx)             _panCX = _cx;
+        if (_panCX > _cx + COL_W - 3) _panCX = _cx + COL_W - 3;
+        fill_rect(_panCX - 1, _panY - 2, 3, 5, 1);
+    }
+
+    /* Active status (knob hint) if no timed status */
+    if (getActiveStatus() === "") {
+        fill_rect(0, SCREEN_H - 10, SCREEN_W, 10, 0);
+        print(0, SCREEN_H - 9, "K1-4:Vol  ShK1-4:Pan  K8:Master", 1);
+    }
+}
+
 function drawSyncView() {
     /* Reuse trim view, then overlay BPM label and status bar */
     drawFreeView();
@@ -3640,6 +3730,9 @@ function switchView(view) {
         psxSendAllParams();
         updateLeds();
         announce("PSX " + PSX_EFFECT_NAMES[psxActiveEffect]);
+    } else if (view === VIEW_MIXER) {
+        updateLeds();
+        announce("Mixer");
     }
 }
 
@@ -6641,6 +6734,47 @@ function handleCC(cc, value) {
         return;
     }
 
+    /* Mixer view: E1-E4 = track volumes, Shift+E1-E4 = pan, E8 = master volume */
+    if (currentView === VIEW_MIXER) {
+        var _mxDelta = decodeDelta(value);
+        if (_mxDelta === 0) return;
+        var _mxTIdx = -1;
+        if (cc === CC_E1) _mxTIdx = 0;
+        else if (cc === CC_E2) _mxTIdx = 1;
+        else if (cc === CC_E3) _mxTIdx = 2;
+        else if (cc === CC_E4) _mxTIdx = 3;
+        if (_mxTIdx >= 0) {
+            if (shiftHeld) {
+                /* Shift+E1-E4: pan */
+                var _mxTs = trackStates[_mxTIdx];
+                _mxTs.pan = Math.max(-1.0, Math.min(1.0, (_mxTs.pan || 0.0) + _mxDelta * 0.05));
+                _mxTs.pan = Math.round(_mxTs.pan * 100) / 100;
+                host_module_set_param("t" + _mxTIdx + ":pan", _mxTs.pan.toFixed(2));
+                var _panLabel = _mxTs.pan === 0 ? "C"
+                              : (_mxTs.pan > 0 ? "R" : "L") + Math.abs(Math.round(_mxTs.pan * 100)) + "%";
+                showKnobStatus(_mxTIdx, "T" + (_mxTIdx + 1) + " Pan:" + _panLabel);
+            } else {
+                /* E1-E4: gain */
+                var _mxTs = trackStates[_mxTIdx];
+                _mxTs.gainDb = Math.max(GAIN_MIN, Math.min(GAIN_MAX, _mxTs.gainDb + _mxDelta * GAIN_STEP));
+                _mxTs.gainDb = Math.round(_mxTs.gainDb * 10) / 10;
+                if (_mxTIdx === activeTrack) gainDb = _mxTs.gainDb;
+                host_module_set_param("t" + _mxTIdx + ":gain_db", _mxTs.gainDb.toFixed(1));
+                showKnobStatus(_mxTIdx, "T" + (_mxTIdx + 1) + ":" + formatDb(_mxTs.gainDb));
+            }
+            return;
+        }
+        if (cc === CC_E8) {
+            /* E8: master volume */
+            masterVolumeDb = Math.max(-60.0, Math.min(6.0, masterVolumeDb + _mxDelta * 0.5));
+            masterVolumeDb = Math.round(masterVolumeDb * 10) / 10;
+            host_module_set_param("master_volume_db", masterVolumeDb.toFixed(1));
+            showKnobStatus(7, "Master:" + formatDb(masterVolumeDb));
+            return;
+        }
+        return; /* consume all other encoder input in mixer view */
+    }
+
     /* E1 turn: adjust start marker */
     if (cc === CC_E1) {
         var delta = decodeDelta(value);
@@ -7132,6 +7266,19 @@ function handleNote(note, velocity) {
             announce(syncEnabled ? "Sync On" : "Sync Off");
             showStatus(syncEnabled ? "Sync On" : "Sync Off", 60);
             updateLeds();
+        }
+        return;
+    }
+
+    /* Step 7: Toggle Mixer view */
+    if (velocity > 0 && note === STEP_BASE + 6) {
+        var _mixerEditViews = [VIEW_FREE, VIEW_SYNC, VIEW_SLICE, VIEW_LOOP, VIEW_PAULXSTRETCH, VIEW_MIXER];
+        if (_mixerEditViews.indexOf(currentView) >= 0) {
+            if (currentView === VIEW_MIXER) {
+                switchView(editMode);
+            } else {
+                switchView(VIEW_MIXER);
+            }
         }
         return;
     }
@@ -8212,6 +8359,9 @@ globalThis.tick = function() {
             break;
         case VIEW_PAULXSTRETCH:
             drawPaulXStretch();
+            break;
+        case VIEW_MIXER:
+            drawMixerView();
             break;
     }
 };
