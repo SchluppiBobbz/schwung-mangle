@@ -172,7 +172,8 @@ var SCENE_FIELDS = [
     "zoomLevel", "zoomCenter", "vScale",
     "psxEnabled", "psxEffectEnabled", "psxStretch", "psxFftSize",
     "psxFreqShiftHz", "psxSpreadBw", "psxRatioLevels", "psxRatioValues",
-    "psxBinauralPower", "psxBinauralMode", "psxBinauralFreq"
+    "psxBinauralPower", "psxBinauralMode", "psxBinauralFreq",
+    "psxFilterLow", "psxFilterHigh", "psxCompressPower"
 ];
 var SCENE_ARRAY_FIELDS = { sliceBoundaries: true, slicePitches: true, sliceTempos: true, psxEffectEnabled: true, psxRatioLevels: true, psxRatioValues: true };
 
@@ -7380,8 +7381,8 @@ function handleNote(note, velocity) {
             syncMarkersToDs();
             refreshWaveform();
             showStatus("Start \u2192 " + formatTime(startSample), 60);
+            return;
         }
-        return;
     }
 
     /* Step 15: set end marker at playback position */
@@ -7393,8 +7394,8 @@ function handleNote(note, velocity) {
             syncMarkersToDs();
             refreshWaveform();
             showStatus("End \u2192 " + formatTime(endSample), 60);
+            return;
         }
-        return;
     }
 
     /* Step 16: Reset Scene / Shuffle Slices */
