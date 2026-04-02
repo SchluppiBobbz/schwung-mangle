@@ -951,8 +951,8 @@ function switchToTrack(idx) {
         setParamBlocking("gain_db",   gainDb.toFixed(1), 500);
         setParamBlocking("pitch",     pitchSemitones.toFixed(2), 500);
         if (syncMode) {
-            var _stEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
-            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample + _stEl, 500);
+            var _stEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
+            setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(6) + "," + startSample + "," + endSample + _stEl, 500);
         } else {
             setParamBlocking("tempo", String(tempoPercent), 500);
         }
@@ -1290,12 +1290,12 @@ function updateSyncTempoAllTracks() {
          * been saved yet (saveCurrentSceneState only runs on transport stop). */
         if (_bi === activeTrack) {
             if (bpm > 0 && syncMode) {
-                var _tpFull = Math.round(globalBpm / bpm * 100 * 10) / 10;
+                var _tpFull = globalBpm / bpm * 100;
                 if (_tpFull < 30) _tpFull = 30;
                 if (_tpFull > 300) _tpFull = 300;
-                var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+                var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
                 var _seA = endSample > 0 ? endSample : _bts.totalFrames;
-                host_module_set_param_blocking("t" + activeTrack + ":sync_tempo", _tpFull.toFixed(1) + "," + startSample + "," + _seA + _scElA);
+                host_module_set_param_blocking("t" + activeTrack + ":sync_tempo", _tpFull.toFixed(6) + "," + startSample + "," + _seA + _scElA);
                 tempoPercent = _tpFull;
             }
             continue;
@@ -1303,13 +1303,13 @@ function updateSyncTempoAllTracks() {
         var _bsc = (_bts.playingSceneIdx >= 0 && _bts.playingSceneIdx < _bts.scenes.length)
             ? _bts.scenes[_bts.playingSceneIdx] : null;
         if (_bsc && _bsc.syncMode && _bsc.bpm > 0) {
-            var _tpFull = Math.round(globalBpm / _bsc.bpm * 100 * 10) / 10;
+            var _tpFull = globalBpm / _bsc.bpm * 100;
             if (_tpFull < 30) _tpFull = 30;
             if (_tpFull > 300) _tpFull = 300;
             var _ss = _bsc.startSample || 0;
             var _se = (_bsc.endSample > 0) ? _bsc.endSample : _bts.totalFrames;
-            var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(3) : "";
-            host_module_set_param_blocking("t" + _bi + ":sync_tempo", _tpFull.toFixed(1) + "," + _ss + "," + _se + _scEl);
+            var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(6) : "";
+            host_module_set_param_blocking("t" + _bi + ":sync_tempo", _tpFull.toFixed(6) + "," + _ss + "," + _se + _scEl);
         }
     }
 }
@@ -1452,8 +1452,8 @@ function loadProjectJson() {
                 setParamBlocking(_ltp + "gain_db",   ts.gainDb.toFixed(1), 500);
                 setParamBlocking(_ltp + "pitch",     ts.pitchSemitones.toFixed(2), 500);
                 if (ts.syncMode) {
-                    var _ltEl = (_ltScene.exactLen > 0) ? "," + _ltScene.exactLen.toFixed(3) : "";
-                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(1) + "," + ts.startSample + "," + ts.endSample + _ltEl, 500);
+                    var _ltEl = (_ltScene.exactLen > 0) ? "," + _ltScene.exactLen.toFixed(6) : "";
+                    setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(6) + "," + ts.startSample + "," + ts.endSample + _ltEl, 500);
                 } else {
                     setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
                 }
@@ -2150,8 +2150,8 @@ function syncMarkersToDs() {
  * Logical markers in JS are never modified.
  */
 function syncSyncModeToDs() {
-    var _tp = (globalBpm / bpm * 100).toFixed(1);
-    var _el = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
+    var _tp = (globalBpm / bpm * 100).toFixed(6);
+    var _el = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
     /* Non-blocking: sync_tempo is handled atomically in DSP, no need to
      * wait for confirmation. Blocking caused audio glitches during rapid
      * knob turns because it stalls the UI thread waiting for DSP ack. */
@@ -3909,8 +3909,8 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            var _aplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(3) : "";
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample + _aplEl, 500);
+            var _aplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(6) : "";
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(6) + "," + scene.startSample + "," + scene.endSample + _aplEl, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -4254,8 +4254,8 @@ function pasteTrack(trackIdx) {
         setParamBlocking(_tp + "gain_db",   scene.gainDb.toFixed(1), 500);
         setParamBlocking(_tp + "pitch",     scene.pitchSemitones.toFixed(2), 500);
         if (scene.syncMode) {
-            var _cplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(3) : "";
-            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(1) + "," + scene.startSample + "," + scene.endSample + _cplEl, 500);
+            var _cplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(6) : "";
+            setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(6) + "," + scene.startSample + "," + scene.endSample + _cplEl, 500);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
         }
@@ -8031,17 +8031,29 @@ globalThis.tick = function() {
                     lastBarCount = 0;
                 }
             }
-            /* Bar/beat-crossing detection: time-based using Date.now() + globalBpm */
+            /* Bar-crossing detection: use DSP bar counter when sync is active for
+             * sample-accurate timing; beat detection stays time-based (16ms jitter
+             * at beat level is acceptable). */
             if (transportPlaying) {
-                var _beatDurationMs = 60000 / globalBpm;     /* one 1/4-note beat in ms */
-                var _barDurationMs  = 4 * _beatDurationMs;   /* one 4/4 bar in ms */
-                var _elapsed = Date.now() - transportPlayingTimestamp;
-                var _curBar  = (_barDurationMs  > 0) ? Math.floor(_elapsed / _barDurationMs)  : 0;
-                var _curBeat = (_beatDurationMs > 0) ? Math.floor(_elapsed / _beatDurationMs) : 0;
-                if (_curBar > lastBarCount) {
-                    _barCrossed = true;
-                    lastBarCount = _curBar;
+                if (syncEnabled) {
+                    var _bcStr = host_module_get_param("bar_count");
+                    var _curBar = parseInt(_bcStr) || 0;
+                    if (_curBar > lastBarCount) {
+                        _barCrossed = true;
+                        lastBarCount = _curBar;
+                    }
+                } else {
+                    /* Fallback: time-based bar detection when sync_clock is off */
+                    var _barDurationMs = (60000 / globalBpm) * 4;
+                    var _elapsed = Date.now() - transportPlayingTimestamp;
+                    var _curBar = (_barDurationMs > 0) ? Math.floor(_elapsed / _barDurationMs) : 0;
+                    if (_curBar > lastBarCount) {
+                        _barCrossed = true;
+                        lastBarCount = _curBar;
+                    }
                 }
+                var _beatDurationMs = 60000 / globalBpm;
+                var _curBeat = (_beatDurationMs > 0) ? Math.floor((Date.now() - transportPlayingTimestamp) / _beatDurationMs) : 0;
                 if (_curBeat > lastBeatCount) {
                     lastBeatCount = _curBeat;
                 }
@@ -8159,15 +8171,13 @@ globalThis.tick = function() {
     if (pendingSceneSwitch >= 0) {
         var _fire = !transportPlaying; /* always fire if transport stopped */
         if (!_fire) {
-            var _elapsed2 = Date.now() - transportPlayingTimestamp;
-            var _beatMs   = 60000 / globalBpm;
-            var _curBeat2 = (_beatMs > 0) ? Math.floor(_elapsed2 / _beatMs) : 0;
-            var _curBar2  = Math.floor(_curBeat2 / 4);
+            var _beatMs2  = 60000 / globalBpm;
+            var _curBeat2 = (_beatMs2 > 0) ? Math.floor((Date.now() - transportPlayingTimestamp) / _beatMs2) : 0;
             switch (quantizeMode) {
                 case QUANT_BEAT:       _fire = (_curBeat2 > lastBeatCount); break;
                 case QUANT_BAR:        _fire = _barCrossed; break;
-                case QUANT_2BAR:       _fire = _barCrossed && (_curBar2 % 2 === 0); break;
-                case QUANT_4BAR:       _fire = _barCrossed && (_curBar2 % 4 === 0); break;
+                case QUANT_2BAR:       _fire = _barCrossed && (lastBarCount % 2 === 0); break;
+                case QUANT_4BAR:       _fire = _barCrossed && (lastBarCount % 4 === 0); break;
                 case QUANT_SAMPLE_END: _fire = !trackStates[pendingSceneSwitchTrack].playing; break;
                 default:               _fire = _barCrossed; break;
             }
@@ -8257,8 +8267,8 @@ globalThis.tick = function() {
                 if (_psr.tempoPercent !== undefined) {
                     tempoPercent = _psr.tempoPercent;
                     if (syncMode) {
-                        var _psrEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(3) : "";
-                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(1) + "," + startSample + "," + endSample + _psrEl, 500);
+                        var _psrEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
+                        setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(6) + "," + startSample + "," + endSample + _psrEl, 500);
                     } else {
                         setParamBlocking("tempo", String(tempoPercent), 500);
                     }
