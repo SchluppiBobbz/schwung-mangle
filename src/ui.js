@@ -49,6 +49,7 @@ import {
     MovePads,
     MoveStep1,
     MoveKnob1, MoveKnob2, MoveKnob3, MoveKnob4, MoveKnob5, MoveKnob6, MoveKnob7, MoveKnob8,
+    MoveKnob1Touch, MoveKnob2Touch, MoveKnob3Touch, MoveKnob4Touch,
     MoveKnob5Touch, MoveKnob6Touch, MoveKnob7Touch, MoveKnob8Touch,
     White, Black, DarkGrey, BrightRed, DeepRed, OrangeRed, BrightGreen, VividYellow, Blue,
     WhiteLedOff, WhiteLedDim, WhiteLedMedium, WhiteLedBright,
