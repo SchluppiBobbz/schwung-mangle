@@ -954,8 +954,10 @@ function switchToTrack(idx) {
         if (syncMode) {
             var _stEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
             setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(6) + "," + startSample + "," + endSample + _stEl, 500);
+            sendCueLength("", true, bpm);
         } else {
             setParamBlocking("tempo", String(tempoPercent), 500);
+            setParamBlocking("cue_length", "0", 200);
         }
         setParamBlocking("play_loop", loopEnabled ? "1" : "0", 500);
     }
@@ -1282,6 +1284,25 @@ function loadScenesFromProjectJson() {
  * Returns true on success.
  */
 /**
+ * Compute cue_length in output samples for the given scene BPM and global BPM.
+ * Returns a 1-bar period at globalBpm (used for phase-aligned clip launch).
+ * Returns 0 (disabled) when bpmVal is 0 or syncMode is false.
+ */
+function computeCueLengthSamples(syncModeVal, bpmVal) {
+    if (!syncModeVal || !bpmVal || bpmVal <= 0) return 0;
+    return Math.round(sampleRate * 60 / globalBpm * 4);  /* 1 bar at globalBpm */
+}
+
+/**
+ * Send cue_length parameter to DSP for the given track prefix.
+ * Must be called immediately after sync_tempo is sent.
+ */
+function sendCueLength(trackPrefix, syncModeVal, bpmVal) {
+    var _cl = computeCueLengthSamples(syncModeVal, bpmVal);
+    setParamBlocking(trackPrefix + "cue_length", String(_cl), 200);
+}
+
+/**
  * Push sync_tempo to DSP for all SYNC-mode tracks after globalBpm changed.
  */
 function updateSyncTempoAllTracks() {
@@ -1297,6 +1318,7 @@ function updateSyncTempoAllTracks() {
                 var _scElA = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
                 var _seA = endSample > 0 ? endSample : _bts.totalFrames;
                 host_module_set_param_blocking("t" + activeTrack + ":sync_tempo", _tpFull.toFixed(6) + "," + startSample + "," + _seA + _scElA);
+                sendCueLength("t" + activeTrack + ":", true, bpm);
                 tempoPercent = _tpFull;
             }
             continue;
@@ -1311,6 +1333,7 @@ function updateSyncTempoAllTracks() {
             var _se = (_bsc.endSample > 0) ? _bsc.endSample : _bts.totalFrames;
             var _scEl = (_bsc.exactLen > 0) ? "," + _bsc.exactLen.toFixed(6) : "";
             host_module_set_param_blocking("t" + _bi + ":sync_tempo", _tpFull.toFixed(6) + "," + _ss + "," + _se + _scEl);
+            sendCueLength("t" + _bi + ":", true, _bsc.bpm);
         }
     }
 }
@@ -1455,8 +1478,10 @@ function loadProjectJson() {
                 if (ts.syncMode) {
                     var _ltEl = (_ltScene.exactLen > 0) ? "," + _ltScene.exactLen.toFixed(6) : "";
                     setParamBlocking(_ltp + "sync_tempo", (globalBpm / ts.bpm * 100).toFixed(6) + "," + ts.startSample + "," + ts.endSample + _ltEl, 500);
+                    sendCueLength(_ltp, true, ts.bpm);
                 } else {
                     setParamBlocking(_ltp + "tempo",  String(ts.tempoPercent), 500);
+                    setParamBlocking(_ltp + "cue_length", "0", 200);
                 }
                 setParamBlocking(_ltp + "play_loop", ts.loopEnabled ? "1" : "0", 500);
                 setParamBlocking(_ltp + "markers",   ts.startSample + "," + ts.endSample, 500);
@@ -3912,8 +3937,10 @@ function applySceneLaunch(trackIdx, sceneIdx, autoPlay, immediate) {
         if (scene.syncMode) {
             var _aplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(6) : "";
             setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(6) + "," + scene.startSample + "," + scene.endSample + _aplEl, 500);
+            sendCueLength(_tp, true, scene.bpm);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+            setParamBlocking(_tp + "cue_length", "0", 200);
         }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "gate_mode", String((scene.gateMode !== undefined) ? scene.gateMode : PAD_MODE_TRIGGER), 500);
@@ -4257,8 +4284,10 @@ function pasteTrack(trackIdx) {
         if (scene.syncMode) {
             var _cplEl = (scene.exactLen > 0) ? "," + scene.exactLen.toFixed(6) : "";
             setParamBlocking(_tp + "sync_tempo", (globalBpm / scene.bpm * 100).toFixed(6) + "," + scene.startSample + "," + scene.endSample + _cplEl, 500);
+            sendCueLength(_tp, true, scene.bpm);
         } else {
             setParamBlocking(_tp + "tempo", String(scene.tempoPercent), 500);
+            setParamBlocking(_tp + "cue_length", "0", 200);
         }
         setParamBlocking(_tp + "play_loop", scene.loopEnabled ? "1" : "0", 500);
         setParamBlocking(_tp + "markers",   scene.startSample + "," + scene.endSample, 500);
@@ -8270,8 +8299,10 @@ globalThis.tick = function() {
                     if (syncMode) {
                         var _psrEl = exactLoopLen > 0 ? "," + exactLoopLen.toFixed(6) : "";
                         setParamBlocking("sync_tempo", (globalBpm / bpm * 100).toFixed(6) + "," + startSample + "," + endSample + _psrEl, 500);
+                        sendCueLength("", true, bpm);
                     } else {
                         setParamBlocking("tempo", String(tempoPercent), 500);
+                        setParamBlocking("cue_length", "0", 200);
                     }
                 }
                 if (_psr.loopEnabled !== undefined) {

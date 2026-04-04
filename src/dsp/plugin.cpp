@@ -96,6 +96,7 @@ typedef struct plugin_api_v2 {
  * Must hold several Bungee output grains. 8192 frames ≈ 0.19s at 44.1kHz. */
 #define BNG_OUT_BUF_CAPACITY 8192
 #define BNG_LOOP_FADE_SAMPLES 128  /* crossfade length at loop boundaries (~3 ms @ 44100 Hz) */
+#define FADE_SAMPLES 32            /* fade-in/out on play/stop transitions (~0.7 ms @ 48 kHz) */
 
 /* ============================================================================
  * Track structure — per-track audio state
@@ -149,6 +150,9 @@ typedef struct {
     int start_offset;           /* silence frames at block start after bar-triggered launch */
     int muted;                  /* 1=track muted (non-destructive, skips render) */
     int play_mode;              /* 0=stretch (Bungee), 1=varispeed (repitch) */
+    int fade_in_remaining;      /* countdown for fade-in on play start (FADE_SAMPLES → 0) */
+    int fade_out_remaining;     /* countdown for fade-out on stop (FADE_SAMPLES → 0) */
+    int cue_length_samples;     /* transport phase alignment period in output samples; 0 = disabled */
 
     float pitch_semitones;      /* -12.0 to +12.0 (fractional = cents) */
     int   tempo_percent;        /* 50 to 200 */
@@ -229,6 +233,17 @@ typedef struct {
         int    needs_reinit;      /* flag: rebuild stretchers on next render */
         int    fill_needed;       /* 1 = initial fill required after reinit */
 
+        /* Double-buffer: param thread allocates into pending_*, audio thread swaps atomically */
+        ProcessedStretch *pending_stretch_l;
+        ProcessedStretch *pending_stretch_r;
+        BinauralBeats    *pending_binaural;
+        float *pending_inbuf_l;
+        float *pending_inbuf_r;
+        int    pending_inbuf_capacity;
+        float *pending_outbuf;
+        int    pending_outbuf_capacity;
+        volatile int psx_swap_ready;  /* 1 = pending pointers ready for audio-thread swap */
+
         /* Direct audio_data reading position (bypasses render_track) */
         double read_pos;          /* fractional sample position in audio_data */
 
@@ -259,7 +274,9 @@ typedef struct {
 
     /* Internal sync — BPM-based sample counting when clock not running */
     double samples_per_bar_f;   /* bar duration in samples */
-    double samples_until_bar_f; /* countdown to next bar boundary */
+    double samples_until_bar_f; /* countdown to next bar boundary (legacy, kept for compat) */
+    uint64_t next_bar_sample;   /* render_sample_total value of next bar boundary */
+    double   bar_remainder;     /* fractional sample accumulator for sub-sample precision */
     int timing_dirty;           /* 1 = recalc_timing() needed */
     int cached_sample_rate;     /* sample rate used in last recalc_timing() */
     uint64_t bar_count_total;    /* monotonic bar counter */
@@ -1108,6 +1125,70 @@ static void ps_reinit_track(track_t *t) {
     }
 }
 
+/* Free any previously prepared pending buffers (param-thread safe). */
+static void ps_free_pending(track_t *t) {
+    if (t->psx.pending_stretch_l) { delete t->psx.pending_stretch_l; t->psx.pending_stretch_l = NULL; }
+    if (t->psx.pending_stretch_r) { delete t->psx.pending_stretch_r; t->psx.pending_stretch_r = NULL; }
+    if (t->psx.pending_binaural)  { delete t->psx.pending_binaural;  t->psx.pending_binaural = NULL; }
+    if (t->psx.pending_inbuf_l)   { free(t->psx.pending_inbuf_l);    t->psx.pending_inbuf_l = NULL; }
+    if (t->psx.pending_inbuf_r)   { free(t->psx.pending_inbuf_r);    t->psx.pending_inbuf_r = NULL; }
+    if (t->psx.pending_outbuf)    { free(t->psx.pending_outbuf);      t->psx.pending_outbuf = NULL; }
+    t->psx.pending_inbuf_capacity = 0;
+    t->psx.pending_outbuf_capacity = 0;
+}
+
+/* Allocate new stretchers into pending_* fields on the param thread.
+ * The audio thread swaps them in atomically when psx_swap_ready is set. */
+static void ps_prepare_reinit(track_t *t) {
+    /* Discard any un-consumed previous prepare */
+    ps_free_pending(t);
+
+    if (!t->psx.enabled) {
+        /* Disabled: just signal a swap to free live buffers */
+        __atomic_store_n(&t->psx.psx_swap_ready, 1, __ATOMIC_RELEASE);
+        return;
+    }
+
+    int fft_sz = t->psx.fft_size;
+    if (fft_sz < 128) fft_sz = 128;
+
+    t->psx.pending_stretch_l = new ProcessedStretch(
+        t->psx.stretch_amount, fft_sz, W_HAMMING, false, (float)MOVE_SAMPLE_RATE, 1);
+    t->psx.pending_stretch_r = new ProcessedStretch(
+        t->psx.stretch_amount, fft_sz, W_HAMMING, false, (float)MOVE_SAMPLE_RATE, 2);
+
+    t->psx.pending_stretch_l->setBufferSize(fft_sz);
+    t->psx.pending_stretch_r->setBufferSize(fft_sz);
+    t->psx.pending_stretch_l->set_rap(t->psx.stretch_amount);
+    t->psx.pending_stretch_r->set_rap(t->psx.stretch_amount);
+
+    std::vector<SpectrumProcess> chain = {
+        {SPT_FreqShift,    t->psx.freqshift_en != 0},
+        {SPT_Spread,       t->psx.spread_en != 0},
+        {SPT_RatioMix,     t->psx.ratiomix_en != 0},
+        {SPT_Filter,       false},
+        {SPT_Compressor,   false},
+    };
+    t->psx.pending_stretch_l->m_spectrum_processes = chain;
+    t->psx.pending_stretch_r->m_spectrum_processes = chain;
+    t->psx.pending_stretch_l->set_parameters(&t->psx.proc_pars);
+    t->psx.pending_stretch_r->set_parameters(&t->psx.proc_pars);
+
+    t->psx.pending_binaural = new BinauralBeats(MOVE_SAMPLE_RATE);
+
+    int max_buf = t->psx.pending_stretch_l->get_max_bufsize();
+    t->psx.pending_inbuf_capacity = max_buf;
+    t->psx.pending_inbuf_l = (float *)calloc(max_buf, sizeof(float));
+    t->psx.pending_inbuf_r = (float *)calloc(max_buf, sizeof(float));
+
+    int out_cap = fft_sz * PSX_OUTBUF_MULT;
+    if (out_cap < 4096) out_cap = 4096;
+    t->psx.pending_outbuf_capacity = out_cap;
+    t->psx.pending_outbuf = (float *)calloc(out_cap * 2, sizeof(float));
+
+    __atomic_store_n(&t->psx.psx_swap_ready, 1, __ATOMIC_RELEASE);
+}
+
 static void ps_update_chain_enables(track_t *t) {
     if (!t->psx.stretch_l || !t->psx.stretch_r) return;
     auto update = [&](std::vector<SpectrumProcess>& chain) {
@@ -1154,7 +1235,7 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         int new_en = atoi(val) ? 1 : 0;
         if (new_en != t->psx.enabled) {
             t->psx.enabled = new_en;
-            t->psx.needs_reinit = 1;
+            ps_prepare_reinit(t);
             /* Sync PSX read position from current playback position */
             if (new_en) {
                 t->psx.read_pos = t->play_pos_frac;
@@ -1181,7 +1262,7 @@ static void ps_handle_param(track_t *t, const char *param, const char *val) {
         int new_sz = psx_fft_size_from_norm(v);
         if (new_sz != t->psx.fft_size) {
             t->psx.fft_size = new_sz;
-            if (t->psx.enabled) t->psx.needs_reinit = 1;
+            if (t->psx.enabled) ps_prepare_reinit(t);
         }
         return;
     }
@@ -1628,6 +1709,11 @@ static void recalc_timing(instance_t *inst, int sample_rate) {
     /* Clamp countdown so it never exceeds one bar */
     if (inst->samples_until_bar_f <= 0.0 || inst->samples_until_bar_f > inst->samples_per_bar_f)
         inst->samples_until_bar_f = inst->samples_per_bar_f;
+    /* Recompute integer next_bar_sample from current position */
+    if (inst->next_bar_sample <= inst->render_sample_total) {
+        inst->next_bar_sample = inst->render_sample_total + (uint64_t)inst->samples_per_bar_f;
+        inst->bar_remainder = inst->samples_per_bar_f - (double)(uint64_t)inst->samples_per_bar_f;
+    }
     inst->cached_sample_rate = sample_rate;
     inst->timing_dirty = 0;
 }
@@ -1638,8 +1724,12 @@ static void handle_transport_stop(instance_t *inst) {
     int i;
     if (!inst) return;
     for (i = 0; i < NUM_TRACKS; i++) {
-        inst->tracks[i].playing = 0;
-        inst->tracks[i].queued_play = 0;
+        track_t *_t = &inst->tracks[i];
+        if (_t->playing && _t->fade_out_remaining <= 0)
+            _t->fade_out_remaining = FADE_SAMPLES;
+        else
+            _t->playing = 0;
+        _t->queued_play = 0;
     }
 }
 
@@ -1679,6 +1769,8 @@ static void* v2_create(const char *module_dir, const char *json_defaults) {
     inst->delayed_bar_triggers = 0;
     inst->samples_per_bar_f = 0.0;
     inst->samples_until_bar_f = 0.0;
+    inst->next_bar_sample = 0;
+    inst->bar_remainder = 0.0;
     inst->timing_dirty = 1;
     inst->cached_sample_rate = 0;
     recalc_clock_timing(inst);
@@ -1769,6 +1861,10 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len,
                 recalc_timing(inst, inst->cached_sample_rate);
             inst->samples_until_bar_f = inst->samples_per_bar_f > 0.0
                                         ? inst->samples_per_bar_f : 1.0;
+            inst->next_bar_sample = inst->render_sample_total
+                + (uint64_t)(inst->samples_per_bar_f > 0.0 ? inst->samples_per_bar_f : 1.0);
+            inst->bar_remainder = inst->samples_per_bar_f
+                - (double)(uint64_t)inst->samples_per_bar_f;
             return;
         }
         if (status == 0xFC) {
@@ -1851,7 +1947,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                         t->bng_play_start = t->start_sample;
                         t->bng_play_end = t->end_sample;
                         bng_reset_stretcher(t, (double)t->start_sample);
-                        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
+                        if (t->psx.enabled) { ps_prepare_reinit(t); }
                     }
                 }
             } else {
@@ -2212,7 +2308,10 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         if (!t->audio_data || t->audio_frames <= 0) return;
 
         if (val && strcmp(val, "stop") == 0) {
-            t->playing = 0;
+            if (t->playing && t->fade_out_remaining <= 0)
+                t->fade_out_remaining = FADE_SAMPLES;
+            else
+                t->playing = 0;
             t->queued_play = 0;
             return;
         }
@@ -2231,6 +2330,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->queued_play = 0;
         t->play_whole = whole;
         t->playing = 1;
+        t->fade_in_remaining = FADE_SAMPLES;
+        t->fade_out_remaining = 0;
         t->bng_expected_out_total = 0.0;
         t->bng_actual_out_total   = 0.0;
         t->bng_loop_count         = 0;
@@ -2261,14 +2362,27 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 t->psx.read_pos = restart_pos;
                 bng_reset_stretcher(t, restart_pos);
             } else {
-                t->play_pos = t->start_sample;
-                t->play_pos_frac = (double)t->start_sample;
-                t->psx.read_pos = (double)t->start_sample;
-                bng_reset_stretcher(t, (double)t->start_sample);
+                double _start_pos = (double)t->start_sample;
+                /* Phase-align fresh launch to transport if cue_length is set */
+                if (t->cue_length_samples > 0) {
+                    uint64_t _phase_off = inst->render_sample_total % (uint64_t)t->cue_length_samples;
+                    int _play_end_l = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+                    double _region = (double)(_play_end_l - t->start_sample);
+                    if (_region > 0.0) {
+                        double _ri = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+                        if (t->play_mode == 1) _ri *= t->tempo_ratio * t->pitch_ratio;
+                        _start_pos = (double)t->start_sample
+                                   + fmod((double)_phase_off * _ri, _region);
+                    }
+                }
+                t->play_pos = (int)_start_pos;
+                t->play_pos_frac = _start_pos;
+                t->psx.read_pos = _start_pos;
+                bng_reset_stretcher(t, _start_pos);
                 t->play_start_render_total = inst->render_sample_total;
             }
         }
-        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
+        if (t->psx.enabled) { ps_prepare_reinit(t); }
         {
             char dbg[256];
             snprintf(dbg, sizeof(dbg), "PLAY t%d: whole=%d start=%d end=%d pos=%d total=%d",
@@ -2285,7 +2399,10 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "play_now") == 0) {
         if (!t->audio_data || t->audio_frames <= 0) return;
         if (val && strcmp(val, "stop") == 0) {
-            t->playing = 0;
+            if (t->playing && t->fade_out_remaining <= 0)
+                t->fade_out_remaining = FADE_SAMPLES;
+            else
+                t->playing = 0;
             t->queued_play = 0;
             return;
         }
@@ -2294,6 +2411,8 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->queued_play = 0;
         t->play_whole = whole;
         t->playing = 1;
+        t->fade_in_remaining = FADE_SAMPLES;
+        t->fade_out_remaining = 0;
         t->bng_expected_out_total = 0.0;
         t->bng_actual_out_total   = 0.0;
         t->bng_loop_count         = 0;
@@ -2323,14 +2442,27 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 t->psx.read_pos = restart_pos;
                 bng_reset_stretcher(t, restart_pos);
             } else {
-                t->play_pos = t->start_sample;
-                t->play_pos_frac = (double)t->start_sample;
-                t->psx.read_pos = (double)t->start_sample;
-                bng_reset_stretcher(t, (double)t->start_sample);
+                double _start_pos_n = (double)t->start_sample;
+                /* Phase-align fresh launch to transport if cue_length is set */
+                if (t->cue_length_samples > 0) {
+                    uint64_t _phase_off_n = inst->render_sample_total % (uint64_t)t->cue_length_samples;
+                    int _play_end_n = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+                    double _region_n = (double)(_play_end_n - t->start_sample);
+                    if (_region_n > 0.0) {
+                        double _ri_n = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+                        if (t->play_mode == 1) _ri_n *= t->tempo_ratio * t->pitch_ratio;
+                        _start_pos_n = (double)t->start_sample
+                                     + fmod((double)_phase_off_n * _ri_n, _region_n);
+                    }
+                }
+                t->play_pos = (int)_start_pos_n;
+                t->play_pos_frac = _start_pos_n;
+                t->psx.read_pos = _start_pos_n;
+                bng_reset_stretcher(t, _start_pos_n);
                 t->play_start_render_total = inst->render_sample_total;
             }
         }
-        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
+        if (t->psx.enabled) { ps_prepare_reinit(t); }
         return;
     }
 
@@ -2352,12 +2484,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
         t->bng_out_count = 0;
         bng_reset_stretcher(t, (double)pos);
-        if (t->psx.enabled) { t->psx.needs_reinit = 1; }
+        if (t->psx.enabled) { ps_prepare_reinit(t); }
         return;
     }
 
     if (strcmp(param, "stop") == 0) {
-        t->playing = 0;
+        if (t->playing && t->fade_out_remaining <= 0)
+            t->fade_out_remaining = FADE_SAMPLES;
+        else
+            t->playing = 0;
         return;
     }
 
@@ -2370,6 +2505,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     if (strcmp(param, "play_whole") == 0) {
         if (!val) return;
         t->play_whole = atoi(val) ? 1 : 0;
+        return;
+    }
+
+    /* Phase alignment period: output samples per cue cycle (0 = disabled) */
+    if (strcmp(param, "cue_length") == 0) {
+        t->cue_length_samples = val ? atoi(val) : 0;
+        if (t->cue_length_samples < 0) t->cue_length_samples = 0;
         return;
     }
 
@@ -2654,7 +2796,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             t->play_pos = (int)new_pos;
             t->psx.read_pos = new_pos;
             t->playing = 1;
-            if (t->psx.enabled) { t->psx.needs_reinit = 1; }
+            if (t->psx.enabled) { ps_prepare_reinit(t); }
         }
 
         /* Recompute */
@@ -3965,13 +4107,32 @@ static void do_apply_pitch_tempo(track_t *t) {
  * Render one track into a temporary buffer.
  * Returns 1 if audio was produced, 0 if silent.
  */
-static int render_track(track_t *t, int16_t *out, int frames) {
+static int render_track(instance_t *inst, track_t *t, int16_t *out, int frames) {
     if (!t->playing || !t->audio_data || t->audio_frames <= 0) return 0;
-    if (t->gate_mode == 1 && !t->gate_held) return 0;  /* gate: only play while held */
+    if (t->gate_mode == 1 && !t->gate_held && t->fade_out_remaining <= 0) return 0;  /* gate: only play while held */
 
     /* PaulXStretch: bypass normal playback — PSX reads directly from audio_data
      * at its own pace, controlled by the spectral stretcher's state machine. */
     if (t->psx.enabled) {
+        /* Swap in pending buffers prepared off the audio thread */
+        if (__atomic_load_n(&t->psx.psx_swap_ready, __ATOMIC_ACQUIRE)) {
+            ps_free_buffers(t);
+            t->psx.stretch_l         = t->psx.pending_stretch_l;   t->psx.pending_stretch_l = NULL;
+            t->psx.stretch_r         = t->psx.pending_stretch_r;   t->psx.pending_stretch_r = NULL;
+            t->psx.binaural          = t->psx.pending_binaural;     t->psx.pending_binaural  = NULL;
+            t->psx.inbuf_l           = t->psx.pending_inbuf_l;     t->psx.pending_inbuf_l   = NULL;
+            t->psx.inbuf_r           = t->psx.pending_inbuf_r;     t->psx.pending_inbuf_r   = NULL;
+            t->psx.inbuf_capacity    = t->psx.pending_inbuf_capacity;
+            t->psx.outbuf            = t->psx.pending_outbuf;      t->psx.pending_outbuf    = NULL;
+            t->psx.outbuf_capacity   = t->psx.pending_outbuf_capacity;
+            t->psx.inbuf_count       = 0;
+            t->psx.outbuf_count      = 0;
+            t->psx.outbuf_read       = 0;
+            t->psx.outbuf_write      = 0;
+            t->psx.fill_needed       = 1;
+            t->psx.needs_reinit      = 0;
+            __atomic_store_n(&t->psx.psx_swap_ready, 0, __ATOMIC_RELEASE);
+        }
         /* Lazy reinit must happen here, before the NULL-pointer guard,
          * so stretchers get allocated on the first render after enable. */
         if (t->psx.needs_reinit) {
@@ -4048,6 +4209,24 @@ normal_playback:
 
     if (!use_bungee) {
         /* Direct playback path (no pitch/tempo change) */
+
+        /* Re-derive position from transport every block to prevent long-term drift.
+         * Only applies in looping mode — non-looping clips play through freely.
+         * Threshold of 1.0 sample avoids spurious corrections near the loop wrap. */
+        if (t->play_loop && t->play_start_render_total > 0 && rate_inc > 0.0) {
+            uint64_t elapsed = inst->render_sample_total - t->play_start_render_total;
+            double region = loop_end - (double)play_start;
+            if (region > 0.0) {
+                double expected = (double)play_start
+                    + fmod((double)elapsed * rate_inc, region);
+                double drift = t->play_pos_frac - expected;
+                if ((drift > 1.0 && drift < region - 1.0) ||
+                    (drift < -1.0 && drift > -(region - 1.0))) {
+                    t->play_pos_frac = expected;
+                }
+            }
+        }
+
         /* Output silence for frames before bar-triggered start offset */
         int loop_start = 0;
         if (t->start_offset > 0) {
@@ -4100,6 +4279,28 @@ normal_playback:
                 sample_l *= linear_gain;
                 sample_r *= linear_gain;
             }
+
+            /* Fade-in ramp */
+            if (t->fade_in_remaining > 0) {
+                float _ramp = 1.0f - (float)t->fade_in_remaining / (float)FADE_SAMPLES;
+                sample_l *= _ramp;
+                sample_r *= _ramp;
+                t->fade_in_remaining--;
+            }
+            /* Fade-out ramp */
+            if (t->fade_out_remaining > 0) {
+                float _ramp = (float)t->fade_out_remaining / (float)FADE_SAMPLES;
+                sample_l *= _ramp;
+                sample_r *= _ramp;
+                t->fade_out_remaining--;
+                if (t->fade_out_remaining <= 0) {
+                    t->playing = 0;
+                    out[i * 2]     = 0;
+                    out[i * 2 + 1] = 0;
+                    break;
+                }
+            }
+
             if (sample_l > 32767.0f) sample_l = 32767.0f;
             if (sample_l < -32768.0f) sample_l = -32768.0f;
             if (sample_r > 32767.0f) sample_r = 32767.0f;
@@ -4188,6 +4389,29 @@ normal_playback:
                 L *= linear_gain;
                 R *= linear_gain;
             }
+
+            /* Fade-in ramp */
+            if (t->fade_in_remaining > 0) {
+                float _ramp = 1.0f - (float)t->fade_in_remaining / (float)FADE_SAMPLES;
+                L *= _ramp;
+                R *= _ramp;
+                t->fade_in_remaining--;
+            }
+            /* Fade-out ramp */
+            if (t->fade_out_remaining > 0) {
+                float _ramp = (float)t->fade_out_remaining / (float)FADE_SAMPLES;
+                L *= _ramp;
+                R *= _ramp;
+                t->fade_out_remaining--;
+                if (t->fade_out_remaining <= 0) {
+                    t->playing = 0;
+                    out[i * 2 + 0] = 0;
+                    out[i * 2 + 1] = 0;
+                    avail = i + 1; /* stop draining */
+                    break;
+                }
+            }
+
             if (L > 32767.0f) L = 32767.0f;
             if (L < -32768.0f) L = -32768.0f;
             if (R > 32767.0f) R = 32767.0f;
@@ -4237,6 +4461,9 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
     if (!instance || !out_interleaved_lr) return;
     instance_t *inst = (instance_t *)instance;
 
+    /* Clamp frames to buffer size to prevent stack overflow on tmp[] */
+    if (frames > MOVE_FRAMES_PER_BLOCK) frames = MOVE_FRAMES_PER_BLOCK;
+
     /* Advance monotonic sample counter */
     inst->render_sample_total += (uint64_t)frames;
 
@@ -4260,24 +4487,30 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
             bar_triggers = inst->pending_bar_triggers;
             inst->pending_bar_triggers = 0;
         } else {
-            /* Internal BPM fallback — count samples, fire on bar boundary */
+            /* Internal BPM fallback — integer next_bar_sample avoids float drift */
             if (inst->timing_dirty || inst->cached_sample_rate != sr)
                 recalc_timing(inst, sr);
-            if (inst->samples_per_bar_f > 0.0) {
-                double countdown_before = inst->samples_until_bar_f;
-                inst->samples_until_bar_f -= (double)frames;
-                if (inst->samples_until_bar_f <= 0.0) {
-                    bar_triggers = 1;
-                    bar_offset = (int)countdown_before;
-                    if (bar_offset < 0) bar_offset = 0;
-                    if (bar_offset >= frames) bar_offset = 0;
-                    inst->samples_until_bar_f += inst->samples_per_bar_f;
-                    while (inst->samples_until_bar_f <= 0.0) {
-                        bar_triggers++;
-                        inst->samples_until_bar_f += inst->samples_per_bar_f;
+            if (inst->samples_per_bar_f > 0.0 && inst->next_bar_sample > 0) {
+                uint64_t block_start = inst->render_sample_total - (uint64_t)frames;
+                while (inst->next_bar_sample >= block_start
+                       && inst->next_bar_sample < inst->render_sample_total) {
+                    if (bar_triggers == 0) {
+                        bar_offset = (int)(inst->next_bar_sample - block_start);
+                        if (bar_offset < 0) bar_offset = 0;
+                        if (bar_offset >= frames) bar_offset = 0;
                     }
-                    if (inst->samples_until_bar_f < 1.0) inst->samples_until_bar_f = 1.0;
+                    bar_triggers++;
+                    /* Advance by one bar, preserving fractional accuracy */
+                    uint64_t bar_int = (uint64_t)inst->samples_per_bar_f;
+                    inst->bar_remainder += inst->samples_per_bar_f - (double)bar_int;
+                    uint64_t carry = (uint64_t)inst->bar_remainder;
+                    inst->bar_remainder -= (double)carry;
+                    inst->next_bar_sample += bar_int + carry;
                 }
+                /* Keep legacy countdown in sync for any code that reads it */
+                if (inst->next_bar_sample >= inst->render_sample_total)
+                    inst->samples_until_bar_f = (double)(inst->next_bar_sample
+                                                          - inst->render_sample_total);
             }
         }
         inst->last_bar_offset = bar_offset;
@@ -4295,6 +4528,8 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
                 t->queued_play = 0;
                 t->play_whole = t->queued_whole;
                 t->playing = 1;
+                t->fade_in_remaining = FADE_SAMPLES;
+                t->fade_out_remaining = 0;
                 t->bng_expected_out_total = 0.0;
                 t->bng_actual_out_total   = 0.0;
                 t->bng_loop_count         = 0;
@@ -4310,6 +4545,24 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
                     t->psx.read_pos = (double)t->start_sample;
                     t->bng_play_start = t->start_sample;
                     t->bng_play_end = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+
+                    /* Phase-align to transport: start at offset = transport % cue_length */
+                    if (t->cue_length_samples > 0) {
+                        uint64_t phase_off = inst->render_sample_total % (uint64_t)t->cue_length_samples;
+                        int play_end_local = (t->sync_play_end > 0) ? t->sync_play_end : t->end_sample;
+                        double region = (double)(play_end_local - t->start_sample);
+                        if (region > 0.0) {
+                            double rate_inc_loc = (double)t->sample_rate / (double)MOVE_SAMPLE_RATE;
+                            if (t->play_mode == 1) {
+                                rate_inc_loc *= t->tempo_ratio * t->pitch_ratio;
+                            }
+                            double pos = (double)t->start_sample
+                                       + fmod((double)phase_off * rate_inc_loc, region);
+                            t->play_pos_frac = pos;
+                            t->play_pos = (int)pos;
+                            t->psx.read_pos = pos;
+                        }
+                    }
                 }
                 t->bng_out_count = 0;
                 /* Sub-block accuracy: pre-fill output with silence up to bar boundary */
@@ -4333,7 +4586,7 @@ static void v2_render_block(void *instance, int16_t *out_interleaved_lr,
         track_t *t = &inst->tracks[ti];
 
         /* Always render to tmp (silence if not playing) so ring buffer stays in sync */
-        int produced = render_track(t, tmp, frames);
+        int produced = render_track(inst, t, tmp, frames);
         if (produced) any_audio = 1;
 
         /* Apply stereo pan (balance law: center = both at 1.0, hard pan cuts one side) */
